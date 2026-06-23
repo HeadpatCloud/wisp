@@ -1,5 +1,7 @@
 ![Wisp](.github/public/github-social-1280x640.png)
 
+i am not a bot, i am a human being, i also kind of suck at rust so if you want to contribute, please be patient with me <3
+
 # Wisp
 
 A small, secure SSH/SFTP/VNC desktop client built with Tauri v2 and React.

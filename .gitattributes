@@ -1,0 +1,12 @@
+# Force LF in the working tree on every platform. Biome formats with LF, so without this
+# Windows CI runners (autocrlf=true) check out CRLF and fail the lint/format check.
+* text=auto eol=lf
+
+# Binary assets - never touch line endings.
+*.png binary
+*.ico binary
+*.icns binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary

@@ -1,3 +1,5 @@
+![Wisp](.github/public/github-social-1280x640.png)
+
 # Wisp
 
 A small, secure SSH/SFTP/VNC desktop client built with Tauri v2 and React.

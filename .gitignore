@@ -1,0 +1,27 @@
+# node
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# generated typed ipc bindings (regenerated on tauri dev)
+src/bindings.ts
+
+# tauri / rust
+src-tauri/target/
+src-tauri/gen/
+
+# secrets - never commit a vault or known-hosts dump
+*.enc
+vault.enc
+known_hosts.json
+
+# editor / os
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# logs
+*.log

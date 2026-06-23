@@ -1,0 +1,310 @@
+import { openUrl } from '@tauri-apps/plugin-opener'
+import { useState } from 'react'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { PageShell } from '@/components/ui/page-shell'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import { COLOR_SCHEMES } from '@/features/sessions/terminalTheme'
+import { ACCENTS, BACKGROUNDS } from '@/lib/theme'
+import { cn } from '@/lib/utils'
+import { vaultChangePassword } from '@/lib/vault'
+import { useSessionStore } from '@/stores/sessionStore'
+import { useSettingsStore } from '@/stores/settingsStore'
+import { TerminalPreview } from './TerminalPreview'
+
+const SECTIONS = ['Appearance', 'Security', 'About'] as const
+const REPO_URL = 'https://github.com/headpatcloud/wisp'
+type Section = (typeof SECTIONS)[number]
+
+export function SettingsPage({ tabId }: { tabId: string }) {
+  const settings = useSettingsStore((s) => s.settings)
+  const update = useSettingsStore((s) => s.update)
+  const removeTab = useSessionStore((s) => s.removeTab)
+  const [section, setSection] = useState<Section>('Appearance')
+  const [masterPw, setMasterPw] = useState('')
+  const [pwSaved, setPwSaved] = useState(false)
+
+  return (
+    <PageShell
+      title="Settings"
+      footer={
+        <Button type="button" variant="ghost" onClick={() => removeTab(tabId)}>
+          Close
+        </Button>
+      }
+    >
+      <div className="flex gap-4">
+        <nav className="flex w-40 shrink-0 flex-col gap-1">
+          {SECTIONS.map((s) => (
+            <button
+              key={s}
+              type="button"
+              onClick={() => setSection(s)}
+              className={cn(
+                'rounded px-2 py-1 text-left text-sm hover:bg-muted',
+                section === s && 'bg-muted font-medium',
+              )}
+            >
+              {s}
+            </button>
+          ))}
+        </nav>
+        <div className="min-w-0 flex-1 space-y-4">
+          {section === 'Appearance' && (
+            <>
+              <h3 className="font-medium text-sm">Application</h3>
+              <div className="space-y-1">
+                <Label htmlFor="theme">Theme</Label>
+                <Select value={settings.theme} onValueChange={(v) => update({ theme: v })}>
+                  <SelectTrigger id="theme">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="system">System</SelectItem>
+                    <SelectItem value="light">Light</SelectItem>
+                    <SelectItem value="dark">Dark</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="accent">Accent color</Label>
+                <Select
+                  value={settings.accent ?? 'teal'}
+                  onValueChange={(v) => update({ accent: v })}
+                >
+                  <SelectTrigger id="accent">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {ACCENTS.map((a) => (
+                      <SelectItem key={a.value} value={a.value}>
+                        <span className="flex items-center gap-2">
+                          <span
+                            className="size-3 rounded-full"
+                            style={{ background: `oklch(0.66 0.13 ${a.hue})` }}
+                          />
+                          {a.label}
+                        </span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="background">Background color</Label>
+                <Select
+                  value={settings.background ?? 'teal'}
+                  onValueChange={(v) => update({ background: v })}
+                >
+                  <SelectTrigger id="background">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {BACKGROUNDS.map((b) => (
+                      <SelectItem key={b.value} value={b.value}>
+                        <span className="flex items-center gap-2">
+                          <span
+                            className="size-3 rounded-full border border-border"
+                            style={{ background: `oklch(0.8 0.06 ${b.hue})` }}
+                          />
+                          {b.label}
+                        </span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-muted-foreground text-xs">
+                  Tints the whole app (sidebar, panels, borders). The terminal uses its own color
+                  scheme below.
+                </p>
+              </div>
+
+              <h3 className="border-border border-t pt-4 font-medium text-sm">Terminal</h3>
+              <TerminalPreview />
+              <div className="space-y-1">
+                <Label htmlFor="colorScheme">Color scheme</Label>
+                <Select
+                  value={settings.colorScheme}
+                  onValueChange={(v) => update({ colorScheme: v })}
+                >
+                  <SelectTrigger id="colorScheme">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {COLOR_SCHEMES.map((s) => (
+                      <SelectItem key={s.value} value={s.value}>
+                        {s.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="fontFamily">Font family</Label>
+                <Input
+                  id="fontFamily"
+                  value={settings.fontFamily}
+                  onChange={(e) => update({ fontFamily: e.target.value })}
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <div className="space-y-1">
+                  <Label htmlFor="fontSize">Font size</Label>
+                  <Input
+                    id="fontSize"
+                    type="number"
+                    value={settings.fontSize}
+                    onChange={(e) => {
+                      const n = Number(e.target.value)
+                      if (Number.isFinite(n) && n > 0) update({ fontSize: n })
+                    }}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="fontWeight">Font weight</Label>
+                  <Select
+                    value={settings.fontWeight ?? 'normal'}
+                    onValueChange={(v) => update({ fontWeight: v })}
+                  >
+                    <SelectTrigger id="fontWeight">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="normal">Normal</SelectItem>
+                      <SelectItem value="bold">Bold</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <div className="space-y-1">
+                  <Label htmlFor="lineHeight">Line height</Label>
+                  <Input
+                    id="lineHeight"
+                    type="number"
+                    step="0.1"
+                    value={settings.lineHeight ?? 1}
+                    onChange={(e) => {
+                      const n = Number(e.target.value)
+                      if (Number.isFinite(n) && n > 0) update({ lineHeight: n })
+                    }}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="letterSpacing">Letter spacing</Label>
+                  <Input
+                    id="letterSpacing"
+                    type="number"
+                    step="0.5"
+                    value={settings.letterSpacing ?? 0}
+                    onChange={(e) => {
+                      const n = Number(e.target.value)
+                      if (Number.isFinite(n)) update({ letterSpacing: n })
+                    }}
+                  />
+                </div>
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="cursorStyle">Cursor style</Label>
+                <Select
+                  value={settings.cursorStyle ?? 'block'}
+                  onValueChange={(v) => update({ cursorStyle: v })}
+                >
+                  <SelectTrigger id="cursorStyle">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="block">Block</SelectItem>
+                    <SelectItem value="bar">Bar</SelectItem>
+                    <SelectItem value="underline">Underline</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={settings.cursorBlink ?? true}
+                  onChange={(e) => update({ cursorBlink: e.target.checked })}
+                />
+                Blink cursor
+              </label>
+              <div className="space-y-1">
+                <Label htmlFor="scrollback">Scrollback (lines)</Label>
+                <Input
+                  id="scrollback"
+                  type="number"
+                  value={settings.scrollback ?? 10000}
+                  onChange={(e) => {
+                    const n = Number(e.target.value)
+                    if (Number.isFinite(n) && n >= 0) update({ scrollback: n })
+                  }}
+                />
+              </div>
+            </>
+          )}
+          {section === 'Security' && (
+            <div className="space-y-2">
+              <div className="space-y-1">
+                <Label htmlFor="masterPw">Master password</Label>
+                <Input
+                  id="masterPw"
+                  type="password"
+                  value={masterPw}
+                  onChange={(e) => {
+                    setMasterPw(e.target.value)
+                    setPwSaved(false)
+                  }}
+                />
+                <p className="text-muted-foreground text-xs">
+                  Encrypts stored secrets with this password instead of the OS keychain. You'll
+                  enter it on each launch.
+                </p>
+              </div>
+              <Button
+                type="button"
+                disabled={!masterPw}
+                onClick={async () => {
+                  await vaultChangePassword(masterPw)
+                  setMasterPw('')
+                  setPwSaved(true)
+                }}
+              >
+                Set master password
+              </Button>
+              {pwSaved && <p className="text-xs">Master password updated.</p>}
+            </div>
+          )}
+          {section === 'About' && (
+            <div className="space-y-3">
+              <div className="flex items-center gap-3">
+                <img src="/wisp-icon.svg" alt="" className="size-12" />
+                <div>
+                  <h3 className="font-semibold text-lg">Wisp</h3>
+                  <p className="text-muted-foreground text-sm">Version {__APP_VERSION__}</p>
+                </div>
+              </div>
+              <p className="text-muted-foreground text-sm">
+                A fast, secure desktop client for SSH, SFTP, FTP, and VNC, built with Tauri and
+                React.
+              </p>
+              <button
+                type="button"
+                onClick={() => openUrl(REPO_URL).catch(() => {})}
+                className="text-primary text-sm underline-offset-2 hover:underline"
+              >
+                {REPO_URL.replace('https://', '')}
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    </PageShell>
+  )
+}

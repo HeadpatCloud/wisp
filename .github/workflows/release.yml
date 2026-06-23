@@ -25,6 +25,11 @@ jobs:
           - platform: windows-latest
             args: ''
     runs-on: ${{ matrix.platform }}
+    env:
+      # Windows' schannel + cargo HTTP/2 flakes on crates.io downloads
+      # ([56] missing close_notify); HTTP/1.1 plus more retries avoids it.
+      CARGO_NET_RETRY: '10'
+      CARGO_HTTP_MULTIPLEXING: 'false'
     steps:
       - uses: actions/checkout@v4
 

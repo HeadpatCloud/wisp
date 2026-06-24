@@ -105,15 +105,57 @@ fn specta_builder() -> Builder<tauri::Wry> {
         ])
 }
 
+// WebKitGTK's GPU paths (DMABUF + accelerated compositing) blank to a white/grey window
+// on many modern Linux setups (Wayland, recent Mesa, Nvidia). Force the software fallbacks
+// and, for AppImages on Wayland, re-exec with the system libwayland-client preloaded so the
+// bundled copy doesn't lose a load-order conflict (the classic white-screen / EGL_BAD_PARAMETER).
+#[cfg(target_os = "linux")]
+fn linux_render_fixes() {
+    for var in ["WEBKIT_DISABLE_DMABUF_RENDERER", "WEBKIT_DISABLE_COMPOSITING_MODE"] {
+        if std::env::var_os(var).is_none() {
+            std::env::set_var(var, "1");
+        }
+    }
+
+    use std::os::unix::process::CommandExt;
+    if std::env::var_os("APPIMAGE").is_none() || std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return;
+    }
+    // Loop guard for the child we re-exec below.
+    if std::env::var_os("WISP_WAYLAND_PRELOADED").is_some() {
+        return;
+    }
+    let existing = std::env::var("LD_PRELOAD").unwrap_or_default();
+    if existing.contains("libwayland-client") {
+        return;
+    }
+    let Some(lib) = [
+        "/usr/lib/x86_64-linux-gnu/libwayland-client.so.0",
+        "/usr/lib64/libwayland-client.so.0",
+        "/usr/lib/libwayland-client.so.0",
+    ]
+    .into_iter()
+    .find(|p| std::path::Path::new(*p).exists()) else {
+        return;
+    };
+    let preload = if existing.is_empty() {
+        lib.to_string()
+    } else {
+        format!("{lib}:{existing}")
+    };
+    let err = std::process::Command::new(std::env::current_exe().expect("current exe"))
+        .args(std::env::args_os().skip(1))
+        .env("LD_PRELOAD", preload)
+        .env("WISP_WAYLAND_PRELOADED", "1")
+        .exec();
+    // exec() only returns on failure - fall through and run unpreloaded.
+    eprintln!("wisp: wayland preload re-exec failed: {err}");
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // WebKitGTK's DMABUF renderer paints a blank/grey window on a lot of modern Linux
-    // setups (Arch + recent Mesa especially). Disabling it forces the GL fallback that
-    // actually renders. Must be set before GTK/WebKit init.
     #[cfg(target_os = "linux")]
-    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
-        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
-    }
+    linux_render_fixes();
 
     let builder = specta_builder();
 

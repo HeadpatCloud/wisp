@@ -37,6 +37,26 @@
       "icons/512x512.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "createUpdaterArtifacts": true,
+    "windows": {
+      "nsis": {
+        "installerIcon": "icons/icon.ico",
+        "headerImage": "installer/header.bmp",
+        "sidebarImage": "installer/sidebar.bmp",
+        "installMode": "currentUser"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/HeadpatCloud/wisp/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYyMTNEQkIyMzZFQzNBRDIKUldUU091dzJzdHNUOHI5UW15YjRmM2JGRWFzb3lWRmxBWSs1YXRBZU5td0tscDJCN2QwU2xNYysK",
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

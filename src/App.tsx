@@ -21,6 +21,7 @@ import { VncConnectDialog } from '@/features/sessions/VncConnectDialog'
 import { VncView } from '@/features/sessions/VncView'
 import { SftpConnectDialog } from '@/features/sftp/SftpConnectDialog'
 import { AppShell } from '@/features/shell/AppShell'
+import { UpdateBanner } from '@/features/updater/UpdateBanner'
 import { VaultGate } from '@/features/vault/VaultGate'
 import { WelcomePage } from '@/features/welcome/WelcomePage'
 import { listShells } from '@/lib/local'
@@ -120,6 +121,7 @@ export default function App() {
   return (
     <>
       <VaultGate />
+      <UpdateBanner />
       <VncConnectDialog open={vncDialogOpen} onOpenChange={setVncDialogOpen} onConnect={openVnc} />
       <FtpConnectDialog open={ftpDialogOpen} onOpenChange={setFtpDialogOpen} onConnect={openFtp} />
       <SftpConnectDialog open={sftpDialogOpen} onOpenChange={setSftpDialogOpen} onPick={openSftp} />

@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [ubuntu-22.04, windows-latest, macos-latest]
+        platform: [ubuntu-22.04, windows-latest, macos-15]
     runs-on: ${{ matrix.platform }}
     env:
       # Windows' schannel + cargo HTTP/2 flakes on crates.io downloads
@@ -19,7 +19,7 @@ jobs:
       CARGO_NET_RETRY: '10'
       CARGO_HTTP_MULTIPLEXING: 'false'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # webkit2gtk 4.1 is Tauri v2's webview; libssl-dev covers suppaftp's native-tls.
       - name: Install Linux dependencies

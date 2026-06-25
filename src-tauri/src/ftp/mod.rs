@@ -20,12 +20,18 @@ pub fn connect(
     password: &str,
     secure: bool,
     allow_invalid_cert: bool,
+    ignore_hostname: bool,
 ) -> AppResult<FtpStream> {
     let mut ftp = NativeTlsFtpStream::connect(format!("{host}:{port}"))?;
     if secure {
         let mut builder = TlsConnector::builder();
+        // Two separate opt-ins: accept an untrusted/self-signed chain vs. ignore a hostname
+        // mismatch. Keeping them apart means "self-signed" doesn't silently also disable the
+        // MITM-relevant hostname check.
         if allow_invalid_cert {
             builder.danger_accept_invalid_certs(true);
+        }
+        if ignore_hostname {
             builder.danger_accept_invalid_hostnames(true);
         }
         let connector = builder.build().map_err(|e| AppError::Ftp(e.to_string()))?;

@@ -17,6 +17,7 @@ const DEFAULTS: Settings = {
   cursorStyle: 'block',
   cursorBlink: true,
   scrollback: 10000,
+  vncClipboardSync: false,
 }
 
 function asAppTheme(theme: string): AppTheme {

@@ -1,4 +1,4 @@
-use argon2::Argon2;
+use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use zeroize::Zeroizing;
@@ -11,11 +11,21 @@ pub fn random_bytes<const N: usize>() -> AppResult<[u8; N]> {
     Ok(buf)
 }
 
-pub fn derive_key(password: &[u8], salt: &[u8; 16]) -> AppResult<Zeroizing<[u8; 32]>> {
+pub fn derive_key(
+    password: &[u8],
+    salt: &[u8; 16],
+    params: Option<(u32, u32, u32)>,
+) -> AppResult<Zeroizing<[u8; 32]>> {
+    let argon = match params {
+        Some((m, t, p)) => Argon2::new(
+            Algorithm::Argon2id,
+            Version::V0x13,
+            Params::new(m, t, p, None).map_err(|_| AppError::Crypto)?,
+        ),
+        None => Argon2::default(),
+    };
     let mut key = Zeroizing::new([0u8; 32]);
-    Argon2::default()
-        .hash_password_into(password, salt, key.as_mut())
-        .map_err(|_| AppError::Crypto)?;
+    argon.hash_password_into(password, salt, key.as_mut()).map_err(|_| AppError::Crypto)?;
     Ok(key)
 }
 
@@ -40,7 +50,7 @@ mod tests {
 
     #[test]
     fn seal_open_round_trips() {
-        let key = derive_key(b"hunter2", &[7u8; 16]).unwrap();
+        let key = derive_key(b"hunter2", &[7u8; 16], None).unwrap();
         let (nonce, ct) = seal(&key, b"my-passphrase").unwrap();
         let pt = open(&key, &nonce, &ct).unwrap();
         assert_eq!(pt.as_slice(), b"my-passphrase");
@@ -48,15 +58,15 @@ mod tests {
 
     #[test]
     fn wrong_key_fails() {
-        let k1 = derive_key(b"a", &[1u8; 16]).unwrap();
-        let k2 = derive_key(b"b", &[1u8; 16]).unwrap();
+        let k1 = derive_key(b"a", &[1u8; 16], None).unwrap();
+        let k2 = derive_key(b"b", &[1u8; 16], None).unwrap();
         let (nonce, ct) = seal(&k1, b"secret").unwrap();
         assert!(matches!(open(&k2, &nonce, &ct), Err(AppError::Crypto)));
     }
 
     #[test]
     fn tampered_ciphertext_fails() {
-        let key = derive_key(b"a", &[1u8; 16]).unwrap();
+        let key = derive_key(b"a", &[1u8; 16], None).unwrap();
         let (nonce, mut ct) = seal(&key, b"secret").unwrap();
         ct[0] ^= 0xff;
         assert!(matches!(open(&key, &nonce, &ct), Err(AppError::Crypto)));
@@ -64,7 +74,7 @@ mod tests {
 
     #[test]
     fn same_plaintext_uses_distinct_nonces() {
-        let key = derive_key(b"a", &[1u8; 16]).unwrap();
+        let key = derive_key(b"a", &[1u8; 16], None).unwrap();
         let (n1, _) = seal(&key, b"x").unwrap();
         let (n2, _) = seal(&key, b"x").unwrap();
         assert_ne!(n1, n2);

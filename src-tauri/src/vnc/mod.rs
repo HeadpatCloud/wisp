@@ -10,6 +10,17 @@ fn err(msg: impl Into<String>) -> AppError {
     AppError::Internal(format!("vnc: {}", msg.into()))
 }
 
+// Caps on server-declared lengths so a hostile server can't trigger a huge allocation.
+const MAX_TEXT: usize = 1 << 20; // failure reason, desktop name, clipboard
+const MAX_RECT: usize = 256 << 20; // one raw framebuffer rectangle
+
+fn bounded(len: usize, max: usize) -> AppResult<usize> {
+    if len > max {
+        return Err(err(format!("declared length {len} exceeds {max}")));
+    }
+    Ok(len)
+}
+
 pub struct VncInit {
     pub reader: OwnedReadHalf,
     pub writer: OwnedWriteHalf,
@@ -31,13 +42,17 @@ pub async fn connect(host: &str, port: u16, password: &str) -> AppResult<VncInit
     if count[0] == 0 {
         let mut len = [0u8; 4];
         stream.read_exact(&mut len).await?;
-        let mut reason = vec![0u8; u32::from_be_bytes(len) as usize];
+        let mut reason = vec![0u8; bounded(u32::from_be_bytes(len) as usize, MAX_TEXT)?];
         stream.read_exact(&mut reason).await?;
         return Err(err(String::from_utf8_lossy(&reason).into_owned()));
     }
     let mut types = vec![0u8; count[0] as usize];
     stream.read_exact(&mut types).await?;
-    let security = if types.contains(&1) {
+    // A password-protected session must never silently fall back to "None" auth: a hostile
+    // server could advertise type 1 to skip the password and connect us unauthenticated.
+    let security = if !password.is_empty() && types.contains(&2) {
+        2u8
+    } else if types.contains(&1) {
         1u8
     } else if types.contains(&2) {
         2u8
@@ -65,7 +80,7 @@ pub async fn connect(host: &str, port: u16, password: &str) -> AppResult<VncInit
     let width = u16::from_be_bytes([header[0], header[1]]);
     let height = u16::from_be_bytes([header[2], header[3]]);
     let name_len = u32::from_be_bytes([header[20], header[21], header[22], header[23]]) as usize;
-    let mut name = vec![0u8; name_len];
+    let mut name = vec![0u8; bounded(name_len, MAX_TEXT)?];
     stream.read_exact(&mut name).await?;
 
     let mut set_format = [0u8; 20];
@@ -97,7 +112,7 @@ fn put_px(rgba: &mut [u8], stride: usize, x: usize, y: usize, px: &[u8; 4]) {
 // tiles, optional sub-rectangles) into an RGBA buffer.
 async fn decode_hextile<R: AsyncRead + Unpin>(reader: &mut R, w: u16, h: u16) -> AppResult<Vec<u8>> {
     let (w, h) = (w as usize, h as usize);
-    let mut rgba = vec![0u8; w * h * 4];
+    let mut rgba = vec![0u8; bounded(w * h * 4, MAX_RECT)?];
     let mut bg = [0u8; 4];
     let mut fg = [0u8; 4];
     let mut ty = 0;
@@ -184,7 +199,7 @@ pub async fn read_message(reader: &mut OwnedReadHalf) -> AppResult<ServerMsg> {
                 let encoding = i32::from_be_bytes([r[8], r[9], r[10], r[11]]);
                 match encoding {
                     0 => {
-                        let mut pixels = vec![0u8; w as usize * h as usize * 4];
+                        let mut pixels = vec![0u8; bounded(w as usize * h as usize * 4, MAX_RECT)?];
                         reader.read_exact(&mut pixels).await?;
                         out.push(DrawOp::Raw { x, y, w, h, rgba: raw_to_rgba(&pixels) });
                     }
@@ -208,7 +223,7 @@ pub async fn read_message(reader: &mut OwnedReadHalf) -> AppResult<ServerMsg> {
         3 => {
             let mut head = [0u8; 7]; // padding(3) + length(4)
             reader.read_exact(&mut head).await?;
-            let len = u32::from_be_bytes([head[3], head[4], head[5], head[6]]) as usize;
+            let len = bounded(u32::from_be_bytes([head[3], head[4], head[5], head[6]]) as usize, MAX_TEXT)?;
             let mut text = vec![0u8; len];
             reader.read_exact(&mut text).await?;
             Ok(ServerMsg::Clipboard(String::from_utf8_lossy(&text).into_owned()))

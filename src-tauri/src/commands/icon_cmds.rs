@@ -20,6 +20,28 @@ fn icon_extension(source_path: &str) -> AppResult<String> {
     }
 }
 
+// The extension is attacker-controlled, so confirm the bytes
+// actually match the claimed format before storing the file
+fn validate_icon_content(ext: &str, bytes: &[u8]) -> AppResult<()> {
+    let ok = match ext {
+        "png" => bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]),
+        "jpg" | "jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        "gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "webp" => bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
+        "svg" => {
+            let head = String::from_utf8_lossy(&bytes[..bytes.len().min(512)]);
+            let trimmed = head.trim_start();
+            trimmed.starts_with("<?xml") || trimmed.starts_with("<svg") || head.contains("<svg")
+        }
+        _ => false,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(AppError::Io(format!("file content is not a valid {ext} image")))
+    }
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn import_icon(app: AppHandle, source_path: String) -> AppResult<String> {
@@ -27,6 +49,8 @@ pub async fn import_icon(app: AppHandle, source_path: String) -> AppResult<Strin
     if std::fs::metadata(&source_path)?.len() > MAX_ICON_BYTES {
         return Err(AppError::Io("icon file is too large (max 2 MB)".into()));
     }
+    let bytes = std::fs::read(&source_path)?;
+    validate_icon_content(&ext, &bytes)?;
     let icons_dir = app
         .path()
         .app_config_dir()
@@ -34,7 +58,7 @@ pub async fn import_icon(app: AppHandle, source_path: String) -> AppResult<Strin
         .join("icons");
     std::fs::create_dir_all(&icons_dir)?;
     let name = format!("{}.{ext}", uuid::Uuid::new_v4());
-    std::fs::copy(&source_path, icons_dir.join(&name))?;
+    std::fs::write(icons_dir.join(&name), &bytes)?;
     Ok(format!("icons/{name}"))
 }
 
@@ -80,5 +104,13 @@ mod tests {
     fn rejects_non_image_and_extensionless() {
         assert!(icon_extension("/a/evil.exe").is_err());
         assert!(icon_extension("/a/noext").is_err());
+    }
+
+    #[test]
+    fn content_validation_matches_magic_bytes() {
+        assert!(validate_icon_content("png", &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]).is_ok());
+        assert!(validate_icon_content("svg", b"<svg xmlns=\"...\"></svg>").is_ok());
+        assert!(validate_icon_content("png", b"MZ\x90\x00").is_err());
+        assert!(validate_icon_content("jpg", b"not a jpeg").is_err());
     }
 }

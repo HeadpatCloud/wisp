@@ -12,8 +12,17 @@ export async function connectFtp(
   password: string,
   secure: boolean,
   allowInvalidCert: boolean,
+  ignoreHostname: boolean,
 ): Promise<string> {
-  const res = await commands.ftpConnect(host, port, username, password, secure, allowInvalidCert)
+  const res = await commands.ftpConnect(
+    host,
+    port,
+    username,
+    password,
+    secure,
+    allowInvalidCert,
+    ignoreHostname,
+  )
   if (res.status === 'error') throw res.error
   return res.data
 }

@@ -17,6 +17,7 @@ export interface FtpParams {
   password: string
   secure: boolean
   allowInvalidCert: boolean
+  ignoreHostname: boolean
 }
 
 export function FtpConnectDialog({
@@ -32,8 +33,9 @@ export function FtpConnectDialog({
   const [port, setPort] = useState(21)
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
-  const [secure, setSecure] = useState(false)
+  const [secure, setSecure] = useState(true)
   const [allowInvalidCert, setAllowInvalidCert] = useState(false)
+  const [ignoreHostname, setIgnoreHostname] = useState(false)
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -76,15 +78,31 @@ export function FtpConnectDialog({
             <input type="checkbox" checked={secure} onChange={(e) => setSecure(e.target.checked)} />
             Use FTPS (explicit TLS)
           </label>
-          {secure && (
-            <label className="flex items-center gap-2 pl-6 text-muted-foreground text-sm">
-              <input
-                type="checkbox"
-                checked={allowInvalidCert}
-                onChange={(e) => setAllowInvalidCert(e.target.checked)}
-              />
-              Allow self-signed / invalid certificate
-            </label>
+          {secure ? (
+            <>
+              <label className="flex items-center gap-2 pl-6 text-muted-foreground text-sm">
+                <input
+                  type="checkbox"
+                  checked={allowInvalidCert}
+                  onChange={(e) => setAllowInvalidCert(e.target.checked)}
+                />
+                Allow self-signed certificate
+              </label>
+              {allowInvalidCert && (
+                <label className="flex items-center gap-2 pl-12 text-muted-foreground text-sm">
+                  <input
+                    type="checkbox"
+                    checked={ignoreHostname}
+                    onChange={(e) => setIgnoreHostname(e.target.checked)}
+                  />
+                  Also ignore hostname mismatch (less safe)
+                </label>
+              )}
+            </>
+          ) : (
+            <p className="pl-6 text-destructive text-xs">
+              Without FTPS your username, password, and files are sent unencrypted.
+            </p>
           )}
         </div>
         <DialogFooter>
@@ -95,7 +113,15 @@ export function FtpConnectDialog({
             type="button"
             disabled={!host}
             onClick={() => {
-              onConnect({ host, port, username, password, secure, allowInvalidCert })
+              onConnect({
+                host,
+                port,
+                username,
+                password,
+                secure,
+                allowInvalidCert,
+                ignoreHostname,
+              })
               onOpenChange(false)
             }}
           >

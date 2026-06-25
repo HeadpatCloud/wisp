@@ -9,6 +9,7 @@ export function FtpConnectionView({
   password,
   secure,
   allowInvalidCert,
+  ignoreHostname,
   active,
 }: {
   host: string
@@ -17,6 +18,7 @@ export function FtpConnectionView({
   password: string
   secure: boolean
   allowInvalidCert: boolean
+  ignoreHostname: boolean
   active?: boolean
 }) {
   const [sessionId, setSessionId] = useState<string | null>(null)
@@ -30,7 +32,7 @@ export function FtpConnectionView({
     idRef.current = null
     setSessionId(null)
     setError(null)
-    connectFtp(host, port, username, password, secure, allowInvalidCert)
+    connectFtp(host, port, username, password, secure, allowInvalidCert, ignoreHostname)
       .then((sid) => {
         if (disposed) {
           disconnectFtp(sid).catch(() => {})
@@ -48,7 +50,7 @@ export function FtpConnectionView({
       disposed = true
       if (idRef.current) disconnectFtp(idRef.current).catch(() => {})
     }
-  }, [host, port, username, password, secure, allowInvalidCert, nonce])
+  }, [host, port, username, password, secure, allowInvalidCert, ignoreHostname, nonce])
 
   if (sessionId) return <FtpPanel sessionId={sessionId} active={active} />
 

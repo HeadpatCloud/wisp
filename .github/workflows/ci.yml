@@ -52,3 +52,22 @@ jobs:
 
       - name: Frontend tests
         run: bun run test:run
+
+  audit:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Audit frontend dependencies
+        run: bun audit
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Audit Rust dependencies
+        run: cargo audit --file src-tauri/Cargo.lock

@@ -10,10 +10,11 @@ use zeroize::Zeroizing;
 
 use crate::error::{AppError, AppResult};
 use crate::store::io;
-use model::{KeySource, SealedSecret, VaultFile, VaultStatus};
+use model::{KdfParams, KeySource, SealedSecret, VaultFile, VaultStatus};
 
 const KEYRING_SERVICE: &str = "de.headpat.wisp";
 const KEYRING_USER: &str = "vault-key";
+const VERIFIER_PLAINTEXT: &[u8] = b"wisp-vault-verifier-v1";
 
 pub struct Vault {
     path: PathBuf,
@@ -73,23 +74,41 @@ impl Vault {
         STANDARD.decode(b64).map_err(|_| AppError::Crypto)?.try_into().map_err(|_| AppError::Crypto)
     }
 
-    // Derive the key from a master password and adopt it. With existing secrets the
-    // password is verified by decrypting one; with none it simply becomes the key.
+    // Derive the key from a master password and adopt it. The password is checked against a
+    // stored verifier (or, for legacy vaults without one, an existing secret). A brand-new
+    // password vault has nothing to check against, so the first password sets the key - and we
+    // persist a verifier immediately so every later unlock is actually verified.
     pub fn unlock(&mut self, password: &str) -> AppResult<()> {
         if self.file.key_source != KeySource::Password {
             return Err(AppError::Vault("vault is not password-protected".into()));
         }
-        let key = crypto::derive_key(password.as_bytes(), &self.salt()?)?;
-        if let Some(sealed) = self.file.secrets.values().next() {
-            let nonce: [u8; 24] = STANDARD
-                .decode(&sealed.nonce)
-                .map_err(|_| AppError::Crypto)?
-                .try_into()
-                .map_err(|_| AppError::Crypto)?;
-            let ciphertext = STANDARD.decode(&sealed.ciphertext).map_err(|_| AppError::Crypto)?;
+        let establishing = self.file.verifier.is_none() && self.file.secrets.is_empty();
+        let params = if establishing {
+            Some(KdfParams::STRONG.tuple())
+        } else {
+            self.file.kdf_params.map(KdfParams::tuple)
+        };
+        let key = crypto::derive_key(password.as_bytes(), &self.salt()?, params)?;
+
+        if let Some(verifier) = &self.file.verifier {
+            if !verify_against(&key, verifier)? {
+                return Err(AppError::WrongPassphrase);
+            }
+        } else if let Some(sealed) = self.file.secrets.values().next() {
+            let (nonce, ciphertext) = decode_sealed(sealed)?;
             crypto::open(&key, &nonce, &ciphertext).map_err(|_| AppError::WrongPassphrase)?;
         }
-        self.key = Some(key);
+
+        if self.file.verifier.is_none() {
+            if establishing {
+                self.file.kdf_params = Some(KdfParams::STRONG);
+            }
+            self.file.verifier = Some(seal_verifier(&key)?);
+            self.key = Some(key);
+            self.persist()?;
+        } else {
+            self.key = Some(key);
+        }
         Ok(())
     }
 
@@ -105,7 +124,7 @@ impl Vault {
             .map(|id| self.get_secret(&id).map(|pt| (id, pt)))
             .collect::<AppResult<_>>()?;
         let salt = crypto::random_bytes::<16>()?;
-        let key = crypto::derive_key(new_password.as_bytes(), &salt)?;
+        let key = crypto::derive_key(new_password.as_bytes(), &salt, Some(KdfParams::STRONG.tuple()))?;
         for (id, pt) in &plaintexts {
             let (nonce, ciphertext) = crypto::seal(&key, pt)?;
             self.file.secrets.insert(
@@ -118,6 +137,8 @@ impl Vault {
         }
         self.file.key_source = KeySource::Password;
         self.file.kdf_salt = Some(STANDARD.encode(salt));
+        self.file.kdf_params = Some(KdfParams::STRONG);
+        self.file.verifier = Some(seal_verifier(&key)?);
         self.key = Some(key);
         self.persist()
     }
@@ -160,6 +181,26 @@ impl Vault {
         let nonce: [u8; 24] = nonce_vec.try_into().map_err(|_| AppError::Crypto)?;
         crypto::open(key, &nonce, &ciphertext)
     }
+}
+
+fn decode_sealed(sealed: &SealedSecret) -> AppResult<([u8; 24], Vec<u8>)> {
+    let nonce: [u8; 24] = STANDARD
+        .decode(&sealed.nonce)
+        .map_err(|_| AppError::Crypto)?
+        .try_into()
+        .map_err(|_| AppError::Crypto)?;
+    let ciphertext = STANDARD.decode(&sealed.ciphertext).map_err(|_| AppError::Crypto)?;
+    Ok((nonce, ciphertext))
+}
+
+fn seal_verifier(key: &[u8; 32]) -> AppResult<SealedSecret> {
+    let (nonce, ciphertext) = crypto::seal(key, VERIFIER_PLAINTEXT)?;
+    Ok(SealedSecret { nonce: STANDARD.encode(nonce), ciphertext: STANDARD.encode(ciphertext) })
+}
+
+fn verify_against(key: &[u8; 32], verifier: &SealedSecret) -> AppResult<bool> {
+    let (nonce, ciphertext) = decode_sealed(verifier)?;
+    Ok(crypto::open(key, &nonce, &ciphertext).map(|pt| pt.as_slice() == VERIFIER_PLAINTEXT).unwrap_or(false))
 }
 
 fn load_or_create_keychain_key() -> AppResult<Zeroizing<[u8; 32]>> {
@@ -278,6 +319,20 @@ mod tests {
         let mut v2 = Vault::open_locked(path.clone()).unwrap();
         assert!(matches!(v2.unlock("wrong"), Err(AppError::WrongPassphrase)));
         assert_eq!(v2.status(), VaultStatus::NeedsPassword);
+    }
+
+    #[test]
+    fn empty_vault_rejects_wrong_password_after_first_unlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        {
+            let mut v = Vault::open_locked(path.clone()).unwrap();
+            v.unlock("first").unwrap(); // no secrets: this sets the password and stores a verifier
+        }
+        let mut v2 = Vault::open_locked(path.clone()).unwrap();
+        assert!(matches!(v2.unlock("wrong"), Err(AppError::WrongPassphrase)));
+        v2.unlock("first").unwrap();
+        assert_eq!(v2.status(), VaultStatus::Unlocked);
     }
 
     #[test]

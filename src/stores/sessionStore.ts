@@ -67,6 +67,7 @@ export interface FtpTab {
   password: string
   secure: boolean
   allowInvalidCert: boolean
+  ignoreHostname: boolean
 }
 
 export type Tab = SessionTab | ViewTab | LocalTab | VncTab | SftpTab | FtpTab
@@ -93,6 +94,7 @@ interface SessionState {
     password: string
     secure: boolean
     allowInvalidCert: boolean
+    ignoreHostname: boolean
   }) => void
   duplicateTab: (tabId: string) => void
   setActiveTab: (tabId: string) => void
@@ -158,7 +160,7 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
     set({ tabs: [...get().tabs, tab], activeTabId: tab.id })
   },
 
-  openFtp: ({ host, port, username, password, secure, allowInvalidCert }) => {
+  openFtp: ({ host, port, username, password, secure, allowInvalidCert, ignoreHostname }) => {
     const tab: FtpTab = {
       id: crypto.randomUUID(),
       kind: 'ftp',
@@ -169,6 +171,7 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       password,
       secure,
       allowInvalidCert,
+      ignoreHostname,
     }
     set({ tabs: [...get().tabs, tab], activeTabId: tab.id })
   },

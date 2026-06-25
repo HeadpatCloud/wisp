@@ -93,6 +93,8 @@ export default function App() {
   }, [])
   useEffect(() => {
     const un = events.vncClipboard.listen((e) => {
+      // Off by default: a remote VNC server shouldn't silently write to the local clipboard
+      if (!useSettingsStore.getState().settings.vncClipboardSync) return
       navigator.clipboard.writeText(e.payload.text).catch(() => {})
     })
     return () => {
@@ -262,6 +264,7 @@ export default function App() {
                     password={t.password}
                     secure={t.secure}
                     allowInvalidCert={t.allowInvalidCert}
+                    ignoreHostname={t.ignoreHostname}
                     active={t.id === activeTabId}
                   />
                 </div>

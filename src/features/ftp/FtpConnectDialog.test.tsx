@@ -11,7 +11,7 @@ test('Connect submits the entered params with FTP defaults', async () => {
   await user.type(screen.getByLabelText('Username'), 'bob')
   await user.click(screen.getByRole('button', { name: 'Connect' }))
   expect(onConnect).toHaveBeenCalledWith(
-    expect.objectContaining({ host: 'ftp.example.com', username: 'bob', port: 21, secure: false }),
+    expect.objectContaining({ host: 'ftp.example.com', username: 'bob', port: 21, secure: true }),
   )
 })
 

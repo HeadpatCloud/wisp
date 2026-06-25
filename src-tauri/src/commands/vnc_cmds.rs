@@ -11,6 +11,7 @@ use tauri_specta::Event;
 use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::Mutex as TokioMutex;
+use zeroize::Zeroizing;
 
 use crate::error::{AppError, AppResult};
 use crate::vnc::{self, client_cut_text, fb_update_request, key_event, pointer_event};
@@ -58,6 +59,7 @@ pub async fn vnc_open(
     password: String,
     on_frame: Channel<FrameUpdate>,
 ) -> AppResult<VncOpened> {
+    let password = Zeroizing::new(password);
     let init = vnc::connect(&host, port, &password).await?;
     let (mut reader, width, height) = (init.reader, init.width, init.height);
     let writer = Arc::new(TokioMutex::new(init.writer));

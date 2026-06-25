@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tauri::ipc::Channel;
 use tauri::State;
 use tokio::sync::Mutex as TokioMutex;
+use zeroize::Zeroizing;
 
 use crate::commands::sftp_cmds::TransferProgress;
 use crate::error::{AppError, AppResult};
@@ -72,9 +73,11 @@ pub async fn ftp_connect(
     password: String,
     secure: bool,
     allow_invalid_cert: bool,
+    ignore_hostname: bool,
 ) -> AppResult<String> {
+    let password = Zeroizing::new(password);
     let stream = tokio::task::spawn_blocking(move || {
-        ftp::connect(&host, port, &username, &password, secure, allow_invalid_cert)
+        ftp::connect(&host, port, &username, &password, secure, allow_invalid_cert, ignore_hostname)
     })
     .await
     .map_err(|e| AppError::Internal(format!("ftp task: {e}")))??;

@@ -249,6 +249,8 @@ export function ProfilePage({ profileId, tabId }: { profileId: string | null; ta
           <Label>Tunnels</Label>
           {fields.map((f, i) => {
             const kind = watch(`tunnels.${i}.kind`)
+            const bindHost = watch(`tunnels.${i}.bindHost`)
+            const exposed = bindHost !== '' && !['127.0.0.1', 'localhost', '::1'].includes(bindHost)
             return (
               <div
                 key={f.id}
@@ -302,6 +304,11 @@ export function ProfilePage({ profileId, tabId }: { profileId: string | null; ta
                 <Button type="button" variant="ghost" size="sm" onClick={() => remove(i)}>
                   Remove
                 </Button>
+                {exposed && (
+                  <p className="w-full text-destructive text-xs">
+                    Binding to {bindHost} exposes this forward beyond localhost to the network.
+                  </p>
+                )}
               </div>
             )
           })}

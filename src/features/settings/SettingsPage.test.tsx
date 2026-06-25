@@ -34,7 +34,13 @@ const removeTab = vi.fn()
 beforeEach(() => {
   vi.clearAllMocks()
   useSettingsStore.setState({
-    settings: { theme: 'system', fontFamily: 'monospace', fontSize: 14, colorScheme: 'default' },
+    settings: {
+      theme: 'system',
+      fontFamily: 'monospace',
+      fontSize: 14,
+      colorScheme: 'default',
+      vncClipboardSync: false,
+    },
     loaded: true,
     update,
   } as never)

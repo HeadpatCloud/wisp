@@ -279,6 +279,19 @@ export function SettingsPage({ tabId }: { tabId: string }) {
                 Set master password
               </Button>
               {pwSaved && <p className="text-xs">Master password updated.</p>}
+              <div className="border-border border-t pt-3">
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={settings.vncClipboardSync}
+                    onChange={(e) => update({ vncClipboardSync: e.target.checked })}
+                  />
+                  Sync clipboard from VNC servers
+                </label>
+                <p className="mt-1 text-muted-foreground text-xs">
+                  Lets a connected VNC server write to your local clipboard. Off by default.
+                </p>
+              </div>
             </div>
           )}
           {section === 'About' && (

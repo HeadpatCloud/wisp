@@ -1,6 +1,7 @@
 use std::sync::Mutex;
 
 use tauri::State;
+use zeroize::Zeroizing;
 
 use crate::error::{AppError, AppResult};
 use crate::vault::model::VaultStatus;
@@ -19,6 +20,7 @@ pub fn vault_status(vault: State<'_, Mutex<Vault>>) -> AppResult<VaultStatus> {
 #[tauri::command]
 #[specta::specta]
 pub fn set_secret(vault: State<'_, Mutex<Vault>>, value: String) -> AppResult<String> {
+    let value = Zeroizing::new(value);
     vault.lock().map_err(|_| poisoned())?.set_secret(value.as_bytes())
 }
 
@@ -37,11 +39,13 @@ pub fn has_secret(vault: State<'_, Mutex<Vault>>, id: String) -> AppResult<bool>
 #[tauri::command]
 #[specta::specta]
 pub fn vault_unlock(vault: State<'_, Mutex<Vault>>, password: String) -> AppResult<()> {
+    let password = Zeroizing::new(password);
     vault.lock().map_err(|_| poisoned())?.unlock(&password)
 }
 
 #[tauri::command]
 #[specta::specta]
 pub fn vault_change_password(vault: State<'_, Mutex<Vault>>, password: String) -> AppResult<()> {
+    let password = Zeroizing::new(password);
     vault.lock().map_err(|_| poisoned())?.change_master_password(&password)
 }

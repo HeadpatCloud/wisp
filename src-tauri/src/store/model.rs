@@ -106,6 +106,8 @@ pub struct Settings {
     pub cursor_blink: bool,
     #[serde(default = "default_scrollback")]
     pub scrollback: u32,
+    #[serde(default)]
+    pub vnc_clipboard_sync: bool,
 }
 
 fn default_accent() -> String {
@@ -145,6 +147,7 @@ impl Default for Settings {
             cursor_style: default_cursor_style(),
             cursor_blink: true,
             scrollback: default_scrollback(),
+            vnc_clipboard_sync: false,
         }
     }
 }

@@ -1,7 +1,7 @@
 name: release
 
 # Push a tag like `v0.1.0` to publish a release, or run manually from the Actions tab
-# (manual runs tag the release from the version in tauri.conf.json).
+# (manual runs tag from the version in package.json)
 on:
   push:
     tags: ['v*']
@@ -11,7 +11,43 @@ permissions:
   contents: write
 
 jobs:
+  # Create ONE draft release up front so the build matrix uploads into a known release id.
+  # Letting tauri-action create the release per matrix job races and leaves installers on a
+  # draft while an empty release takes the tag
+  create-release:
+    runs-on: ubuntu-22.04
+    outputs:
+      release_id: ${{ steps.create.outputs.result }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Read version
+        id: version
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Create draft release
+        id: create
+        uses: actions/github-script@v7
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        with:
+          script: |
+            const tag = context.ref.startsWith('refs/tags/')
+              ? context.ref.replace('refs/tags/', '')
+              : `wisp-v${process.env.VERSION}`
+            const { data } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tag,
+              name: `Wisp v${process.env.VERSION}`,
+              body: 'See the assets to download and install this version.',
+              draft: true,
+              prerelease: false,
+            })
+            return data.id
+
   build:
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
@@ -27,7 +63,7 @@ jobs:
     runs-on: ${{ matrix.platform }}
     env:
       # Windows' schannel + cargo HTTP/2 flakes on crates.io downloads
-      # ([56] missing close_notify); HTTP/1.1 plus more retries avoids it.
+      # ([56] missing close_notify); HTTP/1.1 plus more retries avoids it
       CARGO_NET_RETRY: '10'
       CARGO_HTTP_MULTIPLEXING: 'false'
     steps:
@@ -54,27 +90,23 @@ jobs:
         run: bun install --frozen-lockfile
 
       # Release builds skip the debug-only bindings export, so generate src/bindings.ts here
-      # before tauri build runs the frontend `tsc && vite build`.
+      # before tauri build runs the frontend `tsc && vite build`
       - name: Generate typed IPC bindings
         run: cargo test --manifest-path src-tauri/Cargo.toml export_bindings
 
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Signs the update artifacts and emits latest.json that the in-app updater reads.
+          # Signs the update artifacts and emits latest.json that the in-app updater reads
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # macOS Developer ID signing + notarization. Ignored on Windows/Linux runners and
-          # skipped when the secrets are unset (the macOS build just comes out unsigned).
+          # macOS Developer ID signing + notarization, ignored on Windows/Linux runners and
+          # skipped when the secrets are unset (the macOS build just comes out unsigned)
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
-          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'wisp-v__VERSION__' }}
-          releaseName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'Wisp v__VERSION__' }}
-          releaseBody: 'See the assets to download and install this version.'
-          releaseDraft: true
-          prerelease: false
+          releaseId: ${{ needs.create-release.outputs.release_id }}
           args: ${{ matrix.args }}

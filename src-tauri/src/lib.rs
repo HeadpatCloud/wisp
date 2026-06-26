@@ -1,6 +1,7 @@
 mod commands;
 mod error;
 mod ftp;
+mod s3;
 mod sftp;
 mod ssh;
 mod store;
@@ -14,6 +15,7 @@ use commands::ftp_cmds;
 use commands::icon_cmds;
 use commands::import_cmds;
 use commands::local_cmds;
+use commands::s3_cmds;
 use commands::sftp_cmds;
 use commands::ssh_cmds;
 use commands::store_cmds;
@@ -50,6 +52,9 @@ fn specta_builder() -> Builder<tauri::Wry> {
             store_cmds::set_settings,
             store_cmds::export_profiles,
             store_cmds::import_profiles,
+            store_cmds::list_s3_profiles,
+            store_cmds::upsert_s3_profile,
+            store_cmds::delete_s3_profile,
             vault_cmds::vault_status,
             vault_cmds::set_secret,
             vault_cmds::delete_secret,
@@ -81,6 +86,16 @@ fn specta_builder() -> Builder<tauri::Wry> {
             ftp_cmds::ftp_download,
             ftp_cmds::ftp_cancel,
             ftp_cmds::ftp_disconnect,
+            s3_cmds::s3_connect,
+            s3_cmds::s3_list_buckets,
+            s3_cmds::s3_list,
+            s3_cmds::s3_upload,
+            s3_cmds::s3_download,
+            s3_cmds::s3_delete,
+            s3_cmds::s3_rename,
+            s3_cmds::s3_mkdir,
+            s3_cmds::s3_cancel,
+            s3_cmds::s3_disconnect,
             tunnel_cmds::tunnel_start,
             tunnel_cmds::tunnel_stop,
             tunnel_cmds::tunnel_list,
@@ -194,6 +209,8 @@ pub fn run() {
             app.manage(local_cmds::LocalSessions::default());
             app.manage(ftp_cmds::FtpSessions::default());
             app.manage(ftp_cmds::FtpTransfers::default());
+            app.manage(s3_cmds::S3Sessions::default());
+            app.manage(s3_cmds::S3Transfers::default());
             app.manage(vnc_cmds::VncSessions::default());
             app.manage(tunnel_cmds::Tunnels::default());
             Ok(())

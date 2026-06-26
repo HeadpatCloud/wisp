@@ -4,6 +4,7 @@ import { useTransferStore } from '@/stores/transferStore'
 
 export function TransfersBar() {
   const transfers = useTransferStore((s) => s.transfers)
+  const remove = useTransferStore((s) => s.remove)
   if (transfers.length === 0) return null
   return (
     <div className="shrink-0 space-y-1 border-border border-t p-2">
@@ -21,11 +22,20 @@ export function TransfersBar() {
                   : t.total > 0
                     ? `${pct}% - ${formatBytes(t.transferred)} / ${formatBytes(t.total)}`
                     : `${pct}%`}
-                {t.status === 'active' && (
+                {t.status === 'active' ? (
                   <button
                     type="button"
                     aria-label={`Cancel ${t.name}`}
                     onClick={() => cancelTransfer(t.id).catch(() => {})}
+                    className="rounded px-1 hover:bg-muted"
+                  >
+                    ✕
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    aria-label={`Dismiss ${t.name}`}
+                    onClick={() => remove(t.id)}
                     className="rounded px-1 hover:bg-muted"
                   >
                     ✕

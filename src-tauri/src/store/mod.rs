@@ -4,7 +4,7 @@ pub mod model;
 use std::path::PathBuf;
 
 use crate::error::{AppError, AppResult};
-use model::{Group, Profile, ProfileStore, Settings};
+use model::{Group, Profile, ProfileStore, S3Profile, Settings};
 
 pub struct Store {
     dir: PathBuf,
@@ -84,6 +84,27 @@ impl Store {
     pub fn set_settings(&mut self, settings: Settings) -> AppResult<()> {
         self.settings = settings;
         self.persist_settings()
+    }
+
+    pub fn s3_profiles(&self) -> Vec<S3Profile> {
+        self.data.s3_profiles.clone()
+    }
+
+    pub fn upsert_s3_profile(&mut self, profile: S3Profile) -> AppResult<()> {
+        match self.data.s3_profiles.iter_mut().find(|p| p.id == profile.id) {
+            Some(existing) => *existing = profile,
+            None => self.data.s3_profiles.push(profile),
+        }
+        self.persist_profiles()
+    }
+
+    pub fn delete_s3_profile(&mut self, id: &str) -> AppResult<()> {
+        let before = self.data.s3_profiles.len();
+        self.data.s3_profiles.retain(|p| p.id != id);
+        if self.data.s3_profiles.len() == before {
+            return Err(AppError::NotFound(format!("s3 profile {id}")));
+        }
+        self.persist_profiles()
     }
 }
 

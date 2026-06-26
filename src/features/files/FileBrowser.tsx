@@ -1,5 +1,5 @@
 import { getCurrentWebview } from '@tauri-apps/api/webview'
-import { confirm as confirmDialog } from '@tauri-apps/plugin-dialog'
+import { confirm as confirmDialog, message } from '@tauri-apps/plugin-dialog'
 import { ChevronUp, FolderPlus } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { SftpEntry, TransferProgress } from '@/bindings'
@@ -84,11 +84,13 @@ type Op =
 export function FileBrowser({
   backend,
   active = true,
+  initialPath = '.',
 }: {
   backend: FileBackend
   active?: boolean
+  initialPath?: string
 }) {
-  const { cwd, entries, error, up, enter, refresh } = useFileBrowser(backend)
+  const { cwd, entries, error, up, enter, refresh } = useFileBrowser(backend, initialPath)
   const start = useTransferStore((s) => s.start)
   const progress = useTransferStore((s) => s.progress)
   const finish = useTransferStore((s) => s.finish)
@@ -188,9 +190,13 @@ export function FileBrowser({
         open={op?.kind === 'mkdir'}
         title="New folder"
         onConfirm={async (name) => {
-          await backend.mkdir(joinPath(cwdRef.current, name))
-          setOp(null)
-          refresh(cwdRef.current)
+          try {
+            await backend.mkdir(joinPath(cwdRef.current, name))
+            setOp(null)
+            refresh(cwdRef.current)
+          } catch (e) {
+            await message(String(e), { title: 'Create folder failed', kind: 'error' })
+          }
         }}
         onOpenChange={(open) => {
           if (!open) setOp(null)
@@ -203,9 +209,13 @@ export function FileBrowser({
         defaultValue={op?.kind === 'rename' ? op.entry.name : ''}
         onConfirm={async (name) => {
           if (op?.kind !== 'rename') return
-          await backend.rename(op.entry.path, joinPath(parentOf(op.entry.path), name))
-          setOp(null)
-          refresh(cwdRef.current)
+          try {
+            await backend.rename(op.entry.path, joinPath(parentOf(op.entry.path), name))
+            setOp(null)
+            refresh(cwdRef.current)
+          } catch (e) {
+            await message(String(e), { title: 'Rename failed', kind: 'error' })
+          }
         }}
         onOpenChange={(open) => {
           if (!open) setOp(null)
@@ -231,9 +241,13 @@ export function FileBrowser({
               variant="destructive"
               onClick={async () => {
                 if (op?.kind !== 'delete') return
-                await backend.remove(op.entry.path, op.entry.isDir)
-                setOp(null)
-                refresh(cwdRef.current)
+                try {
+                  await backend.remove(op.entry.path, op.entry.isDir)
+                  setOp(null)
+                  refresh(cwdRef.current)
+                } catch (e) {
+                  await message(String(e), { title: 'Delete failed', kind: 'error' })
+                }
               }}
             >
               Delete

@@ -38,11 +38,17 @@ russh = { version = "0.61.2", default-features = false, features = ["ring", "rsa
 russh-sftp = "2.3"
 tauri-plugin-dialog = "2"
 bytes = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "io-util", "time", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "io-util", "time", "net", "fs"] }
 portable-pty = "0.9.0"
 des = "^0.9"
 suppaftp = { version = "9", default-features = false, features = ["native-tls"] }
 keyring = { version = "4", features = ["v1"] }
+rust-s3 = "0.35"
+reqwest = { version = "0.13", default-features = false, features = ["native-tls"] }
+sha2 = "0.10"
+hmac = "0.12"
+time = "0.3"
+futures-util = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

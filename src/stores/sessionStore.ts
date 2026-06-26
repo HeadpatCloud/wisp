@@ -70,7 +70,15 @@ export interface FtpTab {
   ignoreHostname: boolean
 }
 
-export type Tab = SessionTab | ViewTab | LocalTab | VncTab | SftpTab | FtpTab
+export interface S3Tab {
+  id: string
+  kind: 's3'
+  title: string
+  profileId: string
+  bucket: string | null
+}
+
+export type Tab = SessionTab | ViewTab | LocalTab | VncTab | SftpTab | FtpTab | S3Tab
 
 function viewKey(v: TabView): string {
   if (v.kind === 'profile-editor') return `profile-editor:${v.profileId ?? 'new'}`
@@ -96,6 +104,7 @@ interface SessionState {
     allowInvalidCert: boolean
     ignoreHostname: boolean
   }) => void
+  openS3: (profileId: string, bucket: string | null, title: string) => void
   duplicateTab: (tabId: string) => void
   setActiveTab: (tabId: string) => void
   setActivePane: (tabId: string, sessionId: string) => void
@@ -176,6 +185,11 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
     set({ tabs: [...get().tabs, tab], activeTabId: tab.id })
   },
 
+  openS3: (profileId, bucket, title) => {
+    const tab: S3Tab = { id: crypto.randomUUID(), kind: 's3', title, profileId, bucket }
+    set({ tabs: [...get().tabs, tab], activeTabId: tab.id })
+  },
+
   duplicateTab: (tabId) => {
     const tab = get().tabs.find((t) => t.id === tabId)
     if (!tab) return
@@ -185,6 +199,8 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       get().openSftp(tab.profileId, tab.title)
     } else if (tab.kind === 'ftp') {
       get().openFtp(tab)
+    } else if (tab.kind === 's3') {
+      get().openS3(tab.profileId, tab.bucket, tab.title)
     } else if (tab.kind === 'session') {
       const src = get().sessions[tab.activePaneId]
       if (!src) return

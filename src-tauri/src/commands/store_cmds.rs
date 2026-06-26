@@ -5,7 +5,7 @@ use specta::Type;
 use tauri::{AppHandle, Manager, State};
 
 use crate::error::{AppError, AppResult};
-use crate::store::model::{Group, IconRef, Profile, Settings};
+use crate::store::model::{Group, IconRef, Profile, S3Profile, Settings};
 use crate::store::Store;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
@@ -96,6 +96,37 @@ pub fn delete_profile(app: AppHandle, store: State<'_, Mutex<Store>>, id: String
 #[specta::specta]
 pub fn set_settings(store: State<'_, Mutex<Store>>, settings: Settings) -> AppResult<()> {
     store.lock().map_err(|_| poisoned())?.set_settings(settings)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn list_s3_profiles(store: State<'_, Mutex<Store>>) -> AppResult<Vec<S3Profile>> {
+    Ok(store.lock().map_err(|_| poisoned())?.s3_profiles())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn upsert_s3_profile(store: State<'_, Mutex<Store>>, profile: S3Profile) -> AppResult<()> {
+    store.lock().map_err(|_| poisoned())?.upsert_s3_profile(profile)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn delete_s3_profile(
+    app: AppHandle,
+    store: State<'_, Mutex<Store>>,
+    id: String,
+) -> AppResult<()> {
+    let icon = {
+        let mut s = store.lock().map_err(|_| poisoned())?;
+        let icon = s.s3_profiles().into_iter().find(|p| p.id == id).map(|p| p.icon);
+        s.delete_s3_profile(&id)?;
+        icon
+    };
+    if let Some(icon) = icon {
+        remove_custom_icon(&app, &icon);
+    }
+    Ok(())
 }
 
 // Secrets stay in the vault and are never written here; an export carries only the

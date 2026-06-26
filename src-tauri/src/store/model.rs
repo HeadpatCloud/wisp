@@ -50,6 +50,26 @@ pub struct Tunnel {
     pub auto_start: bool,
 }
 
+// A saved S3 / S3-compatible connection. The secret access key never lives here - only a
+// secret_id pointing at the encrypted vault. The access key id is not secret, so it stays inline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct S3Profile {
+    pub id: String,
+    pub name: String,
+    pub endpoint: String,
+    pub port: Option<u16>,
+    pub region: String,
+    pub use_tls: bool,
+    pub path_style: bool,
+    pub access_key_id: String,
+    pub secret_id: Option<String>,
+    pub bucket: Option<String>,
+    #[serde(default)]
+    pub icon: IconRef,
+    pub order: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct Group {
@@ -158,6 +178,8 @@ pub struct ProfileStore {
     pub version: u32,
     pub groups: Vec<Group>,
     pub profiles: Vec<Profile>,
+    #[serde(default)]
+    pub s3_profiles: Vec<S3Profile>,
 }
 
 impl ProfileStore {

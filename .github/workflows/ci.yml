@@ -70,4 +70,8 @@ jobs:
           tool: cargo-audit
 
       - name: Audit Rust dependencies
-        run: cargo audit --file src-tauri/Cargo.lock
+        # RUSTSEC-2023-0071 (rsa Marvin attack): transitive via russh for RSA SSH keys, no
+        # upstream fix; SSH uses RSA for signatures, not the vulnerable PKCS#1v1.5 decryption.
+        # The gtk-rs/glib/paste/unic warnings are unmaintained transitive Tauri deps that don't
+        # fail the run; they clear when Tauri moves off GTK3
+        run: cargo audit --file src-tauri/Cargo.lock --ignore RUSTSEC-2023-0071

@@ -2,7 +2,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window'
 import { message } from '@tauri-apps/plugin-dialog'
 import { Settings } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { events, type ShellInfo } from '@/bindings'
+import { events, type S3Profile, type ShellInfo } from '@/bindings'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -12,6 +12,8 @@ import {
 import { FtpConnectDialog } from '@/features/ftp/FtpConnectDialog'
 import { FtpConnectionView } from '@/features/ftp/FtpConnectionView'
 import { ProfileTree } from '@/features/profiles/ProfileTree'
+import { S3ConnectionView } from '@/features/s3/S3ConnectionView'
+import { S3ProfileDialog } from '@/features/s3/S3ProfileDialog'
 import { LocalTerminalView } from '@/features/sessions/LocalTerminalView'
 import { PanesView } from '@/features/sessions/PanesView'
 import { SftpConnectionView } from '@/features/sessions/SftpConnectionView'
@@ -29,9 +31,11 @@ import { exportProfilesToFile, importProfilesFromFile } from '@/lib/profiles'
 import { watchSystemTheme } from '@/lib/theme'
 import { cn } from '@/lib/utils'
 import { useProfileStore } from '@/stores/profileStore'
+import { useS3ProfileStore } from '@/stores/s3ProfileStore'
 import {
   type FtpTab,
   type LocalTab,
+  type S3Tab,
   type SessionTab,
   type SftpTab,
   useSessionStore,
@@ -50,11 +54,15 @@ export default function App() {
   const openVnc = useSessionStore((s) => s.openVnc)
   const openSftp = useSessionStore((s) => s.openSftp)
   const openFtp = useSessionStore((s) => s.openFtp)
+  const openS3 = useSessionStore((s) => s.openS3)
   const loadSettings = useSettingsStore((s) => s.load)
+  const loadS3 = useS3ProfileStore((s) => s.load)
   const themeValue = useSettingsStore((s) => s.settings.theme)
   const [vncDialogOpen, setVncDialogOpen] = useState(false)
   const [ftpDialogOpen, setFtpDialogOpen] = useState(false)
   const [sftpDialogOpen, setSftpDialogOpen] = useState(false)
+  const [s3DialogOpen, setS3DialogOpen] = useState(false)
+  const [s3Editing, setS3Editing] = useState<S3Profile | null>(null)
   const [shells, setShells] = useState<ShellInfo[]>([])
 
   useEffect(() => {
@@ -75,6 +83,9 @@ export default function App() {
   useEffect(() => {
     loadSettings().catch(console.error)
   }, [loadSettings])
+  useEffect(() => {
+    loadS3().catch(console.error)
+  }, [loadS3])
   useEffect(() => {
     return watchSystemTheme(() =>
       themeValue === 'light' || themeValue === 'dark' ? themeValue : 'system',
@@ -118,6 +129,7 @@ export default function App() {
   const vncTabs = tabs.filter((t): t is VncTab => t.kind === 'vnc')
   const sftpTabs = tabs.filter((t): t is SftpTab => t.kind === 'sftp')
   const ftpTabs = tabs.filter((t): t is FtpTab => t.kind === 'ftp')
+  const s3Tabs = tabs.filter((t): t is S3Tab => t.kind === 's3')
   const activeViewTab = activeTab && activeTab.kind === 'view' ? activeTab : null
 
   return (
@@ -127,6 +139,7 @@ export default function App() {
       <VncConnectDialog open={vncDialogOpen} onOpenChange={setVncDialogOpen} onConnect={openVnc} />
       <FtpConnectDialog open={ftpDialogOpen} onOpenChange={setFtpDialogOpen} onConnect={openFtp} />
       <SftpConnectDialog open={sftpDialogOpen} onOpenChange={setSftpDialogOpen} onPick={openSftp} />
+      <S3ProfileDialog open={s3DialogOpen} onOpenChange={setS3DialogOpen} editing={s3Editing} />
       <AppShell
         sidebar={
           <div className="flex h-full flex-col">
@@ -193,6 +206,15 @@ export default function App() {
                 }
                 onNewVnc={() => setVncDialogOpen(true)}
                 onNewFtp={() => setFtpDialogOpen(true)}
+                onNewS3={() => {
+                  setS3Editing(null)
+                  setS3DialogOpen(true)
+                }}
+                onActivateS3={(p) => openS3(p.id, p.bucket, p.name)}
+                onEditS3={(p) => {
+                  setS3Editing(p)
+                  setS3DialogOpen(true)
+                }}
                 onNewLocalShell={(program, title) => openLocalShell(program, title)}
                 onNewSftp={(profileId, title) => openSftp(profileId, title)}
                 onOpenSftpPicker={() => setSftpDialogOpen(true)}
@@ -265,6 +287,19 @@ export default function App() {
                     secure={t.secure}
                     allowInvalidCert={t.allowInvalidCert}
                     ignoreHostname={t.ignoreHostname}
+                    active={t.id === activeTabId}
+                  />
+                </div>
+              ))}
+              {s3Tabs.map((t) => (
+                <div
+                  key={t.id}
+                  data-testid={`tabpane-${t.id}`}
+                  className={cn('absolute inset-0', t.id !== activeTabId && 'hidden')}
+                >
+                  <S3ConnectionView
+                    profileId={t.profileId}
+                    bucket={t.bucket}
                     active={t.id === activeTabId}
                   />
                 </div>

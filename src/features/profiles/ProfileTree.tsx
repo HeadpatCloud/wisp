@@ -1,6 +1,7 @@
 import {
   ChevronDown,
   ChevronRight,
+  Cloud,
   FolderPlus,
   FolderTree,
   Monitor,
@@ -11,7 +12,7 @@ import {
 } from 'lucide-react'
 import type { ReactNode, PointerEvent as ReactPointerEvent } from 'react'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { Group, Profile, ShellInfo } from '@/bindings'
+import type { Group, Profile, S3Profile, ShellInfo } from '@/bindings'
 import {
   ContextMenu,
   ContextMenuContent,
@@ -30,6 +31,7 @@ import {
 import { Input } from '@/components/ui/input'
 import { duplicateProfile, reorderGroups, reorderProfiles } from '@/lib/profiles'
 import { useProfileStore } from '@/stores/profileStore'
+import { useS3ProfileStore } from '@/stores/s3ProfileStore'
 import { ProfileIcon } from './ProfileIcon'
 
 const COLLAPSED_KEY = 'sidebar-collapsed'
@@ -77,6 +79,9 @@ interface ProfileTreeProps {
   onNewProfile: () => void
   onNewVnc: () => void
   onNewFtp: () => void
+  onNewS3: () => void
+  onActivateS3: (profile: S3Profile) => void
+  onEditS3: (profile: S3Profile) => void
   onNewLocalShell: (program: string | null, title: string) => void
   onNewSftp: (profileId: string, title: string) => void
   onOpenSftpPicker: () => void
@@ -91,6 +96,9 @@ export function ProfileTree({
   onNewProfile,
   onNewVnc,
   onNewFtp,
+  onNewS3,
+  onActivateS3,
+  onEditS3,
   onNewLocalShell,
   onNewSftp,
   onOpenSftpPicker,
@@ -101,6 +109,8 @@ export function ProfileTree({
 }: ProfileTreeProps) {
   const groups = useProfileStore((s) => s.groups)
   const profiles = useProfileStore((s) => s.profiles)
+  const s3Profiles = useS3ProfileStore((s) => s.profiles)
+  const removeS3 = useS3ProfileStore((s) => s.remove)
   const removeProfile = useProfileStore((s) => s.removeProfile)
   const removeGroup = useProfileStore((s) => s.removeGroup)
   const saveProfile = useProfileStore((s) => s.saveProfile)
@@ -241,6 +251,9 @@ export function ProfileTree({
             <DropdownMenuItem onSelect={onNewVnc}>
               <Monitor /> VNC connection
             </DropdownMenuItem>
+            <DropdownMenuItem onSelect={onNewS3}>
+              <Cloud /> S3 connection
+            </DropdownMenuItem>
             {shells.length > 1 ? (
               <DropdownMenuSub>
                 <DropdownMenuSubTrigger>
@@ -277,7 +290,7 @@ export function ProfileTree({
       </div>
 
       <div data-tree className="min-h-0 flex-1 overflow-y-auto px-1 pb-2">
-        {groups.length === 0 && profiles.length === 0 && (
+        {groups.length === 0 && profiles.length === 0 && s3Profiles.length === 0 && (
           <div className="px-2 py-6 text-center text-muted-foreground text-xs">
             No hosts yet. Use + to add a profile, or Import from ~/.ssh/config.
           </div>
@@ -346,6 +359,33 @@ export function ProfileTree({
             }}
           />
         ))}
+        {s3Profiles.length > 0 && (
+          <div className="mt-2">
+            <div className="px-2 py-1 font-medium text-muted-foreground text-xs">S3</div>
+            {s3Profiles
+              .filter((p) => {
+                const q = query.trim().toLowerCase()
+                return (
+                  !q || p.name.toLowerCase().includes(q) || p.endpoint.toLowerCase().includes(q)
+                )
+              })
+              .map((p) => (
+                <Row key={p.id} onEdit={() => onEditS3(p)} onDelete={() => removeS3(p.id)}>
+                  <button
+                    type="button"
+                    onDoubleClick={() => onActivateS3(p)}
+                    className="flex w-full select-none items-center gap-1.5 rounded border-2 border-transparent px-1.5 py-1 text-sm hover:bg-muted"
+                  >
+                    <Cloud className="size-4 text-muted-foreground" />
+                    <span className="truncate">{p.name}</span>
+                    <span className="ml-auto truncate text-muted-foreground text-xs">
+                      {p.endpoint}
+                    </span>
+                  </button>
+                </Row>
+              ))}
+          </div>
+        )}
       </div>
     </div>
   )

@@ -1,4 +1,5 @@
 import { formatBytes } from '@/lib/format'
+import { cancelQueuedTransfer } from '@/lib/transferQueue'
 import { cancelTransfer } from '@/lib/transfers'
 import { useTransferStore } from '@/stores/transferStore'
 
@@ -19,9 +20,11 @@ export function TransfersBar() {
               <span className="flex shrink-0 items-center gap-1 text-muted-foreground">
                 {t.status === 'error'
                   ? 'error'
-                  : t.total > 0
-                    ? `${pct}% - ${formatBytes(t.transferred)} / ${formatBytes(t.total)}`
-                    : `${pct}%`}
+                  : t.status === 'queued'
+                    ? 'queued'
+                    : t.total > 0
+                      ? `${pct}% - ${formatBytes(t.transferred)} / ${formatBytes(t.total)}`
+                      : `${pct}%`}
                 {t.status === 'active' ? (
                   <button
                     type="button"
@@ -35,7 +38,10 @@ export function TransfersBar() {
                   <button
                     type="button"
                     aria-label={`Dismiss ${t.name}`}
-                    onClick={() => remove(t.id)}
+                    onClick={() => {
+                      if (t.status === 'queued') cancelQueuedTransfer(t.id)
+                      remove(t.id)
+                    }}
                     className="rounded px-1 hover:bg-muted"
                   >
                     ✕

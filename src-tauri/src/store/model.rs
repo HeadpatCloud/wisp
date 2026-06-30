@@ -128,6 +128,8 @@ pub struct Settings {
     pub scrollback: u32,
     #[serde(default)]
     pub vnc_clipboard_sync: bool,
+    #[serde(default = "default_max_transfers")]
+    pub max_concurrent_transfers: u32,
 }
 
 fn default_accent() -> String {
@@ -151,6 +153,9 @@ fn default_true() -> bool {
 fn default_scrollback() -> u32 {
     10000
 }
+fn default_max_transfers() -> u32 {
+    3
+}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -168,6 +173,7 @@ impl Default for Settings {
             cursor_blink: true,
             scrollback: default_scrollback(),
             vnc_clipboard_sync: false,
+            max_concurrent_transfers: default_max_transfers(),
         }
     }
 }

@@ -3,6 +3,7 @@ import { commands, type ProfileAppearance, type Settings } from '@/bindings'
 import type { AppearanceSettings } from '@/features/sessions/terminalTheme'
 import { unwrap } from '@/lib/ipc'
 import { type AppTheme, applyAccent, applyAppTheme, applyBackground, cacheTheme } from '@/lib/theme'
+import { setTransferLimit } from '@/lib/transferQueue'
 
 const DEFAULTS: Settings = {
   theme: 'system',
@@ -18,6 +19,7 @@ const DEFAULTS: Settings = {
   cursorBlink: true,
   scrollback: 10000,
   vncClipboardSync: false,
+  maxConcurrentTransfers: 3,
 }
 
 function asAppTheme(theme: string): AppTheme {
@@ -70,6 +72,7 @@ export const useSettingsStore = create<SettingsState>()((set, get) => ({
     applyAccent(settings.accent ?? 'teal')
     applyBackground(settings.background ?? 'teal')
     cacheTheme(asAppTheme(settings.theme))
+    setTransferLimit(settings.maxConcurrentTransfers ?? 3)
     set({ settings, loaded: true })
   },
   update: async (patch) => {
@@ -80,6 +83,7 @@ export const useSettingsStore = create<SettingsState>()((set, get) => ({
     applyAccent(next.accent ?? 'teal')
     applyBackground(next.background ?? 'teal')
     cacheTheme(asAppTheme(next.theme))
+    setTransferLimit(next.maxConcurrentTransfers ?? 3)
     set({ settings: next })
     await commands.setSettings(next).then(unwrap).catch(console.error)
   },

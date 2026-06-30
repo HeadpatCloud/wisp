@@ -1,7 +1,7 @@
 import { create } from 'zustand'
 
 export type TransferDir = 'upload' | 'download'
-export type TransferStatus = 'active' | 'done' | 'error'
+export type TransferStatus = 'queued' | 'active' | 'done' | 'error'
 
 export interface Transfer {
   id: string
@@ -15,6 +15,7 @@ export interface Transfer {
 interface TransferState {
   transfers: Transfer[]
   start: (t: Transfer) => void
+  activate: (id: string) => void
   progress: (id: string, transferred: number, total: number) => void
   finish: (id: string, error?: boolean) => void
   remove: (id: string) => void
@@ -24,6 +25,10 @@ interface TransferState {
 export const useTransferStore = create<TransferState>()((set, get) => ({
   transfers: [],
   start: (t) => set({ transfers: [...get().transfers, t] }),
+  activate: (id) =>
+    set({
+      transfers: get().transfers.map((t) => (t.id === id ? { ...t, status: 'active' } : t)),
+    }),
   progress: (id, transferred, total) =>
     set({
       transfers: get().transfers.map((t) => (t.id === id ? { ...t, transferred, total } : t)),

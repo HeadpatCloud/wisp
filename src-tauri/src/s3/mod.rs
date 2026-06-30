@@ -1,10 +1,10 @@
 use std::fmt::Write as _;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
-use futures_util::StreamExt;
+use futures_util::stream::{self, StreamExt};
 use hmac::{Hmac, Mac};
 use s3::bucket::Bucket;
 use s3::creds::Credentials;
@@ -18,6 +18,10 @@ use crate::sftp::{sort_entries, SftpEntry};
 
 type HmacSha256 = Hmac<Sha256>;
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+// Per-folder fan-out: how many objects to download / delete at once within a single folder op.
+const FOLDER_DOWNLOAD_CONCURRENCY: usize = 6;
+const DELETE_CONCURRENCY: usize = 16;
 
 fn s3err(e: impl std::fmt::Display) -> AppError {
     AppError::Internal(format!("s3: {e}"))
@@ -299,18 +303,21 @@ pub async fn upload<F: FnMut(u64, u64) + Send + Unpin>(
     Ok(())
 }
 
-// Stream one object to disk, reporting cumulative bytes (across a whole folder) as it goes.
-async fn download_object<F: FnMut(u64, u64) + Send>(
+// Stream one object to disk. `transferred` is the cumulative byte counter shared across a whole
+// folder, so concurrent downloads all report against the same running total.
+async fn download_object<F: Fn(u64, u64) + Send + Sync>(
     bucket: &Bucket,
     key: &str,
     dest: &Path,
-    transferred: &mut u64,
+    transferred: &AtomicU64,
     total: u64,
     cancel: &AtomicBool,
-    on_progress: &mut F,
+    on_progress: &F,
 ) -> AppResult<()> {
     let mut stream = bucket.get_object_stream(key).await.map_err(s3err)?;
     let mut file = tokio::fs::File::create(dest).await.map_err(s3err)?;
+    // Coalesce progress so a large file doesn't fire an IPC message per network chunk.
+    let mut since_emit = 0u64;
     while let Some(chunk) = stream.bytes().next().await {
         if cancel.load(Ordering::Relaxed) {
             drop(file);
@@ -319,16 +326,22 @@ async fn download_object<F: FnMut(u64, u64) + Send>(
         }
         let chunk = chunk.map_err(s3err)?;
         file.write_all(&chunk).await.map_err(s3err)?;
-        *transferred += chunk.len() as u64;
-        on_progress(*transferred, total);
+        let added = chunk.len() as u64;
+        let now = transferred.fetch_add(added, Ordering::Relaxed) + added;
+        since_emit += added;
+        if since_emit >= 256 * 1024 {
+            since_emit = 0;
+            on_progress(now, total);
+        }
     }
     file.flush().await.map_err(s3err)?;
+    on_progress(transferred.load(Ordering::Relaxed), total);
     Ok(())
 }
 
 // A file goes to `local_path`; a folder downloads every object under its prefix into the
 // `local_path` directory, preserving the sub-prefix structure. Progress is byte counts.
-pub async fn download<F: FnMut(u64, u64) + Send>(
+pub async fn download<F: Fn(u64, u64) + Send + Sync>(
     cfg: &S3Config,
     bucket_name: &str,
     key: &str,
@@ -336,13 +349,13 @@ pub async fn download<F: FnMut(u64, u64) + Send>(
     is_dir: bool,
     size: u64,
     cancel: &AtomicBool,
-    mut on_progress: F,
+    on_progress: F,
 ) -> AppResult<()> {
     let bucket = cfg.bucket(bucket_name)?;
+    let transferred = AtomicU64::new(0);
     if !is_dir {
         // `size` is the object size the listing already reported, so no HEAD round-trip.
-        let mut transferred = 0;
-        return download_object(&bucket, key, Path::new(local_path), &mut transferred, size, cancel, &mut on_progress).await;
+        return download_object(&bucket, key, Path::new(local_path), &transferred, size, cancel, &on_progress).await;
     }
 
     let prefix = if key.ends_with('/') { key.to_string() } else { format!("{key}/") };
@@ -356,26 +369,83 @@ pub async fn download<F: FnMut(u64, u64) + Send>(
     let total: u64 = objects.iter().map(|(_, size)| *size).sum();
     let base = Path::new(local_path);
     tokio::fs::create_dir_all(base).await.map_err(s3err)?;
-    let mut transferred = 0;
+    // Pre-create every parent dir sequentially so the concurrent downloads don't race on mkdir,
+    // then fan out the object transfers up to FOLDER_DOWNLOAD_CONCURRENCY at a time.
+    let mut tasks: Vec<(String, std::path::PathBuf)> = Vec::with_capacity(objects.len());
     for (okey, _) in objects {
-        if cancel.load(Ordering::Relaxed) {
-            return Err(s3err("transfer cancelled"));
-        }
-        let rel = okey.strip_prefix(&prefix).unwrap_or(&okey);
-        let dest = base.join(rel);
+        let rel = okey.strip_prefix(&prefix).unwrap_or(&okey).to_string();
+        let dest = base.join(&rel);
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(s3err)?;
         }
-        download_object(&bucket, &okey, &dest, &mut transferred, total, cancel, &mut on_progress).await?;
+        tasks.push((okey, dest));
+    }
+    let all_dests: Vec<std::path::PathBuf> = tasks.iter().map(|(_, dest)| dest.clone()).collect();
+    let bucket = &bucket;
+    let transferred = &transferred;
+    let on_progress = &on_progress;
+    let mut runners = stream::iter(tasks)
+        .map(|(okey, dest)| async move {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(s3err("transfer cancelled"));
+            }
+            download_object(bucket, &okey, &dest, transferred, total, cancel, on_progress).await
+        })
+        .buffer_unordered(FOLDER_DOWNLOAD_CONCURRENCY);
+    let mut failure: Option<AppError> = None;
+    while let Some(res) = runners.next().await {
+        if let Err(e) = res {
+            failure = Some(e);
+            break;
+        }
+    }
+    // Drop the in-flight downloads (a dropped future can leave a partial file) before rolling back.
+    drop(runners);
+    if let Some(e) = failure {
+        rollback_folder(&all_dests, base).await;
+        return Err(e);
     }
     Ok(())
 }
 
+// Undo a cancelled/failed folder download: remove every file it may have written (finished or
+// partial) and prune the dirs it created that are now empty. remove_dir only deletes empty dirs,
+// so any pre-existing content under `base` is left untouched.
+async fn rollback_folder(dests: &[std::path::PathBuf], base: &Path) {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    for f in dests {
+        let _ = tokio::fs::remove_file(f).await;
+        let mut cur = f.parent();
+        while let Some(dir) = cur {
+            if !dir.starts_with(base) {
+                break;
+            }
+            if !dirs.iter().any(|d| d == dir) {
+                dirs.push(dir.to_path_buf());
+            }
+            if dir == base {
+                break;
+            }
+            cur = dir.parent();
+        }
+    }
+    // Deepest first so nested empty dirs collapse in a single pass.
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+    for d in dirs {
+        let _ = tokio::fs::remove_dir(&d).await;
+    }
+}
+
 // rust-s3 mis-signs DELETE against Ceph RGW (SignatureDoesNotMatch), so sign it ourselves.
-pub async fn delete_object(cfg: &S3Config, bucket_name: &str, key: &str) -> AppResult<()> {
+async fn delete_one(
+    client: &reqwest::Client,
+    cfg: &S3Config,
+    bucket_name: &str,
+    key: &str,
+) -> AppResult<()> {
     let uri = format!("/{bucket_name}/{}", aws_uri_encode(key));
     let (amz_date, authorization) = sign_v4(cfg, "DELETE", &uri, &[]);
-    let resp = signed_client()?
+    let resp = client
         .delete(format!("{}{uri}", cfg.endpoint))
         .header("x-amz-date", &amz_date)
         .header("x-amz-content-sha256", EMPTY_SHA256)
@@ -391,15 +461,25 @@ pub async fn delete_object(cfg: &S3Config, bucket_name: &str, key: &str) -> AppR
     Ok(())
 }
 
-// S3 has no folders, so a delete of one removes every object under its prefix.
+pub async fn delete_object(cfg: &S3Config, bucket_name: &str, key: &str) -> AppResult<()> {
+    delete_one(&signed_client()?, cfg, bucket_name, key).await
+}
+
+// S3 has no folders, so a delete of one removes every object under its prefix. Uses the same
+// hand-signed DELETE as single objects (rust-s3's would 403), one shared client, fanned out up to
+// DELETE_CONCURRENCY at a time.
 pub async fn delete_prefix(cfg: &S3Config, bucket_name: &str, prefix: &str) -> AppResult<()> {
     let prefix = if prefix.ends_with('/') { prefix.to_string() } else { format!("{prefix}/") };
     let bucket = cfg.bucket(bucket_name)?;
     let results = bucket.list(prefix, None).await.map_err(s3err)?;
-    for res in results {
-        for obj in res.contents {
-            bucket.delete_object(&obj.key).await.map_err(s3err)?;
-        }
+    let keys: Vec<String> = results.into_iter().flat_map(|r| r.contents).map(|o| o.key).collect();
+    let client = signed_client()?;
+    let client = &client;
+    let mut runners = stream::iter(keys)
+        .map(|key| async move { delete_one(client, cfg, bucket_name, &key).await })
+        .buffer_unordered(DELETE_CONCURRENCY);
+    while let Some(res) = runners.next().await {
+        res?;
     }
     Ok(())
 }
@@ -435,4 +515,33 @@ pub async fn create_folder(cfg: &S3Config, bucket_name: &str, prefix: &str) -> A
     let bucket = cfg.bucket(bucket_name)?;
     bucket.put_object(&key, &[]).await.map_err(s3err)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rollback_removes_our_files_and_empty_dirs_but_keeps_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("download");
+        let sub = base.join("nested");
+        tokio::fs::create_dir_all(&sub).await.unwrap();
+
+        let ours_top = base.join("a.txt");
+        let ours_nested = sub.join("b.txt");
+        let preexisting = base.join("keep.txt");
+        tokio::fs::write(&ours_top, b"a").await.unwrap();
+        tokio::fs::write(&ours_nested, b"b").await.unwrap();
+        tokio::fs::write(&preexisting, b"keep").await.unwrap();
+
+        rollback_folder(&[ours_top.clone(), ours_nested.clone()], &base).await;
+
+        assert!(!ours_top.exists());
+        assert!(!ours_nested.exists());
+        // The nested dir held only our file, so it's gone; base still holds the pre-existing file.
+        assert!(!sub.exists());
+        assert!(preexisting.exists());
+        assert!(base.exists());
+    }
 }

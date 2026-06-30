@@ -19,7 +19,7 @@ import { useSessionStore } from '@/stores/sessionStore'
 import { useSettingsStore } from '@/stores/settingsStore'
 import { TerminalPreview } from './TerminalPreview'
 
-const SECTIONS = ['Appearance', 'Security', 'About'] as const
+const SECTIONS = ['Appearance', 'Transfers', 'Security', 'About'] as const
 const REPO_URL = 'https://github.com/headpatcloud/wisp'
 type Section = (typeof SECTIONS)[number]
 
@@ -248,6 +248,30 @@ export function SettingsPage({ tabId }: { tabId: string }) {
                 />
               </div>
             </>
+          )}
+          {section === 'Transfers' && (
+            <div className="space-y-2">
+              <div className="space-y-1">
+                <Label htmlFor="maxTransfers">Concurrent transfers</Label>
+                <Input
+                  id="maxTransfers"
+                  type="number"
+                  min={1}
+                  max={16}
+                  value={settings.maxConcurrentTransfers ?? 3}
+                  onChange={(e) => {
+                    const n = Number(e.target.value)
+                    if (Number.isFinite(n) && n >= 1) {
+                      update({ maxConcurrentTransfers: Math.min(16, Math.floor(n)) })
+                    }
+                  }}
+                />
+                <p className="text-muted-foreground text-xs">
+                  How many uploads or downloads run at once. The rest wait in a queue. 1-16, default
+                  3.
+                </p>
+              </div>
+            </div>
           )}
           {section === 'Security' && (
             <div className="space-y-2">

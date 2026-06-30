@@ -13,6 +13,7 @@ import {
 } from '@/components/ui/dialog'
 import { PromptDialog } from '@/components/ui/prompt-dialog'
 import { basename } from '@/lib/sftp'
+import { runTransfer } from '@/lib/transferQueue'
 import { useTransferStore } from '@/stores/transferStore'
 import { FileList } from '../sftp/FileList'
 import { TransfersBar } from '../sftp/TransfersBar'
@@ -92,6 +93,7 @@ export function FileBrowser({
 }) {
   const { cwd, entries, error, up, enter, refresh } = useFileBrowser(backend, initialPath)
   const start = useTransferStore((s) => s.start)
+  const activate = useTransferStore((s) => s.activate)
   const progress = useTransferStore((s) => s.progress)
   const finish = useTransferStore((s) => s.finish)
   const cwdRef = useRef(cwd)
@@ -102,16 +104,19 @@ export function FileBrowser({
   activeRef.current = active
   const [op, setOp] = useState<Op | null>(null)
 
-  async function doDownload(entry: SftpEntry) {
+  function doDownload(entry: SftpEntry) {
     const id = crypto.randomUUID()
-    start({ id, dir: 'download', name: entry.name, transferred: 0, total: 0, status: 'active' })
-    try {
-      const ok = await backend.download(id, entry, (p) => progress(id, p.transferred, p.total))
-      finish(id)
-      if (!ok) useTransferStore.getState().remove(id)
-    } catch {
-      finish(id, true)
-    }
+    start({ id, dir: 'download', name: entry.name, transferred: 0, total: 0, status: 'queued' })
+    runTransfer(id, async () => {
+      activate(id)
+      try {
+        const ok = await backend.download(id, entry, (p) => progress(id, p.transferred, p.total))
+        finish(id)
+        if (!ok) useTransferStore.getState().remove(id)
+      } catch {
+        finish(id, true)
+      }
+    })
   }
 
   async function uploadPaths(paths: string[]) {
@@ -126,16 +131,21 @@ export function FileBrowser({
       )
       if (!ok) return
     }
-    for (const p of paths) {
+    const dir = cwdRef.current
+    const runs = paths.map((p) => {
       const id = crypto.randomUUID()
-      start({ id, dir: 'upload', name: basename(p), transferred: 0, total: 0, status: 'active' })
-      try {
-        await backend.upload(id, p, cwdRef.current, (pr) => progress(id, pr.transferred, pr.total))
-        finish(id)
-      } catch {
-        finish(id, true)
-      }
-    }
+      start({ id, dir: 'upload', name: basename(p), transferred: 0, total: 0, status: 'queued' })
+      return runTransfer(id, async () => {
+        activate(id)
+        try {
+          await backend.upload(id, p, dir, (pr) => progress(id, pr.transferred, pr.total))
+          finish(id)
+        } catch {
+          finish(id, true)
+        }
+      })
+    })
+    await Promise.allSettled(runs)
     refresh(cwdRef.current)
   }
 

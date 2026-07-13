@@ -7,11 +7,13 @@ use specta::Type;
 use tauri::ipc::Channel;
 use tauri::State;
 use tokio::sync::Mutex as TokioMutex;
+use zeroize::Zeroizing;
 
 use crate::commands::ssh_cmds::{self, KnownHostsState, Sessions};
 use crate::error::{AppError, AppResult};
 use crate::sftp::{self, transfer, SftpEntry};
 use crate::ssh::client::SshHandle;
+use crate::store::model::AuthMethod;
 use crate::store::Store;
 use crate::vault::Vault;
 
@@ -42,8 +44,22 @@ pub struct SftpConn {
 #[derive(Default)]
 pub struct SftpConns(pub TokioMutex<HashMap<String, SftpConn>>);
 
-// Connect SSH for a saved profile and open an SFTP session without a PTY. The session is
-// pre-cached in SftpSessions so the existing sftp_* commands resolve it by id.
+// Open an SFTP session (no PTY) on a fresh connection and pre-cache it in SftpSessions
+// so the existing sftp_* commands resolve it by id.
+async fn register_standalone(
+    sftps: &State<'_, SftpSessions>,
+    conns: &State<'_, SftpConns>,
+    handle: SshHandle,
+    bastions: Vec<SshHandle>,
+) -> AppResult<String> {
+    let handle = Arc::new(handle);
+    let sftp = Arc::new(sftp::open_sftp(&handle).await?);
+    let id = uuid::Uuid::new_v4().to_string();
+    sftps.0.lock().await.insert(id.clone(), sftp);
+    conns.0.lock().await.insert(id.clone(), SftpConn { handle, bastions });
+    Ok(id)
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn sftp_connect(
@@ -56,12 +72,35 @@ pub async fn sftp_connect(
 ) -> AppResult<String> {
     let (handle, bastions, _forwards) =
         ssh_cmds::connect_via_chain(&store, &vault, &known, &profile_id).await?;
-    let handle = Arc::new(handle);
-    let sftp = Arc::new(sftp::open_sftp(&handle).await?);
-    let id = uuid::Uuid::new_v4().to_string();
-    sftps.0.lock().await.insert(id.clone(), sftp);
-    conns.0.lock().await.insert(id.clone(), SftpConn { handle, bastions });
-    Ok(id)
+    register_standalone(&sftps, &conns, handle, bastions).await
+}
+
+// Same as sftp_connect but for a one-off host with no saved profile (no jump chain).
+#[tauri::command]
+#[specta::specta]
+pub async fn sftp_connect_adhoc(
+    known: State<'_, KnownHostsState>,
+    sftps: State<'_, SftpSessions>,
+    conns: State<'_, SftpConns>,
+    host: String,
+    port: u16,
+    username: String,
+    auth_method: AuthMethod,
+    key_path: Option<String>,
+    secret: Option<String>,
+) -> AppResult<String> {
+    let secret = secret.map(Zeroizing::new);
+    let handle = ssh_cmds::connect_adhoc(
+        &known,
+        &host,
+        port,
+        &username,
+        auth_method,
+        key_path.as_deref(),
+        secret,
+    )
+    .await?;
+    register_standalone(&sftps, &conns, handle, Vec::new()).await
 }
 
 #[tauri::command]

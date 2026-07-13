@@ -85,7 +85,14 @@ pub(crate) async fn connect_via_chain(
     let root_forwards = client::new_forwards();
     let mut prev =
         client::connect(&root.host, root.port, known.0.clone(), root_forwards.clone()).await?;
-    authenticate(&mut prev, root, secret_for(vault, root)?).await?;
+    authenticate(
+        &mut prev,
+        &root.username,
+        root.auth_method,
+        root.key_path.as_deref(),
+        secret_for(vault, root)?,
+    )
+    .await?;
 
     let mut bastions: Vec<SshHandle> = Vec::new();
     let mut prev_forwards = root_forwards;
@@ -103,37 +110,59 @@ pub(crate) async fn connect_via_chain(
             hop_forwards.clone(),
         )
         .await?;
-        authenticate(&mut next, hop, secret_for(vault, hop)?).await?;
+        authenticate(
+            &mut next,
+            &hop.username,
+            hop.auth_method,
+            hop.key_path.as_deref(),
+            secret_for(vault, hop)?,
+        )
+        .await?;
         prev = next;
         prev_forwards = hop_forwards;
     }
     Ok((prev, bastions, prev_forwards))
 }
 
+pub(crate) async fn connect_adhoc(
+    known: &State<'_, KnownHostsState>,
+    host: &str,
+    port: u16,
+    username: &str,
+    auth_method: AuthMethod,
+    key_path: Option<&str>,
+    secret: Option<Zeroizing<String>>,
+) -> AppResult<SshHandle> {
+    let mut handle = client::connect(host, port, known.0.clone(), client::new_forwards()).await?;
+    authenticate(&mut handle, username, auth_method, key_path, secret).await?;
+    Ok(handle)
+}
+
 async fn authenticate(
     handle: &mut SshHandle,
-    profile: &Profile,
+    username: &str,
+    auth_method: AuthMethod,
+    key_path: Option<&str>,
     secret: Option<Zeroizing<String>>,
 ) -> AppResult<()> {
-    match profile.auth_method {
+    match auth_method {
         AuthMethod::Password => {
             let pw = secret.ok_or_else(|| AppError::Auth("no password stored".into()))?;
-            match client::auth_password(handle, &profile.username, &pw).await {
+            match client::auth_password(handle, username, &pw).await {
                 Ok(()) => Ok(()),
                 // Some servers only offer keyboard-interactive for password login.
                 Err(AppError::Auth(_)) => {
-                    client::auth_keyboard_interactive(handle, &profile.username, &pw).await
+                    client::auth_keyboard_interactive(handle, username, &pw).await
                 }
                 Err(e) => Err(e),
             }
         }
         AuthMethod::Key => {
-            let key_path =
-                profile.key_path.as_deref().ok_or_else(|| AppError::Auth("no key path".into()))?;
+            let key_path = key_path.ok_or_else(|| AppError::Auth("no key path".into()))?;
             let passphrase = secret.as_ref().map(|s| s.as_str());
-            client::auth_key(handle, &profile.username, key_path, passphrase).await
+            client::auth_key(handle, username, key_path, passphrase).await
         }
-        AuthMethod::Agent => client::auth_agent(handle, &profile.username).await,
+        AuthMethod::Agent => client::auth_agent(handle, username).await,
     }
 }
 

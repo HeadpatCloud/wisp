@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import type { SftpAdhocParams } from '@/lib/sftp'
 
 export type SessionStatus = 'connecting' | 'connected' | 'closed' | 'error'
 export type SplitDirection = 'horizontal' | 'vertical'
@@ -54,7 +55,8 @@ export interface SftpTab {
   id: string
   kind: 'sftp'
   title: string
-  profileId: string
+  profileId: string | null
+  adhoc: SftpAdhocParams | null
 }
 
 export interface FtpTab {
@@ -95,6 +97,7 @@ interface SessionState {
   openLocalShell: (program?: string | null, title?: string) => void
   openVnc: (host: string, port: number, password: string) => void
   openSftp: (profileId: string, title: string) => void
+  openSftpAdhoc: (params: SftpAdhocParams) => void
   openFtp: (params: {
     host: string
     port: number
@@ -165,7 +168,18 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
   },
 
   openSftp: (profileId, title) => {
-    const tab: SftpTab = { id: crypto.randomUUID(), kind: 'sftp', title, profileId }
+    const tab: SftpTab = { id: crypto.randomUUID(), kind: 'sftp', title, profileId, adhoc: null }
+    set({ tabs: [...get().tabs, tab], activeTabId: tab.id })
+  },
+
+  openSftpAdhoc: (params) => {
+    const tab: SftpTab = {
+      id: crypto.randomUUID(),
+      kind: 'sftp',
+      title: `${params.host}:${params.port}`,
+      profileId: null,
+      adhoc: params,
+    }
     set({ tabs: [...get().tabs, tab], activeTabId: tab.id })
   },
 
@@ -196,7 +210,8 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
     if (tab.kind === 'local') {
       get().openLocalShell(tab.program, tab.title)
     } else if (tab.kind === 'sftp') {
-      get().openSftp(tab.profileId, tab.title)
+      if (tab.adhoc) get().openSftpAdhoc(tab.adhoc)
+      else if (tab.profileId) get().openSftp(tab.profileId, tab.title)
     } else if (tab.kind === 'ftp') {
       get().openFtp(tab)
     } else if (tab.kind === 's3') {

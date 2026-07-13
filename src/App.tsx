@@ -53,6 +53,7 @@ export default function App() {
   const openLocalShell = useSessionStore((s) => s.openLocalShell)
   const openVnc = useSessionStore((s) => s.openVnc)
   const openSftp = useSessionStore((s) => s.openSftp)
+  const openSftpAdhoc = useSessionStore((s) => s.openSftpAdhoc)
   const openFtp = useSessionStore((s) => s.openFtp)
   const openS3 = useSessionStore((s) => s.openS3)
   const loadSettings = useSettingsStore((s) => s.load)
@@ -138,7 +139,12 @@ export default function App() {
       <UpdateBanner />
       <VncConnectDialog open={vncDialogOpen} onOpenChange={setVncDialogOpen} onConnect={openVnc} />
       <FtpConnectDialog open={ftpDialogOpen} onOpenChange={setFtpDialogOpen} onConnect={openFtp} />
-      <SftpConnectDialog open={sftpDialogOpen} onOpenChange={setSftpDialogOpen} onPick={openSftp} />
+      <SftpConnectDialog
+        open={sftpDialogOpen}
+        onOpenChange={setSftpDialogOpen}
+        onPick={openSftp}
+        onConnect={openSftpAdhoc}
+      />
       <S3ProfileDialog open={s3DialogOpen} onOpenChange={setS3DialogOpen} editing={s3Editing} />
       <AppShell
         sidebar={
@@ -270,7 +276,11 @@ export default function App() {
                   data-testid={`tabpane-${t.id}`}
                   className={cn('absolute inset-0', t.id !== activeTabId && 'hidden')}
                 >
-                  <SftpConnectionView profileId={t.profileId} active={t.id === activeTabId} />
+                  <SftpConnectionView
+                    profileId={t.profileId}
+                    adhoc={t.adhoc}
+                    active={t.id === activeTabId}
+                  />
                 </div>
               ))}
               {ftpTabs.map((t) => (

@@ -1,11 +1,19 @@
 import { useEffect, useRef, useState } from 'react'
 import type { AppError } from '@/bindings'
-import { connectSftp, disconnectSftp } from '@/lib/sftp'
+import { connectSftp, connectSftpAdhoc, disconnectSftp, type SftpAdhocParams } from '@/lib/sftp'
 import { trustHostKey } from '@/lib/ssh'
 import { SftpPanel } from '../sftp/SftpPanel'
 import { HostKeyDialog, type HostKeyPrompt } from './HostKeyDialog'
 
-export function SftpConnectionView({ profileId, active }: { profileId: string; active?: boolean }) {
+export function SftpConnectionView({
+  profileId,
+  adhoc,
+  active,
+}: {
+  profileId: string | null
+  adhoc?: SftpAdhocParams | null
+  active?: boolean
+}) {
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [hostKeyPrompt, setHostKeyPrompt] = useState<HostKeyPrompt | null>(null)
@@ -18,7 +26,12 @@ export function SftpConnectionView({ profileId, active }: { profileId: string; a
     idRef.current = null
     setSessionId(null)
     setError(null)
-    connectSftp(profileId)
+    const connect = adhoc
+      ? connectSftpAdhoc(adhoc)
+      : profileId
+        ? connectSftp(profileId)
+        : Promise.reject(new Error('SFTP tab has no profile or connection parameters'))
+    connect
       .then((sid) => {
         if (disposed) {
           disconnectSftp(sid).catch(() => {})
@@ -51,7 +64,7 @@ export function SftpConnectionView({ profileId, active }: { profileId: string; a
       disposed = true
       if (idRef.current) disconnectSftp(idRef.current).catch(() => {})
     }
-  }, [profileId, nonce])
+  }, [profileId, adhoc, nonce])
 
   if (sessionId) return <SftpPanel sessionId={sessionId} active={active} />
 

@@ -75,6 +75,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
             sftp_cmds::sftp_download,
             sftp_cmds::sftp_cancel,
             sftp_cmds::sftp_connect,
+            sftp_cmds::sftp_connect_adhoc,
             sftp_cmds::sftp_disconnect,
             ftp_cmds::ftp_connect,
             ftp_cmds::ftp_list,

@@ -1,11 +1,35 @@
 import { Channel } from '@tauri-apps/api/core'
 import { open, save } from '@tauri-apps/plugin-dialog'
-import { commands, type SftpEntry, type TransferProgress } from '@/bindings'
+import { type AuthMethod, commands, type SftpEntry, type TransferProgress } from '@/bindings'
 import { unwrap } from '@/lib/ipc'
+
+export interface SftpAdhocParams {
+  host: string
+  port: number
+  username: string
+  authMethod: AuthMethod
+  keyPath: string
+  secret: string
+}
 
 // Throws the raw AppError (not unwrapped) so callers can inspect err.kind for host-key prompts.
 export async function connectSftp(profileId: string): Promise<string> {
   const res = await commands.sftpConnect(profileId)
+  if (res.status === 'error') throw res.error
+  return res.data
+}
+
+// Throws the raw AppError, same as connectSftp. An empty password is still sent (some
+// servers allow it); an empty key passphrase means an unencrypted key, so it becomes null.
+export async function connectSftpAdhoc(p: SftpAdhocParams): Promise<string> {
+  const res = await commands.sftpConnectAdhoc(
+    p.host,
+    p.port,
+    p.username,
+    p.authMethod,
+    p.keyPath || null,
+    p.authMethod === 'password' ? p.secret : p.secret || null,
+  )
   if (res.status === 'error') throw res.error
   return res.data
 }

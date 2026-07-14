@@ -6,7 +6,7 @@ use std::time::UNIX_EPOCH;
 use suppaftp::list::File as FtpFile;
 use suppaftp::native_tls::TlsConnector;
 use suppaftp::types::FileType;
-use suppaftp::{NativeTlsConnector, NativeTlsFtpStream};
+use suppaftp::{FtpError, NativeTlsConnector, NativeTlsFtpStream};
 
 use crate::error::{AppError, AppResult};
 use crate::sftp::{join_remote, sort_entries, SftpEntry};
@@ -22,7 +22,13 @@ pub fn connect(
     allow_invalid_cert: bool,
     ignore_hostname: bool,
 ) -> AppResult<FtpStream> {
-    let mut ftp = NativeTlsFtpStream::connect(format!("{host}:{port}"))?;
+    // A non-FTP greeting here is almost always an SSH server (SFTP vs FTPS mix-up).
+    let mut ftp = NativeTlsFtpStream::connect(format!("{host}:{port}")).map_err(|e| match e {
+        FtpError::BadResponse => AppError::Ftp(
+            "Server did not reply with FTP. If this is an SFTP (SSH) server, use an SFTP connection instead.".into(),
+        ),
+        e => e.into(),
+    })?;
     if secure {
         let mut builder = TlsConnector::builder();
         // Two separate opt-ins: accept an untrusted/self-signed chain vs. ignore a hostname
@@ -202,5 +208,24 @@ mod tests {
         let e = entry_from("/", &f);
         assert_eq!(e.path, "/pub");
         assert!(e.is_dir);
+    }
+
+    #[test]
+    fn ssh_greeting_hints_at_sftp() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.write_all(b"SSH-2.0-Go\r\n").unwrap();
+        });
+        let err = match connect("127.0.0.1", port, "u", "p", false, false, false) {
+            Err(e) => e,
+            Ok(_) => panic!("connect unexpectedly succeeded"),
+        };
+        server.join().unwrap();
+        match err {
+            AppError::Ftp(msg) => assert!(msg.contains("SFTP"), "unexpected message: {msg}"),
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }

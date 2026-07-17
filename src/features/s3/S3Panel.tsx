@@ -76,6 +76,10 @@ export function S3Panel({
         await s3.download(sessionId, b, key, dest, entry.isDir, entry.size, id, onProgress)
         return true
       },
+      downloadTo: async (id, entry, dest, onProgress) => {
+        const { bucket: b, key } = split(entry.path)
+        await s3.download(sessionId, b, key, dest, entry.isDir, entry.size, id, onProgress)
+      },
     }),
     [sessionId, bucket],
   )

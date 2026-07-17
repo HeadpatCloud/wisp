@@ -1,6 +1,6 @@
 import { getCurrentWebview } from '@tauri-apps/api/webview'
-import { confirm as confirmDialog, message } from '@tauri-apps/plugin-dialog'
-import { ChevronUp, FolderPlus } from 'lucide-react'
+import { confirm as confirmDialog, message, open as openDialog } from '@tauri-apps/plugin-dialog'
+import { ChevronUp, FolderPlus, X } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { SftpEntry, TransferProgress } from '@/bindings'
 import { Button } from '@/components/ui/button'
@@ -12,13 +12,14 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { PromptDialog } from '@/components/ui/prompt-dialog'
+import { formatBytes } from '@/lib/format'
 import { basename } from '@/lib/sftp'
 import { runTransfer } from '@/lib/transferQueue'
 import { useTransferStore } from '@/stores/transferStore'
 import { FileList } from '../sftp/FileList'
 import { TransfersBar } from '../sftp/TransfersBar'
 
-// A protocol-agnostic set of file operations. SFTP and FTP each supply one.
+// A protocol-agnostic set of file operations. SFTP, FTP and S3 each supply one.
 export interface FileBackend {
   list(path: string): Promise<SftpEntry[]>
   exists(path: string): Promise<boolean>
@@ -36,6 +37,12 @@ export interface FileBackend {
     entry: SftpEntry,
     onProgress: (p: TransferProgress) => void,
   ): Promise<boolean>
+  downloadTo(
+    transferId: string,
+    entry: SftpEntry,
+    destPath: string,
+    onProgress: (p: TransferProgress) => void,
+  ): Promise<void>
 }
 
 function joinPath(dir: string, name: string): string {
@@ -80,7 +87,8 @@ function useFileBrowser(backend: FileBackend, initial = '.') {
 type Op =
   | { kind: 'mkdir' }
   | { kind: 'rename'; entry: SftpEntry }
-  | { kind: 'delete'; entry: SftpEntry }
+  | { kind: 'delete'; entries: SftpEntry[] }
+  | { kind: 'move'; entries: SftpEntry[] }
 
 export function FileBrowser({
   backend,
@@ -103,6 +111,69 @@ export function FileBrowser({
   const activeRef = useRef(active)
   activeRef.current = active
   const [op, setOp] = useState<Op | null>(null)
+  const [selected, setSelected] = useState<ReadonlySet<string>>(new Set())
+  const anchorRef = useRef<string | null>(null)
+  const entriesRef = useRef(entries)
+  entriesRef.current = entries
+  const selectedRef = useRef(selected)
+  selectedRef.current = selected
+  const opRef = useRef(op)
+  opRef.current = op
+
+  const selectedEntries = entries.filter((e) => selected.has(e.path))
+  const selectedSize = selectedEntries.reduce((n, e) => n + (e.isDir ? 0 : e.size), 0)
+
+  // Keep selection valid across refreshes: navigating away or deleting drops gone paths.
+  useEffect(() => {
+    setSelected((prev) => {
+      const paths = new Set(entries.map((e) => e.path))
+      const next = new Set([...prev].filter((p) => paths.has(p)))
+      return next.size === prev.size ? prev : next
+    })
+  }, [entries])
+
+  function rowClick(entry: SftpEntry, mods: { toggle: boolean; range: boolean }) {
+    setSelected((prev) => {
+      if (mods.range && anchorRef.current) {
+        const a = entries.findIndex((e) => e.path === anchorRef.current)
+        const b = entries.findIndex((e) => e.path === entry.path)
+        if (a !== -1 && b !== -1) {
+          const [lo, hi] = a < b ? [a, b] : [b, a]
+          const range = entries.slice(lo, hi + 1).map((e) => e.path)
+          return mods.toggle ? new Set([...prev, ...range]) : new Set(range)
+        }
+      }
+      if (mods.toggle) {
+        const next = new Set(prev)
+        if (next.has(entry.path)) next.delete(entry.path)
+        else next.add(entry.path)
+        return next
+      }
+      return new Set([entry.path])
+    })
+    if (!mods.range) anchorRef.current = entry.path
+  }
+
+  useEffect(() => {
+    const onKey = (ev: KeyboardEvent) => {
+      if (!activeRef.current || opRef.current) return
+      const t = ev.target as HTMLElement | null
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
+      if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'a') {
+        ev.preventDefault()
+        setSelected(new Set(entriesRef.current.map((e) => e.path)))
+      } else if (ev.key === 'Escape' && selectedRef.current.size > 0) {
+        setSelected(new Set())
+      } else if (ev.key === 'Delete' && selectedRef.current.size > 0) {
+        setOp({
+          kind: 'delete',
+          entries: entriesRef.current.filter((e) => selectedRef.current.has(e.path)),
+        })
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
 
   function doDownload(entry: SftpEntry) {
     const id = crypto.randomUUID()
@@ -117,6 +188,70 @@ export function FileBrowser({
         finish(id, true)
       }
     })
+  }
+
+  // One file keeps the save-as dialog; several download into a single picked directory.
+  async function downloadMany(list: SftpEntry[]) {
+    if (list.length === 1) {
+      doDownload(list[0])
+      return
+    }
+    const parent = await openDialog({ directory: true })
+    if (typeof parent !== 'string') return
+    for (const entry of list) {
+      const id = crypto.randomUUID()
+      start({ id, dir: 'download', name: entry.name, transferred: 0, total: 0, status: 'queued' })
+      runTransfer(id, async () => {
+        activate(id)
+        try {
+          await backend.downloadTo(id, entry, `${parent}/${entry.name}`, (p) =>
+            progress(id, p.transferred, p.total),
+          )
+          finish(id)
+        } catch {
+          finish(id, true)
+        }
+      })
+    }
+  }
+
+  async function removeMany(list: SftpEntry[]) {
+    const errors: string[] = []
+    for (const e of list) {
+      try {
+        await backend.remove(e.path, e.isDir)
+      } catch (err) {
+        errors.push(`${e.name}: ${err}`)
+      }
+    }
+    setOp(null)
+    refresh(cwdRef.current)
+    if (errors.length > 0) {
+      await message(`${errors.length} of ${list.length} failed.\n${errors[0]}`, {
+        title: 'Delete failed',
+        kind: 'error',
+      })
+    }
+  }
+
+  async function moveMany(list: SftpEntry[], dest: string) {
+    const dir = dest !== '/' ? dest.replace(/\/+$/, '') : dest
+    const errors: string[] = []
+    for (const e of list) {
+      try {
+        await backend.rename(e.path, joinPath(dir, e.name))
+      } catch (err) {
+        errors.push(`${e.name}: ${err}`)
+      }
+    }
+    setOp(null)
+    refresh(cwdRef.current)
+    if (errors.length > 0) {
+      await message(`${errors.length} of ${list.length} failed.\n${errors[0]}`, {
+        title: 'Move failed',
+        kind: 'error',
+      })
+    }
   }
 
   async function uploadPaths(paths: string[]) {
@@ -188,11 +323,62 @@ export function FileBrowser({
       ) : (
         <FileList
           entries={entries}
+          selected={selected}
+          onRowClick={rowClick}
           onEnter={enter}
           onDownload={(e) => doDownload(e)}
           onRename={(e) => setOp({ kind: 'rename', entry: e })}
-          onDelete={(e) => setOp({ kind: 'delete', entry: e })}
+          onDelete={(e) => setOp({ kind: 'delete', entries: [e] })}
         />
+      )}
+      {!error && selectedEntries.length > 0 && (
+        <div className="fade-in slide-in-from-bottom-2 flex shrink-0 animate-in items-center gap-1 border-border border-t p-1 text-xs duration-200">
+          <span className="truncate px-1 text-muted-foreground">
+            {selectedEntries.length} selected
+            {selectedSize > 0 ? ` · ${formatBytes(selectedSize)}` : ''}
+          </span>
+          <span className="min-w-0 flex-1" />
+          <button
+            type="button"
+            onClick={() => downloadMany(selectedEntries)}
+            className="rounded px-2 py-1 hover:bg-muted"
+          >
+            Download
+          </button>
+          <button
+            type="button"
+            onClick={() => setOp({ kind: 'move', entries: selectedEntries })}
+            className="rounded px-2 py-1 hover:bg-muted"
+          >
+            Move…
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              navigator.clipboard
+                .writeText(selectedEntries.map((e) => e.path).join('\n'))
+                .catch(() => {})
+            }
+            className="rounded px-2 py-1 hover:bg-muted"
+          >
+            Copy paths
+          </button>
+          <button
+            type="button"
+            onClick={() => setOp({ kind: 'delete', entries: selectedEntries })}
+            className="rounded px-2 py-1 text-destructive hover:bg-muted"
+          >
+            Delete
+          </button>
+          <button
+            type="button"
+            aria-label="Clear selection"
+            onClick={() => setSelected(new Set())}
+            className="rounded p-1 hover:bg-muted"
+          >
+            <X className="size-3.5" />
+          </button>
+        </div>
       )}
       <TransfersBar />
 
@@ -232,6 +418,24 @@ export function FileBrowser({
         }}
       />
 
+      <PromptDialog
+        open={op?.kind === 'move'}
+        title={
+          op?.kind === 'move'
+            ? `Move ${op.entries.length} item${op.entries.length === 1 ? '' : 's'} to`
+            : ''
+        }
+        defaultValue={cwd}
+        confirmLabel="Move"
+        onConfirm={(dest) => {
+          if (op?.kind !== 'move') return
+          moveMany(op.entries, dest)
+        }}
+        onOpenChange={(open) => {
+          if (!open) setOp(null)
+        }}
+      />
+
       <Dialog
         open={op?.kind === 'delete'}
         onOpenChange={(open) => {
@@ -240,7 +444,13 @@ export function FileBrowser({
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Delete {op?.kind === 'delete' ? op.entry.name : ''}?</DialogTitle>
+            <DialogTitle>
+              {op?.kind === 'delete'
+                ? op.entries.length === 1
+                  ? `Delete ${op.entries[0].name}?`
+                  : `Delete ${op.entries.length} items?`
+                : ''}
+            </DialogTitle>
           </DialogHeader>
           <DialogFooter>
             <Button type="button" variant="ghost" onClick={() => setOp(null)}>
@@ -249,15 +459,9 @@ export function FileBrowser({
             <Button
               type="button"
               variant="destructive"
-              onClick={async () => {
+              onClick={() => {
                 if (op?.kind !== 'delete') return
-                try {
-                  await backend.remove(op.entry.path, op.entry.isDir)
-                  setOp(null)
-                  refresh(cwdRef.current)
-                } catch (e) {
-                  await message(String(e), { title: 'Delete failed', kind: 'error' })
-                }
+                removeMany(op.entries)
               }}
             >
               Delete

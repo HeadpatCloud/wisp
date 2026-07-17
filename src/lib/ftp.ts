@@ -68,6 +68,18 @@ export async function upload(
   return name
 }
 
+export async function downloadTo(
+  sid: string,
+  transferId: string,
+  remotePath: string,
+  dest: string,
+  onProgress: (p: TransferProgress) => void,
+): Promise<void> {
+  const channel = new Channel<TransferProgress>()
+  channel.onmessage = onProgress
+  unwrap(await commands.ftpDownload(sid, transferId, remotePath, dest, channel))
+}
+
 export async function download(
   sid: string,
   transferId: string,
@@ -82,8 +94,6 @@ export async function download(
     dest = await save({ defaultPath: entry.name })
   }
   if (!dest) return false
-  const channel = new Channel<TransferProgress>()
-  channel.onmessage = onProgress
-  unwrap(await commands.ftpDownload(sid, transferId, entry.path, dest, channel))
+  await downloadTo(sid, transferId, entry.path, dest, onProgress)
   return true
 }

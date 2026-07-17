@@ -8,6 +8,7 @@ const m = vi.hoisted(() => ({
 vi.mock('@/lib/ftp', () => ({
   listDir: m.listDir,
   download: vi.fn(),
+  downloadTo: vi.fn(),
   upload: vi.fn(),
   exists: vi.fn(),
   mkdir: vi.fn(),

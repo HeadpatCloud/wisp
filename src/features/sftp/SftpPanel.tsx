@@ -1,6 +1,6 @@
 import { useMemo } from 'react'
 import { type FileBackend, FileBrowser } from '@/features/files/FileBrowser'
-import { download, exists, listDir, mkdir, remove, rename, upload } from '@/lib/sftp'
+import { download, downloadTo, exists, listDir, mkdir, remove, rename, upload } from '@/lib/sftp'
 
 export function SftpPanel({ sessionId, active }: { sessionId: string; active?: boolean }) {
   const backend = useMemo<FileBackend>(
@@ -13,6 +13,8 @@ export function SftpPanel({ sessionId, active }: { sessionId: string; active?: b
       upload: (id, localPath, remoteDir, onProgress) =>
         upload(sessionId, id, localPath, remoteDir, onProgress),
       download: (id, entry, onProgress) => download(sessionId, id, entry, onProgress),
+      downloadTo: (id, entry, dest, onProgress) =>
+        downloadTo(sessionId, id, entry.path, dest, onProgress),
     }),
     [sessionId],
   )

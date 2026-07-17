@@ -7,6 +7,7 @@ import {
   ContextMenuTrigger,
 } from '@/components/ui/context-menu'
 import { ScrollArea } from '@/components/ui/scroll-area'
+import { cn } from '@/lib/utils'
 
 function fmtSize(n: number): string {
   if (n < 1024) return `${n} B`
@@ -16,12 +17,16 @@ function fmtSize(n: number): string {
 
 export function FileList({
   entries,
+  selected,
+  onRowClick,
   onEnter,
   onDownload,
   onRename,
   onDelete,
 }: {
   entries: SftpEntry[]
+  selected: ReadonlySet<string>
+  onRowClick: (e: SftpEntry, mods: { toggle: boolean; range: boolean }) => void
   onEnter: (e: SftpEntry) => void
   onDownload: (e: SftpEntry) => void
   onRename: (e: SftpEntry) => void
@@ -33,9 +38,17 @@ export function FileList({
         {entries.map((e) => (
           <ContextMenu key={e.path}>
             <ContextMenuTrigger asChild>
+              {/* biome-ignore lint/a11y/useKeyWithClickEvents: selection has browser-level keys (Ctrl+A/Escape/Delete) */}
               <li
+                data-selected={selected.has(e.path) || undefined}
+                onClick={(ev) =>
+                  onRowClick(e, { toggle: ev.ctrlKey || ev.metaKey, range: ev.shiftKey })
+                }
                 onDoubleClick={() => (e.isDir ? onEnter(e) : onDownload(e))}
-                className="flex cursor-default select-none items-center gap-2 px-2 py-1 hover:bg-muted/50"
+                className={cn(
+                  'flex cursor-default select-none items-center gap-2 px-2 py-1',
+                  selected.has(e.path) ? 'bg-muted' : 'hover:bg-muted/50',
+                )}
               >
                 {e.isDir ? (
                   <Folder className="size-4 shrink-0 text-muted-foreground" />

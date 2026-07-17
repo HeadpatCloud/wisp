@@ -12,6 +12,8 @@ function renderList(overrides = {}) {
   return render(
     <FileList
       entries={entries}
+      selected={new Set<string>()}
+      onRowClick={vi.fn()}
       onEnter={vi.fn()}
       onDownload={vi.fn()}
       onRename={vi.fn()}

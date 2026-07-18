@@ -85,6 +85,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ./src-tauri -> target
+          # Both macOS targets build on the same arm64 runner; without this they'd share one
+          # cache key and clobber each other, leaving the x86_64 cross-build permanently cold.
+          key: ${{ matrix.args }}
 
       - name: Install frontend dependencies
         run: bun install --frozen-lockfile

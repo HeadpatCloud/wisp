@@ -119,6 +119,17 @@ export function FileBrowser({
   selectedRef.current = selected
   const opRef = useRef(op)
   opRef.current = op
+  const [bulk, setBulk] = useState<{
+    verb: string
+    done: number
+    total: number
+    failed: number
+    status: 'running' | 'cancelling' | 'stopped' | 'failed'
+    error?: string
+  } | null>(null)
+  const cancelBulkRef = useRef(false)
+  const bulkRef = useRef(bulk)
+  bulkRef.current = bulk
 
   const selectedEntries = entries.filter((e) => selected.has(e.path))
   const selectedSize = selectedEntries.reduce((n, e) => n + (e.isDir ? 0 : e.size), 0)
@@ -156,7 +167,7 @@ export function FileBrowser({
 
   useEffect(() => {
     const onKey = (ev: KeyboardEvent) => {
-      if (!activeRef.current || opRef.current) return
+      if (!activeRef.current || opRef.current || bulkRef.current) return
       const t = ev.target as HTMLElement | null
       if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
       if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'a') {
@@ -174,6 +185,14 @@ export function FileBrowser({
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [])
+
+  // Stop an in-flight bulk loop when the panel unmounts (SFTP toggle, pane close, disconnect).
+  useEffect(
+    () => () => {
+      cancelBulkRef.current = true
+    },
+    [],
+  )
 
   function doDownload(entry: SftpEntry) {
     const id = crypto.randomUUID()
@@ -215,43 +234,49 @@ export function FileBrowser({
     }
   }
 
-  async function removeMany(list: SftpEntry[]) {
-    const errors: string[] = []
-    for (const e of list) {
-      try {
-        await backend.remove(e.path, e.isDir)
-      } catch (err) {
-        errors.push(`${e.name}: ${err}`)
-      }
-    }
+  async function runBulk(verb: string, list: SftpEntry[], each: (e: SftpEntry) => Promise<void>) {
     setOp(null)
-    refresh(cwdRef.current)
-    if (errors.length > 0) {
-      await message(`${errors.length} of ${list.length} failed.\n${errors[0]}`, {
-        title: 'Delete failed',
-        kind: 'error',
-      })
+    cancelBulkRef.current = false
+    setBulk({ verb, done: 0, total: list.length, failed: 0, status: 'running' })
+    let failed = 0
+    let firstError: string | undefined
+    let cancelled = false
+    for (let i = 0; i < list.length; i++) {
+      // Only checked between items, so a cancel during the last item still finishes it and
+      // completes normally - the loop exits via the condition, not this break.
+      if (cancelBulkRef.current) {
+        cancelled = true
+        break
+      }
+      try {
+        await each(list[i])
+      } catch (e) {
+        failed++
+        if (!firstError) {
+          firstError =
+            e && typeof e === 'object' && 'message' in e
+              ? String((e as { message: unknown }).message)
+              : String(e)
+        }
+      }
+      setBulk((b) => (b ? { ...b, done: i + 1, failed } : b))
     }
+    setSelected(new Set())
+    if (!cancelled && failed === 0) setBulk(null)
+    else {
+      setBulk((b) =>
+        b ? { ...b, status: cancelled ? 'stopped' : 'failed', error: firstError } : b,
+      )
+    }
+    refresh(cwdRef.current)
   }
 
-  async function moveMany(list: SftpEntry[], dest: string) {
+  const removeMany = (list: SftpEntry[]) =>
+    runBulk('Deleting', list, (e) => backend.remove(e.path, e.isDir))
+
+  function moveMany(list: SftpEntry[], dest: string) {
     const dir = dest !== '/' ? dest.replace(/\/+$/, '') : dest
-    const errors: string[] = []
-    for (const e of list) {
-      try {
-        await backend.rename(e.path, joinPath(dir, e.name))
-      } catch (err) {
-        errors.push(`${e.name}: ${err}`)
-      }
-    }
-    setOp(null)
-    refresh(cwdRef.current)
-    if (errors.length > 0) {
-      await message(`${errors.length} of ${list.length} failed.\n${errors[0]}`, {
-        title: 'Move failed',
-        kind: 'error',
-      })
-    }
+    return runBulk('Moving', list, (e) => backend.rename(e.path, joinPath(dir, e.name)))
   }
 
   async function uploadPaths(paths: string[]) {
@@ -466,6 +491,57 @@ export function FileBrowser({
             >
               Delete
             </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={bulk !== null}
+        onOpenChange={(open) => {
+          if (!open && bulk?.status !== 'running' && bulk?.status !== 'cancelling') setBulk(null)
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              {bulk?.status === 'running'
+                ? `${bulk.verb} ${bulk.done} of ${bulk.total}…`
+                : bulk?.status === 'cancelling'
+                  ? `Cancelling… (${bulk.done} of ${bulk.total})`
+                  : bulk?.status === 'stopped'
+                    ? `Stopped at ${bulk.done} of ${bulk.total}${bulk.failed ? ` · ${bulk.failed} failed` : ''}`
+                    : bulk
+                      ? `${bulk.failed} of ${bulk.total} failed`
+                      : ''}
+            </DialogTitle>
+          </DialogHeader>
+          <div className="h-1 rounded bg-muted">
+            <div
+              className="h-1 rounded bg-primary transition-[width]"
+              style={{
+                width: `${bulk?.total ? Math.round((bulk.done / bulk.total) * 100) : 0}%`,
+              }}
+            />
+          </div>
+          {bulk?.error ? <p className="text-destructive text-xs">{bulk.error}</p> : null}
+          <DialogFooter>
+            {bulk?.status === 'running' || bulk?.status === 'cancelling' ? (
+              <Button
+                type="button"
+                variant="ghost"
+                disabled={bulk.status === 'cancelling'}
+                onClick={() => {
+                  cancelBulkRef.current = true
+                  setBulk((b) => (b ? { ...b, status: 'cancelling' } : b))
+                }}
+              >
+                {bulk.status === 'cancelling' ? 'Cancelling…' : 'Cancel'}
+              </Button>
+            ) : (
+              <Button type="button" variant="ghost" onClick={() => setBulk(null)}>
+                Close
+              </Button>
+            )}
           </DialogFooter>
         </DialogContent>
       </Dialog>

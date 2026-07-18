@@ -14,6 +14,9 @@ pub struct ProfileExport {
     pub version: u32,
     pub groups: Vec<Group>,
     pub profiles: Vec<Profile>,
+    // Defaulted so bundles exported before S3 support still import.
+    #[serde(default)]
+    pub s3_profiles: Vec<S3Profile>,
 }
 
 fn poisoned() -> AppError {
@@ -136,7 +139,12 @@ pub fn delete_s3_profile(
 pub fn export_profiles(store: State<'_, Mutex<Store>>, path: String) -> AppResult<()> {
     let export = {
         let s = store.lock().map_err(|_| poisoned())?;
-        ProfileExport { version: 1, groups: s.groups(), profiles: s.profiles() }
+        ProfileExport {
+            version: 1,
+            groups: s.groups(),
+            profiles: s.profiles(),
+            s3_profiles: s.s3_profiles(),
+        }
     };
     let json = serde_json::to_string_pretty(&export)?;
     std::fs::write(&path, json).map_err(|e| AppError::Io(format!("{path}: {e}")))?;
@@ -160,6 +168,10 @@ pub fn import_profiles(store: State<'_, Mutex<Store>>, path: String) -> AppResul
     let mut count = 0;
     for p in export.profiles {
         s.upsert_profile(p)?;
+        count += 1;
+    }
+    for p in export.s3_profiles {
+        s.upsert_s3_profile(p)?;
         count += 1;
     }
     Ok(count)
@@ -189,6 +201,23 @@ mod tests {
         }
     }
 
+    fn sample_s3(id: &str, name: &str) -> S3Profile {
+        S3Profile {
+            id: id.into(),
+            name: name.into(),
+            endpoint: "s3.example.com".into(),
+            port: None,
+            region: "us-east-1".into(),
+            use_tls: true,
+            path_style: false,
+            access_key_id: "AK".into(),
+            secret_id: None,
+            bucket: None,
+            icon: IconRef::default(),
+            order: 0,
+        }
+    }
+
     #[test]
     fn profile_export_round_trips_json() {
         let export = ProfileExport {
@@ -201,6 +230,7 @@ mod tests {
                 order: 0,
             }],
             profiles: vec![sample_profile("p1", "web")],
+            s3_profiles: vec![sample_s3("s1", "backups")],
         };
         let json = serde_json::to_string_pretty(&export).unwrap();
         assert!(json.contains("\"version\": 1"));
@@ -208,13 +238,26 @@ mod tests {
         assert_eq!(export, back);
     }
 
+    // Bundles exported before S3 support have no s3Profiles field; import must still parse them.
+    #[test]
+    fn import_without_s3_field_defaults_empty() {
+        let json = r#"{"version":1,"groups":[],"profiles":[]}"#;
+        let export: ProfileExport = serde_json::from_str(json).unwrap();
+        assert!(export.s3_profiles.is_empty());
+    }
+
     #[test]
     fn import_merges_bundle_into_a_fresh_store() {
         let src = tempfile::tempdir().unwrap();
         let mut store = Store::load(src.path().to_path_buf()).unwrap();
         store.upsert_profile(sample_profile("p1", "web")).unwrap();
-        let export =
-            ProfileExport { version: 1, groups: store.groups(), profiles: store.profiles() };
+        store.upsert_s3_profile(sample_s3("s1", "backups")).unwrap();
+        let export = ProfileExport {
+            version: 1,
+            groups: store.groups(),
+            profiles: store.profiles(),
+            s3_profiles: store.s3_profiles(),
+        };
         let json = serde_json::to_string(&export).unwrap();
 
         let dst = tempfile::tempdir().unwrap();
@@ -226,7 +269,12 @@ mod tests {
         for p in parsed.profiles {
             store2.upsert_profile(p).unwrap();
         }
+        for p in parsed.s3_profiles {
+            store2.upsert_s3_profile(p).unwrap();
+        }
         assert_eq!(store2.profiles().len(), 1);
         assert_eq!(store2.profiles()[0].name, "web");
+        assert_eq!(store2.s3_profiles().len(), 1);
+        assert_eq!(store2.s3_profiles()[0].name, "backups");
     }
 }

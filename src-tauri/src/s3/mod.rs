@@ -509,11 +509,26 @@ pub async fn rename(cfg: &S3Config, bucket_name: &str, from: &str, to: &str) -> 
     delete_object(cfg, bucket_name, from).await
 }
 
-// A folder is just a zero-byte object whose key ends in `/`.
+// A folder is just a zero-byte object whose key ends in `/`. rust-s3's put_object mis-signs
+// against Ceph RGW (SignatureDoesNotMatch), so hand-sign the empty-body PUT like the others.
 pub async fn create_folder(cfg: &S3Config, bucket_name: &str, prefix: &str) -> AppResult<()> {
     let key = if prefix.ends_with('/') { prefix.to_string() } else { format!("{prefix}/") };
-    let bucket = cfg.bucket(bucket_name)?;
-    bucket.put_object(&key, &[]).await.map_err(s3err)?;
+    let uri = format!("/{bucket_name}/{}", aws_uri_encode(&key));
+    let (amz_date, authorization) = sign_v4(cfg, "PUT", &uri, &[]);
+    let resp = signed_client()?
+        .put(format!("{}{uri}", cfg.endpoint))
+        .header("x-amz-date", &amz_date)
+        .header("x-amz-content-sha256", EMPTY_SHA256)
+        .header("authorization", &authorization)
+        .body(Vec::new())
+        .send()
+        .await
+        .map_err(s3err)?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(s3err(format!("create folder failed ({status}): {body}")));
+    }
     Ok(())
 }
 

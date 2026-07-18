@@ -105,3 +105,82 @@ test('move renames each selected entry into the destination', async () => {
   expect(backend.rename).toHaveBeenCalledWith('/a.txt', '/archive/a.txt')
   expect(backend.rename).toHaveBeenCalledWith('/b.txt', '/archive/b.txt')
 })
+
+test('shows a running count while a bulk delete is in flight', async () => {
+  const user = userEvent.setup()
+  const backend = makeBackend()
+  let releaseFirst = () => {}
+  const gate = new Promise<void>((res) => {
+    releaseFirst = res
+  })
+  backend.remove = vi.fn().mockReturnValueOnce(gate).mockResolvedValue(undefined)
+  render(<FileBrowser backend={backend} />)
+  await screen.findByText('a.txt')
+  await user.keyboard('{Control>}a{/Control}')
+  await user.click(screen.getByRole('button', { name: 'Delete' }))
+  await user.click(screen.getAllByRole('button', { name: 'Delete' }).at(-1) as HTMLElement)
+  expect(await screen.findByText('Deleting 0 of 3…')).toBeInTheDocument()
+  releaseFirst()
+  await waitFor(() => expect(backend.remove).toHaveBeenCalledTimes(3))
+})
+
+test('cancel stops a bulk delete at the next item boundary', async () => {
+  const user = userEvent.setup()
+  const backend = makeBackend()
+  let release = () => {}
+  const gate = new Promise<void>((res) => {
+    release = res
+  })
+  backend.remove = vi.fn().mockReturnValueOnce(gate).mockResolvedValue(undefined)
+  render(<FileBrowser backend={backend} />)
+  await screen.findByText('a.txt')
+  await user.keyboard('{Control>}a{/Control}')
+  await user.click(screen.getByRole('button', { name: 'Delete' }))
+  await user.click(screen.getAllByRole('button', { name: 'Delete' }).at(-1) as HTMLElement)
+  await screen.findByText('Deleting 0 of 3…')
+  await user.click(screen.getByRole('button', { name: 'Cancel' }))
+  release()
+  expect(await screen.findByText('Stopped at 1 of 3')).toBeInTheDocument()
+  expect(backend.remove).toHaveBeenCalledTimes(1)
+})
+
+test('cancelling while the last item completes still reports success and closes', async () => {
+  const user = userEvent.setup()
+  const backend = makeBackend()
+  let release = () => {}
+  const gate = new Promise<void>((res) => {
+    release = res
+  })
+  backend.remove = vi
+    .fn()
+    .mockResolvedValueOnce(undefined)
+    .mockResolvedValueOnce(undefined)
+    .mockReturnValueOnce(gate)
+  render(<FileBrowser backend={backend} />)
+  await screen.findByText('a.txt')
+  await user.keyboard('{Control>}a{/Control}')
+  await user.click(screen.getByRole('button', { name: 'Delete' }))
+  await user.click(screen.getAllByRole('button', { name: 'Delete' }).at(-1) as HTMLElement)
+  await waitFor(() => expect(backend.remove).toHaveBeenCalledTimes(3))
+  await user.click(screen.getByRole('button', { name: 'Cancel' }))
+  release()
+  await waitFor(() => expect(screen.queryByText(/of 3/)).not.toBeInTheDocument())
+  expect(screen.queryByText(/Stopped/)).not.toBeInTheDocument()
+})
+
+test('keeps the dialog open with a failure summary when items fail', async () => {
+  const user = userEvent.setup()
+  const backend = makeBackend()
+  backend.remove = vi
+    .fn()
+    .mockResolvedValueOnce(undefined)
+    .mockRejectedValueOnce(new Error('denied'))
+    .mockResolvedValueOnce(undefined)
+  render(<FileBrowser backend={backend} />)
+  await screen.findByText('a.txt')
+  await user.keyboard('{Control>}a{/Control}')
+  await user.click(screen.getByRole('button', { name: 'Delete' }))
+  await user.click(screen.getAllByRole('button', { name: 'Delete' }).at(-1) as HTMLElement)
+  expect(await screen.findByText('1 of 3 failed')).toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: 'Cancel' })).not.toBeInTheDocument()
+})

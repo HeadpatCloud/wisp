@@ -118,6 +118,7 @@ export default function App() {
     const n = await importProfilesFromFile()
     if (n === null) return
     await load()
+    await loadS3()
     await message(`Imported ${n} profile${n === 1 ? '' : 's'}.`)
   }
   const exportToFile = async () => {

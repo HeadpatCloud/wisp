@@ -1,8 +1,19 @@
 import { useMemo } from 'react'
 import { type FileBackend, FileBrowser } from '@/features/files/FileBrowser'
 import { download, downloadTo, exists, listDir, mkdir, remove, rename, upload } from '@/lib/ftp'
+import { type RemoteOrigin, remoteUrl } from '@/lib/urls'
 
-export function FtpPanel({ sessionId, active }: { sessionId: string; active?: boolean }) {
+export function FtpPanel({
+  sessionId,
+  active,
+  origin,
+  secure,
+}: {
+  sessionId: string
+  active?: boolean
+  origin?: RemoteOrigin
+  secure?: boolean
+}) {
   const backend = useMemo<FileBackend>(
     () => ({
       list: (path) => listDir(sessionId, path),
@@ -15,8 +26,11 @@ export function FtpPanel({ sessionId, active }: { sessionId: string; active?: bo
       download: (id, entry, onProgress) => download(sessionId, id, entry, onProgress),
       downloadTo: (id, entry, dest, onProgress) =>
         downloadTo(sessionId, id, entry.path, dest, onProgress),
+      links: origin && {
+        url: (entry) => remoteUrl(secure ? 'ftps' : 'ftp', origin, entry.path),
+      },
     }),
-    [sessionId],
+    [sessionId, origin, secure],
   )
   return <FileBrowser backend={backend} active={active} />
 }

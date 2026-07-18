@@ -130,6 +130,15 @@ pub struct Settings {
     pub vnc_clipboard_sync: bool,
     #[serde(default = "default_max_transfers")]
     pub max_concurrent_transfers: u32,
+    #[serde(default)]
+    pub copy_on_select: bool,
+    #[serde(default)]
+    pub right_click_paste: bool,
+    // Action id -> chord, holding only the bindings the user changed from the defaults.
+    #[serde(default)]
+    pub hotkeys: std::collections::HashMap<String, String>,
+    #[serde(default = "default_true")]
+    pub restore_session: bool,
 }
 
 fn default_accent() -> String {
@@ -174,6 +183,10 @@ impl Default for Settings {
             scrollback: default_scrollback(),
             vnc_clipboard_sync: false,
             max_concurrent_transfers: default_max_transfers(),
+            copy_on_select: false,
+            right_click_paste: false,
+            hotkeys: Default::default(),
+            restore_session: true,
         }
     }
 }

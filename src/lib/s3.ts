@@ -75,3 +75,10 @@ export async function download(
 export const cancelS3 = async (transferId: string): Promise<void> => {
   unwrap(await commands.s3Cancel(transferId))
 }
+
+export const presign = async (
+  sid: string,
+  bucket: string,
+  key: string,
+  expiresSecs: number,
+): Promise<string> => unwrap(await commands.s3Presign(sid, bucket, key, expiresSecs))

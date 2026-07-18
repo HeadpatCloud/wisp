@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { AppError } from '@/bindings'
 import { connectSftp, connectSftpAdhoc, disconnectSftp, type SftpAdhocParams } from '@/lib/sftp'
 import { trustHostKey } from '@/lib/ssh'
+import { useProfileStore } from '@/stores/profileStore'
 import { SftpPanel } from '../sftp/SftpPanel'
 import { HostKeyDialog, type HostKeyPrompt } from './HostKeyDialog'
 
@@ -19,6 +20,11 @@ export function SftpConnectionView({
   const [hostKeyPrompt, setHostKeyPrompt] = useState<HostKeyPrompt | null>(null)
   const [nonce, setNonce] = useState(0)
   const idRef = useRef<string | null>(null)
+  const profile = useProfileStore((s) => s.profiles.find((p) => p.id === profileId))
+  const origin = useMemo(() => {
+    if (adhoc) return { user: adhoc.username, host: adhoc.host, port: adhoc.port }
+    return profile ? { user: profile.username, host: profile.host, port: profile.port } : undefined
+  }, [adhoc, profile])
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: nonce bump retries the connect
   useEffect(() => {
@@ -66,7 +72,7 @@ export function SftpConnectionView({
     }
   }, [profileId, adhoc, nonce])
 
-  if (sessionId) return <SftpPanel sessionId={sessionId} active={active} />
+  if (sessionId) return <SftpPanel sessionId={sessionId} active={active} origin={origin} />
 
   return (
     <div className="flex h-full flex-col items-center justify-center gap-2 text-sm">

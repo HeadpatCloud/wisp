@@ -79,6 +79,7 @@ pub async fn sftp_connect(
 #[tauri::command]
 #[specta::specta]
 pub async fn sftp_connect_adhoc(
+    vault: State<'_, StdMutex<Vault>>,
     known: State<'_, KnownHostsState>,
     sftps: State<'_, SftpSessions>,
     conns: State<'_, SftpConns>,
@@ -87,9 +88,13 @@ pub async fn sftp_connect_adhoc(
     username: String,
     auth_method: AuthMethod,
     key_path: Option<String>,
-    secret: Option<String>,
+    secret_id: Option<String>,
 ) -> AppResult<String> {
-    let secret = secret.map(Zeroizing::new);
+    // The password/passphrase lives in the vault; the caller only holds a reference.
+    let secret = match &secret_id {
+        Some(id) => Some(ssh_cmds::secret_string(&vault, id)?),
+        None => None,
+    };
     let handle = ssh_cmds::connect_adhoc(
         &known,
         &host,

@@ -53,13 +53,18 @@ fn io(e: impl std::fmt::Display) -> AppError {
 #[specta::specta]
 pub async fn vnc_open(
     app: AppHandle,
+    vault: State<'_, std::sync::Mutex<crate::vault::Vault>>,
     vncs: State<'_, VncSessions>,
     host: String,
     port: u16,
-    password: String,
+    secret_id: Option<String>,
     on_frame: Channel<FrameUpdate>,
 ) -> AppResult<VncOpened> {
-    let password = Zeroizing::new(password);
+    // The password lives in the vault; the caller only ever holds a reference to it.
+    let password = match &secret_id {
+        Some(id) => crate::commands::ssh_cmds::secret_string(&vault, id)?,
+        None => Zeroizing::new(String::new()),
+    };
     let init = vnc::connect(&host, port, &password).await?;
     let (mut reader, width, height) = (init.reader, init.width, init.height);
     let writer = Arc::new(TokioMutex::new(init.writer));

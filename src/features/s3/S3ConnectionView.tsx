@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { connectS3, disconnectS3 } from '@/lib/s3'
+import { useS3ProfileStore } from '@/stores/s3ProfileStore'
 import { S3Panel } from './S3Panel'
 
 export function S3ConnectionView({
@@ -14,6 +15,19 @@ export function S3ConnectionView({
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const idRef = useRef<string | null>(null)
+  const profile = useS3ProfileStore((s) => s.profiles.find((p) => p.id === profileId))
+  const origin = useMemo(
+    () =>
+      profile
+        ? {
+            endpoint: profile.endpoint,
+            port: profile.port,
+            useTls: profile.useTls,
+            pathStyle: profile.pathStyle,
+          }
+        : undefined,
+    [profile],
+  )
 
   useEffect(() => {
     let disposed = false
@@ -40,7 +54,8 @@ export function S3ConnectionView({
     }
   }, [profileId])
 
-  if (sessionId) return <S3Panel sessionId={sessionId} bucket={bucket} active={active} />
+  if (sessionId)
+    return <S3Panel sessionId={sessionId} bucket={bucket} active={active} origin={origin} />
 
   return (
     <div className="flex h-full flex-col items-center justify-center gap-2 text-sm">

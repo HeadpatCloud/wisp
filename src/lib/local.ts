@@ -28,3 +28,14 @@ export async function resizeLocal(id: string, cols: number, rows: number): Promi
 export async function closeLocal(id: string): Promise<void> {
   unwrap(await commands.localClose(id))
 }
+
+export const clearEditTemp = async (): Promise<void> => {
+  unwrap(await commands.clearEditTemp())
+}
+
+export const editTempPath = async (fileName: string): Promise<string> =>
+  unwrap(await commands.editTempPath(fileName))
+
+// specta types f64 as `number | null` since non-finite floats serialize to null.
+export const fileMtime = async (path: string): Promise<number> =>
+  unwrap(await commands.fileMtime(path)) ?? 0

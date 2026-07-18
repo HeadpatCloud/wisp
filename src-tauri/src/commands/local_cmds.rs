@@ -19,6 +19,52 @@ pub struct ShellInfo {
     pub program: String,
 }
 
+fn edit_root() -> std::path::PathBuf {
+    std::env::temp_dir().join("wisp-edit")
+}
+
+// Wipes leftovers from previous runs. Called at startup rather than on close so a file the
+// user is still editing is never pulled out from under them mid-session.
+#[tauri::command]
+#[specta::specta]
+pub fn clear_edit_temp() -> AppResult<()> {
+    let root = edit_root();
+    if root.exists() {
+        std::fs::remove_dir_all(&root).map_err(|e| AppError::Io(e.to_string()))?;
+    }
+    Ok(())
+}
+
+// Scratch path for "edit remote file": a per-edit directory keeps the original filename
+// intact so the re-upload lands back on the same remote name.
+#[tauri::command]
+#[specta::specta]
+pub fn edit_temp_path(file_name: String) -> AppResult<String> {
+    let name = std::path::Path::new(&file_name)
+        .file_name()
+        .ok_or_else(|| AppError::Io(format!("bad file name: {file_name}")))?;
+    let dir = edit_root().join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&dir).map_err(|e| AppError::Io(e.to_string()))?;
+    Ok(dir.join(name).to_string_lossy().into_owned())
+}
+
+// Seconds since the epoch, or 0 when the file is missing - the caller polls this to notice
+// that the external editor saved. f64 because specta won't export u64 to TypeScript.
+#[tauri::command]
+#[specta::specta]
+pub fn file_mtime(path: String) -> AppResult<f64> {
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return Ok(0.0);
+    };
+    let secs = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    Ok(secs)
+}
+
 fn on_path(name: &str) -> Option<String> {
     let paths = std::env::var_os("PATH")?;
     std::env::split_paths(&paths)

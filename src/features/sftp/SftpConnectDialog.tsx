@@ -19,8 +19,18 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { ProfileIcon } from '@/features/profiles/ProfileIcon'
-import type { SftpAdhocParams } from '@/lib/sftp'
 import { useProfileStore } from '@/stores/profileStore'
+
+// What the form collects: the plaintext secret is exchanged for a vault id before it
+// reaches the session store.
+export interface SftpManualParams {
+  host: string
+  port: number
+  username: string
+  authMethod: AuthMethod
+  keyPath: string
+  secret: string
+}
 
 export function SftpConnectDialog({
   open,
@@ -31,7 +41,7 @@ export function SftpConnectDialog({
   open: boolean
   onOpenChange: (open: boolean) => void
   onPick: (profileId: string, title: string) => void
-  onConnect: (params: SftpAdhocParams) => void
+  onConnect: (params: SftpManualParams) => void
 }) {
   const profiles = useProfileStore((s) => s.profiles)
   const [query, setQuery] = useState('')

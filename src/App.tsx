@@ -1,7 +1,7 @@
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { message } from '@tauri-apps/plugin-dialog'
 import { Settings } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { events, type S3Profile, type ShellInfo } from '@/bindings'
 import {
   DropdownMenu,
@@ -11,6 +11,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { FtpConnectDialog } from '@/features/ftp/FtpConnectDialog'
 import { FtpConnectionView } from '@/features/ftp/FtpConnectionView'
+import { CommandPalette } from '@/features/palette/CommandPalette'
 import { ProfileTree } from '@/features/profiles/ProfileTree'
 import { S3ConnectionView } from '@/features/s3/S3ConnectionView'
 import { S3ProfileDialog } from '@/features/s3/S3ProfileDialog'
@@ -26,10 +27,13 @@ import { AppShell } from '@/features/shell/AppShell'
 import { UpdateBanner } from '@/features/updater/UpdateBanner'
 import { VaultGate } from '@/features/vault/VaultGate'
 import { WelcomePage } from '@/features/welcome/WelcomePage'
-import { listShells } from '@/lib/local'
+import { useHotkeys } from '@/lib/hotkeys'
+import { clearEditTemp, listShells } from '@/lib/local'
 import { exportProfilesToFile, importProfilesFromFile } from '@/lib/profiles'
+import { clearSnapshot, loadSnapshot, saveSnapshot } from '@/lib/sessionPersist'
 import { watchSystemTheme } from '@/lib/theme'
 import { cn } from '@/lib/utils'
+import { setSecret } from '@/lib/vault'
 import { useProfileStore } from '@/stores/profileStore'
 import { useS3ProfileStore } from '@/stores/s3ProfileStore'
 import {
@@ -43,6 +47,28 @@ import {
 } from '@/stores/sessionStore'
 import { useSettingsStore } from '@/stores/settingsStore'
 import { useTunnelStore } from '@/stores/tunnelStore'
+
+function cycleTab(delta: number) {
+  const st = useSessionStore.getState()
+  if (st.tabs.length === 0) return
+  const i = st.tabs.findIndex((t) => t.id === st.activeTabId)
+  const next = st.tabs[(i + delta + st.tabs.length) % st.tabs.length]
+  if (next) st.setActiveTab(next.id)
+}
+
+function splitActivePane(direction: 'horizontal' | 'vertical') {
+  const st = useSessionStore.getState()
+  const t = st.tabs.find((tab) => tab.id === st.activeTabId)
+  if (t?.kind === 'session') st.splitPane(t.id, t.activePaneId, direction)
+}
+
+function nudgeZoom(delta: number, reset = false) {
+  const st = useSessionStore.getState()
+  const t = st.tabs.find((tab) => tab.id === st.activeTabId)
+  if (t?.kind !== 'session') return
+  const cur = st.sessions[t.activePaneId]?.zoom ?? 0
+  st.setZoom(t.activePaneId, reset ? 0 : cur + delta)
+}
 
 export default function App() {
   const load = useProfileStore((s) => s.load)
@@ -59,12 +85,70 @@ export default function App() {
   const loadSettings = useSettingsStore((s) => s.load)
   const loadS3 = useS3ProfileStore((s) => s.load)
   const themeValue = useSettingsStore((s) => s.settings.theme)
+  const settingsHotkeys = useSettingsStore((s) => s.settings.hotkeys ?? {})
   const [vncDialogOpen, setVncDialogOpen] = useState(false)
   const [ftpDialogOpen, setFtpDialogOpen] = useState(false)
   const [sftpDialogOpen, setSftpDialogOpen] = useState(false)
   const [s3DialogOpen, setS3DialogOpen] = useState(false)
   const [s3Editing, setS3Editing] = useState<S3Profile | null>(null)
   const [shells, setShells] = useState<ShellInfo[]>([])
+  const [paletteOpen, setPaletteOpen] = useState(false)
+  const [vaultReady, setVaultReady] = useState(false)
+  const settingsLoaded = useSettingsStore((s) => s.loaded)
+  const restoreEnabled = useSettingsStore((s) => s.settings.restoreSession ?? true)
+  const restoredRef = useRef(false)
+  const restoreEnabledRef = useRef(restoreEnabled)
+  restoreEnabledRef.current = restoreEnabled
+
+  // Restoring waits on both the vault (secrets) and settings (the toggle still reads as its
+  // default until they load), and persistence only starts afterwards so an empty startup
+  // state can't overwrite the saved snapshot.
+  useEffect(() => {
+    if (!vaultReady || !settingsLoaded || restoredRef.current) return
+    restoredRef.current = true
+    if (restoreEnabledRef.current) {
+      const snap = loadSnapshot()
+      // Anything opened while the vault was resolving must survive.
+      if (snap && useSessionStore.getState().tabs.length === 0) {
+        useSessionStore.getState().restoreTabs(snap)
+      }
+    } else {
+      clearSnapshot()
+    }
+    return useSessionStore.subscribe((s) => {
+      if (restoreEnabledRef.current) saveSnapshot(s)
+    })
+  }, [vaultReady, settingsLoaded])
+
+  useHotkeys(
+    {
+      palette: () => setPaletteOpen((v) => !v),
+      localShell: () => openLocalShell(),
+      settings: () => openView({ kind: 'settings' }, 'Settings'),
+      closeTab: () => {
+        const st = useSessionStore.getState()
+        if (st.activeTabId) st.removeTab(st.activeTabId)
+      },
+      nextTab: () => cycleTab(1),
+      prevTab: () => cycleTab(-1),
+      splitRight: () => splitActivePane('horizontal'),
+      splitDown: () => splitActivePane('vertical'),
+      closePane: () => {
+        const st = useSessionStore.getState()
+        const t = st.tabs.find((tab) => tab.id === st.activeTabId)
+        if (t?.kind === 'session') st.closePane(t.id, t.activePaneId)
+      },
+      zoomIn: () => nudgeZoom(1),
+      zoomOut: () => nudgeZoom(-1),
+      zoomReset: () => nudgeZoom(0, true),
+      broadcast: () => {
+        const st = useSessionStore.getState()
+        const t = st.tabs.find((tab) => tab.id === st.activeTabId)
+        if (t?.kind === 'session') st.toggleBroadcast(t.id)
+      },
+    },
+    settingsHotkeys,
+  )
 
   useEffect(() => {
     load().catch(console.error)
@@ -80,6 +164,9 @@ export default function App() {
   }, [])
   useEffect(() => {
     listShells().then(setShells).catch(console.error)
+  }, [])
+  useEffect(() => {
+    clearEditTemp().catch(console.error)
   }, [])
   useEffect(() => {
     loadSettings().catch(console.error)
@@ -136,15 +223,30 @@ export default function App() {
 
   return (
     <>
-      <VaultGate />
+      <VaultGate onReady={() => setVaultReady(true)} />
       <UpdateBanner />
-      <VncConnectDialog open={vncDialogOpen} onOpenChange={setVncDialogOpen} onConnect={openVnc} />
-      <FtpConnectDialog open={ftpDialogOpen} onOpenChange={setFtpDialogOpen} onConnect={openFtp} />
+      <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} />
+      <VncConnectDialog
+        open={vncDialogOpen}
+        onOpenChange={setVncDialogOpen}
+        onConnect={async (host, port, password) =>
+          openVnc(host, port, password ? await setSecret(password) : null)
+        }
+      />
+      <FtpConnectDialog
+        open={ftpDialogOpen}
+        onOpenChange={setFtpDialogOpen}
+        onConnect={async ({ password, ...rest }) =>
+          openFtp({ ...rest, secretId: password ? await setSecret(password) : null })
+        }
+      />
       <SftpConnectDialog
         open={sftpDialogOpen}
         onOpenChange={setSftpDialogOpen}
         onPick={openSftp}
-        onConnect={openSftpAdhoc}
+        onConnect={async ({ secret, ...rest }) =>
+          openSftpAdhoc({ ...rest, secretId: secret ? await setSecret(secret) : null })
+        }
       />
       <S3ProfileDialog open={s3DialogOpen} onOpenChange={setS3DialogOpen} editing={s3Editing} />
       <AppShell
@@ -268,7 +370,7 @@ export default function App() {
                   data-testid={`tabpane-${t.id}`}
                   className={cn('absolute inset-0', t.id !== activeTabId && 'hidden')}
                 >
-                  <VncView host={t.host} port={t.port} password={t.password} />
+                  <VncView host={t.host} port={t.port} secretId={t.secretId} />
                 </div>
               ))}
               {sftpTabs.map((t) => (
@@ -294,7 +396,7 @@ export default function App() {
                     host={t.host}
                     port={t.port}
                     username={t.username}
-                    password={t.password}
+                    secretId={t.secretId}
                     secure={t.secure}
                     allowInvalidCert={t.allowInvalidCert}
                     ignoreHostname={t.ignoreHostname}

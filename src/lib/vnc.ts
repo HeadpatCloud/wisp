@@ -5,12 +5,12 @@ import { unwrap } from '@/lib/ipc'
 export async function openVnc(
   host: string,
   port: number,
-  password: string,
+  secretId: string | null,
   onFrame: (f: FrameUpdate) => void,
 ): Promise<VncOpened> {
   const channel = new Channel<FrameUpdate>()
   channel.onmessage = onFrame
-  return unwrap(await commands.vncOpen(host, port, password, channel))
+  return unwrap(await commands.vncOpen(host, port, secretId, channel))
 }
 
 export async function vncPointer(id: string, buttons: number, x: number, y: number): Promise<void> {

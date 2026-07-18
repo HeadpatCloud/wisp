@@ -16,7 +16,16 @@ vi.mock('@/lib/ssh', () => ({
   trustHostKey: vi.fn().mockResolvedValue(undefined),
 }))
 vi.mock('@/lib/tunnels', () => ({ startTunnel: vi.fn().mockResolvedValue(undefined) }))
-vi.mock('@/lib/local', () => ({ listShells: vi.fn().mockResolvedValue([]) }))
+vi.mock('@/lib/local', () => ({
+  listShells: vi.fn().mockResolvedValue([]),
+  clearEditTemp: vi.fn().mockResolvedValue(undefined),
+}))
+vi.mock('@/lib/vault', () => ({
+  setSecret: vi.fn().mockResolvedValue('vault-id'),
+  deleteSecret: vi.fn().mockResolvedValue(undefined),
+  vaultStatus: vi.fn().mockResolvedValue('unlocked'),
+  vaultUnlock: vi.fn().mockResolvedValue(undefined),
+}))
 vi.mock('@/lib/theme', () => ({ watchSystemTheme: vi.fn().mockReturnValue(() => undefined) }))
 vi.mock('@/stores/profileStore', () => ({
   useProfileStore: vi.fn(

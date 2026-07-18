@@ -20,6 +20,10 @@ const DEFAULTS: Settings = {
   scrollback: 10000,
   vncClipboardSync: false,
   maxConcurrentTransfers: 3,
+  copyOnSelect: false,
+  rightClickPaste: false,
+  hotkeys: {},
+  restoreSession: true,
 }
 
 function asAppTheme(theme: string): AppTheme {

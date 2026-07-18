@@ -9,7 +9,7 @@ export interface SftpAdhocParams {
   username: string
   authMethod: AuthMethod
   keyPath: string
-  secret: string
+  secretId: string | null
 }
 
 // Throws the raw AppError (not unwrapped) so callers can inspect err.kind for host-key prompts.
@@ -19,8 +19,7 @@ export async function connectSftp(profileId: string): Promise<string> {
   return res.data
 }
 
-// Throws the raw AppError, same as connectSftp. An empty password is still sent (some
-// servers allow it); an empty key passphrase means an unencrypted key, so it becomes null.
+// Throws the raw AppError, same as connectSftp.
 export async function connectSftpAdhoc(p: SftpAdhocParams): Promise<string> {
   const res = await commands.sftpConnectAdhoc(
     p.host,
@@ -28,7 +27,7 @@ export async function connectSftpAdhoc(p: SftpAdhocParams): Promise<string> {
     p.username,
     p.authMethod,
     p.keyPath || null,
-    p.authMethod === 'password' ? p.secret : p.secret || null,
+    p.secretId,
   )
   if (res.status === 'error') throw res.error
   return res.data

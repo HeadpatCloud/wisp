@@ -1,5 +1,6 @@
 import { openUrl } from '@tauri-apps/plugin-opener'
-import { useState } from 'react'
+import { RotateCcw } from 'lucide-react'
+import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -12,6 +13,15 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { COLOR_SCHEMES } from '@/features/sessions/terminalTheme'
+import {
+  chordFor,
+  chordOf,
+  conflictFor,
+  formatChord,
+  HOTKEY_ACTIONS,
+  type HotkeyAction,
+  suspendHotkeys,
+} from '@/lib/hotkeys'
 import { ACCENTS, BACKGROUNDS } from '@/lib/theme'
 import { cn } from '@/lib/utils'
 import { vaultChangePassword } from '@/lib/vault'
@@ -19,7 +29,7 @@ import { useSessionStore } from '@/stores/sessionStore'
 import { useSettingsStore } from '@/stores/settingsStore'
 import { TerminalPreview } from './TerminalPreview'
 
-const SECTIONS = ['Appearance', 'Transfers', 'Security', 'About'] as const
+const SECTIONS = ['Appearance', 'Keyboard', 'Transfers', 'Security', 'About'] as const
 const REPO_URL = 'https://github.com/headpatcloud/wisp'
 type Section = (typeof SECTIONS)[number]
 
@@ -30,6 +40,43 @@ export function SettingsPage({ tabId }: { tabId: string }) {
   const [section, setSection] = useState<Section>('Appearance')
   const [masterPw, setMasterPw] = useState('')
   const [pwSaved, setPwSaved] = useState(false)
+  const [capturing, setCapturing] = useState<HotkeyAction | null>(null)
+  const [bindError, setBindError] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!capturing) return
+    suspendHotkeys(true)
+    setBindError(null)
+    const onKey = (ev: KeyboardEvent) => {
+      if (['Control', 'Shift', 'Alt', 'Meta'].includes(ev.key)) return
+      ev.preventDefault()
+      ev.stopPropagation()
+      if (ev.key === 'Escape') {
+        setCapturing(null)
+        return
+      }
+      // Without a modifier the key would be swallowed before the terminal ever sees it.
+      if (!ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+        setBindError('Shortcuts need Ctrl, Alt or Cmd.')
+        return
+      }
+      const chord = chordOf(ev)
+      const clash = conflictFor(capturing, chord, settings.hotkeys ?? {})
+      if (clash) {
+        setBindError(
+          `${formatChord(chord)} is already used by "${HOTKEY_ACTIONS.find((a) => a.id === clash)?.label}".`,
+        )
+        return
+      }
+      update({ hotkeys: { ...(settings.hotkeys ?? {}), [capturing]: chord } })
+      setCapturing(null)
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => {
+      suspendHotkeys(false)
+      window.removeEventListener('keydown', onKey, true)
+    }
+  }, [capturing, settings.hotkeys, update])
 
   return (
     <PageShell
@@ -247,7 +294,79 @@ export function SettingsPage({ tabId }: { tabId: string }) {
                   }}
                 />
               </div>
+              <div className="border-border border-t pt-3">
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={settings.copyOnSelect ?? false}
+                    onChange={(e) => update({ copyOnSelect: e.target.checked })}
+                  />
+                  Copy on select
+                </label>
+                <label className="mt-2 flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={settings.rightClickPaste ?? false}
+                    onChange={(e) => update({ rightClickPaste: e.target.checked })}
+                  />
+                  Right-click pastes
+                </label>
+                <p className="mt-1 text-muted-foreground text-xs">
+                  PuTTY-style mouse behaviour in terminals. Both off by default.
+                </p>
+                <label className="mt-3 flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={settings.restoreSession ?? true}
+                    onChange={(e) => update({ restoreSession: e.target.checked })}
+                  />
+                  Reopen tabs on startup
+                </label>
+                <p className="mt-1 text-muted-foreground text-xs">
+                  Restores SSH, SFTP and S3 tabs. FTP and VNC tabs are skipped because their
+                  passwords would have to be stored on disk.
+                </p>
+              </div>
             </>
+          )}
+          {section === 'Keyboard' && (
+            <div className="space-y-1">
+              <p className="pb-2 text-muted-foreground text-xs">
+                Click a shortcut to rebind it. Escape cancels.
+              </p>
+              {bindError && <p className="pb-2 text-destructive text-xs">{bindError}</p>}
+              {HOTKEY_ACTIONS.map((a) => (
+                <div key={a.id} className="flex items-center gap-2 py-1 text-sm">
+                  <span className="min-w-0 flex-1 truncate">{a.label}</span>
+                  <button
+                    type="button"
+                    onClick={() => setCapturing(a.id)}
+                    className={cn(
+                      'rounded border border-border px-2 py-1 font-mono text-xs hover:bg-muted',
+                      capturing === a.id && 'border-ring text-muted-foreground',
+                    )}
+                  >
+                    {capturing === a.id
+                      ? 'Press keys…'
+                      : formatChord(chordFor(a.id, settings.hotkeys ?? {}))}
+                  </button>
+                  {settings.hotkeys?.[a.id] && (
+                    <button
+                      type="button"
+                      aria-label={`Reset ${a.label}`}
+                      onClick={() => {
+                        const next = { ...(settings.hotkeys ?? {}) }
+                        delete next[a.id]
+                        update({ hotkeys: next })
+                      }}
+                      className="rounded p-1 text-muted-foreground hover:bg-muted"
+                    >
+                      <RotateCcw className="size-3.5" />
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
           )}
           {section === 'Transfers' && (
             <div className="space-y-2">

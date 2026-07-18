@@ -205,6 +205,19 @@ pub async fn s3_mkdir(
 
 #[tauri::command]
 #[specta::specta]
+pub async fn s3_presign(
+    sessions: State<'_, S3Sessions>,
+    session_id: String,
+    bucket: String,
+    key: String,
+    expires_secs: u32,
+) -> AppResult<String> {
+    let conn = conn_for(&sessions, &session_id).await?;
+    Ok(s3::presign_get(&conn, &bucket, &key, expires_secs))
+}
+
+#[tauri::command]
+#[specta::specta]
 pub async fn s3_disconnect(sessions: State<'_, S3Sessions>, session_id: String) -> AppResult<()> {
     sessions.0.lock().await.remove(&session_id);
     Ok(())

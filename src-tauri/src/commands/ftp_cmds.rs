@@ -67,15 +67,20 @@ where
 #[specta::specta]
 pub async fn ftp_connect(
     sessions: State<'_, FtpSessions>,
+    vault: State<'_, StdMutex<crate::vault::Vault>>,
     host: String,
     port: u16,
     username: String,
-    password: String,
+    secret_id: Option<String>,
     secure: bool,
     allow_invalid_cert: bool,
     ignore_hostname: bool,
 ) -> AppResult<String> {
-    let password = Zeroizing::new(password);
+    // The password lives in the vault; the caller only ever holds a reference to it.
+    let password = match &secret_id {
+        Some(id) => crate::commands::ssh_cmds::secret_string(&vault, id)?,
+        None => Zeroizing::new(String::new()),
+    };
     let stream = tokio::task::spawn_blocking(move || {
         ftp::connect(&host, port, &username, &password, secure, allow_invalid_cert, ignore_hostname)
     })

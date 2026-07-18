@@ -3,6 +3,7 @@ import { useMemo } from 'react'
 import { type FileBackend, FileBrowser } from '@/features/files/FileBrowser'
 import * as s3 from '@/lib/s3'
 import { basename } from '@/lib/sftp'
+import { encodePath } from '@/lib/urls'
 
 // FileBrowser paths are "/bucket/key...". '.', '/' and '' all mean root (the bucket list).
 function isRoot(path: string): boolean {
@@ -14,14 +15,32 @@ function split(path: string): { bucket: string; key: string } {
   return i === -1 ? { bucket: t, key: '' } : { bucket: t.slice(0, i), key: t.slice(i + 1) }
 }
 
+export interface S3Origin {
+  endpoint: string
+  port: number | null
+  useTls: boolean
+  pathStyle: boolean
+}
+
+function publicUrl(o: S3Origin, bucket: string, key: string): string {
+  const scheme = o.useTls ? 'https' : 'http'
+  const defaultPort = o.useTls ? 443 : 80
+  const authority = o.port && o.port !== defaultPort ? `${o.endpoint}:${o.port}` : o.endpoint
+  return o.pathStyle
+    ? `${scheme}://${authority}/${bucket}/${encodePath(key)}`
+    : `${scheme}://${bucket}.${authority}/${encodePath(key)}`
+}
+
 export function S3Panel({
   sessionId,
   bucket,
   active,
+  origin,
 }: {
   sessionId: string
   bucket: string | null
   active?: boolean
+  origin?: S3Origin
 }) {
   const backend = useMemo<FileBackend>(
     () => ({
@@ -80,8 +99,18 @@ export function S3Panel({
         const { bucket: b, key } = split(entry.path)
         await s3.download(sessionId, b, key, dest, entry.isDir, entry.size, id, onProgress)
       },
+      links: origin && {
+        url: (entry) => {
+          const { bucket: b, key } = split(entry.path)
+          return publicUrl(origin, b, key)
+        },
+        signedUrl: (entry, expiresSecs) => {
+          const { bucket: b, key } = split(entry.path)
+          return s3.presign(sessionId, b, key, expiresSecs)
+        },
+      },
     }),
-    [sessionId, bucket],
+    [sessionId, bucket, origin],
   )
 
   return <FileBrowser backend={backend} active={active} initialPath={bucket ? `/${bucket}` : '/'} />

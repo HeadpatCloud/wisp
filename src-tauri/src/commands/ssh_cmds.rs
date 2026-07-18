@@ -52,7 +52,10 @@ pub enum SshStatus {
     },
 }
 
-fn secret_string(vault: &State<'_, StdMutex<Vault>>, secret_id: &str) -> AppResult<Zeroizing<String>> {
+pub(crate) fn secret_string(
+    vault: &State<'_, StdMutex<Vault>>,
+    secret_id: &str,
+) -> AppResult<Zeroizing<String>> {
     let v = vault.lock().map_err(|_| AppError::Internal("vault lock poisoned".into()))?;
     let bytes = v.get_secret(secret_id)?; // Zeroizing<Vec<u8>>
     let text = std::str::from_utf8(&bytes).map_err(|_| AppError::Vault("secret not utf-8".into()))?;
@@ -150,9 +153,17 @@ async fn authenticate(
             let pw = secret.ok_or_else(|| AppError::Auth("no password stored".into()))?;
             match client::auth_password(handle, username, &pw).await {
                 Ok(()) => Ok(()),
-                // Some servers only offer keyboard-interactive for password login.
+                // Some servers only offer keyboard-interactive for password login. Report
+                // both attempts, or the fallback's error hides the plain password rejection.
                 Err(AppError::Auth(_)) => {
-                    client::auth_keyboard_interactive(handle, username, &pw).await
+                    match client::auth_keyboard_interactive(handle, username, &pw).await {
+                        Err(AppError::Auth(_)) => Err(AppError::Auth(
+                            "password rejected (tried password and keyboard-interactive). \
+                             Check the password, or the server may require a key or MFA."
+                                .into(),
+                        )),
+                        other => other,
+                    }
                 }
                 Err(e) => Err(e),
             }

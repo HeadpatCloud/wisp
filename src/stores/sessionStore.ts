@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import type { SftpAdhocParams } from '@/lib/sftp'
+import { deleteSecret } from '@/lib/vault'
 
 export type SessionStatus = 'connecting' | 'connected' | 'closed' | 'error'
 export type SplitDirection = 'horizontal' | 'vertical'
@@ -11,6 +12,8 @@ export interface PaneSession {
   status: SessionStatus
   reconnectNonce: number
   sshId?: string | null
+  // Font-size offset applied on top of the resolved appearance, per pane.
+  zoom?: number
 }
 
 export type TabView =
@@ -26,6 +29,7 @@ export interface SessionTab {
   sessionIds: string[]
   direction: SplitDirection
   activePaneId: string
+  broadcast?: boolean
 }
 
 export interface ViewTab {
@@ -48,7 +52,7 @@ export interface VncTab {
   title: string
   host: string
   port: number
-  password: string
+  secretId: string | null
 }
 
 export interface SftpTab {
@@ -66,7 +70,7 @@ export interface FtpTab {
   host: string
   port: number
   username: string
-  password: string
+  secretId: string | null
   secure: boolean
   allowInvalidCert: boolean
   ignoreHostname: boolean
@@ -82,6 +86,12 @@ export interface S3Tab {
 
 export type Tab = SessionTab | ViewTab | LocalTab | VncTab | SftpTab | FtpTab | S3Tab
 
+export function tabSecretId(t: Tab): string | null {
+  if (t.kind === 'ftp' || t.kind === 'vnc') return t.secretId
+  if (t.kind === 'sftp') return t.adhoc?.secretId ?? null
+  return null
+}
+
 function viewKey(v: TabView): string {
   if (v.kind === 'profile-editor') return `profile-editor:${v.profileId ?? 'new'}`
   if (v.kind === 'group-editor') return `group-editor:${v.groupId ?? 'new'}`
@@ -95,14 +105,14 @@ interface SessionState {
   openTab: (session: PaneSession) => void
   openView: (view: TabView, title: string) => void
   openLocalShell: (program?: string | null, title?: string) => void
-  openVnc: (host: string, port: number, password: string) => void
+  openVnc: (host: string, port: number, secretId: string | null) => void
   openSftp: (profileId: string, title: string) => void
   openSftpAdhoc: (params: SftpAdhocParams) => void
   openFtp: (params: {
     host: string
     port: number
     username: string
-    password: string
+    secretId: string | null
     secure: boolean
     allowInvalidCert: boolean
     ignoreHostname: boolean
@@ -117,6 +127,13 @@ interface SessionState {
   setStatus: (sessionId: string, status: SessionStatus) => void
   setSshId: (sessionId: string, sshId: string) => void
   reconnect: (sessionId: string) => void
+  toggleBroadcast: (tabId: string) => void
+  setZoom: (sessionId: string, zoom: number) => void
+  restoreTabs: (snapshot: {
+    tabs: Tab[]
+    sessions: Record<string, PaneSession>
+    activeTabId: string | null
+  }) => void
 }
 
 export const useSessionStore = create<SessionState>()((set, get) => ({
@@ -155,14 +172,14 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
     set({ tabs: [...get().tabs, tab], activeTabId: tab.id })
   },
 
-  openVnc: (host, port, password) => {
+  openVnc: (host, port, secretId) => {
     const tab: VncTab = {
       id: crypto.randomUUID(),
       kind: 'vnc',
       title: `${host}:${port}`,
       host,
       port,
-      password,
+      secretId,
     }
     set({ tabs: [...get().tabs, tab], activeTabId: tab.id })
   },
@@ -183,7 +200,7 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
     set({ tabs: [...get().tabs, tab], activeTabId: tab.id })
   },
 
-  openFtp: ({ host, port, username, password, secure, allowInvalidCert, ignoreHostname }) => {
+  openFtp: ({ host, port, username, secretId, secure, allowInvalidCert, ignoreHostname }) => {
     const tab: FtpTab = {
       id: crypto.randomUUID(),
       kind: 'ftp',
@@ -191,7 +208,7 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       host,
       port,
       username,
-      password,
+      secretId,
       secure,
       allowInvalidCert,
       ignoreHostname,
@@ -296,6 +313,11 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
     const sessions = { ...get().sessions }
     if (tab.kind === 'session') for (const id of tab.sessionIds) delete sessions[id]
     const tabs = get().tabs.filter((t) => t.id !== tabId)
+    // Drop the ad-hoc credential with its last tab; a duplicated tab still references it.
+    const secretId = tabSecretId(tab)
+    if (secretId && !tabs.some((t) => tabSecretId(t) === secretId)) {
+      deleteSecret(secretId).catch(() => {})
+    }
     set({
       tabs,
       sessions,
@@ -322,6 +344,33 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       sessions: {
         ...get().sessions,
         [sessionId]: { ...prev, status: 'connecting', reconnectNonce: prev.reconnectNonce + 1 },
+      },
+    })
+  },
+
+  // Panes come back as 'connecting' with no ssh id, so PaneView's connect effect redials.
+  restoreTabs: ({ tabs, sessions, activeTabId }) => {
+    const revived: Record<string, PaneSession> = {}
+    for (const [id, s] of Object.entries(sessions)) {
+      revived[id] = { ...s, status: 'connecting', sshId: null, reconnectNonce: 0 }
+    }
+    set({ tabs, sessions: revived, activeTabId: activeTabId ?? tabs.at(-1)?.id ?? null })
+  },
+
+  toggleBroadcast: (tabId) =>
+    set({
+      tabs: get().tabs.map((t) =>
+        t.id === tabId && t.kind === 'session' ? { ...t, broadcast: !t.broadcast } : t,
+      ),
+    }),
+
+  setZoom: (sessionId, zoom) => {
+    const prev = get().sessions[sessionId]
+    if (!prev) return
+    set({
+      sessions: {
+        ...get().sessions,
+        [sessionId]: { ...prev, zoom: Math.max(-6, Math.min(12, zoom)) },
       },
     })
   },

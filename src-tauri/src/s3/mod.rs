@@ -113,12 +113,25 @@ fn aws_uri_encode(s: &str) -> String {
     out
 }
 
-// Sign an empty-payload request (GET/HEAD/DELETE/copy-PUT) and return the date + Authorization
-// header. rust-s3 mis-signs HEAD/DELETE against Ceph RGW, so those go through this instead.
-// `extra` holds any additional signed headers (e.g. x-amz-copy-source), beyond the fixed three.
-fn sign_v4(cfg: &S3Config, method: &str, canonical_uri: &str, extra: &[(&str, &str)]) -> (String, String) {
+// Query-string encoding also escapes `/`, unlike the canonical-URI form above.
+fn aws_query_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => {
+                let _ = write!(out, "%{b:02X}");
+            }
+        }
+    }
+    out
+}
+
+fn amz_timestamp() -> String {
     let now = time::OffsetDateTime::now_utc();
-    let amz_date = format!(
+    format!(
         "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
         now.year(),
         u8::from(now.month()),
@@ -126,7 +139,57 @@ fn sign_v4(cfg: &S3Config, method: &str, canonical_uri: &str, extra: &[(&str, &s
         now.hour(),
         now.minute(),
         now.second()
+    )
+}
+
+fn signing_key(cfg: &S3Config, date: &str) -> Zeroizing<Vec<u8>> {
+    let mut secret_material = Zeroizing::new(Vec::with_capacity(4 + cfg.secret_key.len()));
+    secret_material.extend_from_slice(b"AWS4");
+    secret_material.extend_from_slice(cfg.secret_key.as_bytes());
+    let k_date = Zeroizing::new(hmac(&secret_material, date.as_bytes()));
+    let k_region = Zeroizing::new(hmac(&k_date, cfg.region.as_bytes()));
+    let k_service = Zeroizing::new(hmac(&k_region, b"s3"));
+    Zeroizing::new(hmac(&k_service, b"aws4_request"))
+}
+
+// A time-limited GET link: SigV4 moved into the query string so the URL alone authorizes
+// the download. Payload is UNSIGNED-PAYLOAD and `host` is the only signed header.
+pub fn presign_get(cfg: &S3Config, bucket_name: &str, key: &str, expires_secs: u32) -> String {
+    let amz_date = amz_timestamp();
+    let date = &amz_date[..8];
+    let scope = format!("{date}/{region}/s3/aws4_request", region = cfg.region);
+    let mut params = vec![
+        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256".to_string()),
+        ("X-Amz-Credential", format!("{}/{scope}", cfg.access_key)),
+        ("X-Amz-Date", amz_date.clone()),
+        ("X-Amz-Expires", expires_secs.to_string()),
+        ("X-Amz-SignedHeaders", "host".to_string()),
+    ];
+    params.sort_by(|a, b| a.0.cmp(b.0));
+    let canonical_query = params
+        .iter()
+        .map(|(k, v)| format!("{}={}", aws_query_encode(k), aws_query_encode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let uri = format!("/{bucket_name}/{}", aws_uri_encode(key));
+    let canonical_request = format!(
+        "GET\n{uri}\n{canonical_query}\nhost:{host}\n\nhost\nUNSIGNED-PAYLOAD",
+        host = cfg.host
     );
+    let string_to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}", {
+        let mut h = Sha256::new();
+        h.update(canonical_request.as_bytes());
+        hex(&h.finalize())
+    });
+    let signature = hex(&hmac(&signing_key(cfg, date), string_to_sign.as_bytes()));
+    format!("{}{uri}?{canonical_query}&X-Amz-Signature={signature}", cfg.endpoint)
+}
+
+// Sign an empty-payload request (GET/HEAD/DELETE/copy-PUT) and return the date + Authorization
+// header. rust-s3 mis-signs HEAD/DELETE against Ceph RGW, so those go through this instead.
+// `extra` holds any additional signed headers (e.g. x-amz-copy-source), beyond the fixed three.
+fn sign_v4(cfg: &S3Config, method: &str, canonical_uri: &str, extra: &[(&str, &str)]) -> (String, String) {
+    let amz_date = amz_timestamp();
     let date = &amz_date[..8];
 
     let mut headers: Vec<(&str, &str)> = vec![
@@ -147,14 +210,7 @@ fn sign_v4(cfg: &S3Config, method: &str, canonical_uri: &str, extra: &[(&str, &s
         hex(&h.finalize())
     });
 
-    let mut secret_material = Zeroizing::new(Vec::with_capacity(4 + cfg.secret_key.len()));
-    secret_material.extend_from_slice(b"AWS4");
-    secret_material.extend_from_slice(cfg.secret_key.as_bytes());
-    let k_date = Zeroizing::new(hmac(&secret_material, date.as_bytes()));
-    let k_region = Zeroizing::new(hmac(&k_date, cfg.region.as_bytes()));
-    let k_service = Zeroizing::new(hmac(&k_region, b"s3"));
-    let k_signing = Zeroizing::new(hmac(&k_service, b"aws4_request"));
-    let signature = hex(&hmac(&k_signing, string_to_sign.as_bytes()));
+    let signature = hex(&hmac(&signing_key(cfg, date), string_to_sign.as_bytes()));
 
     let authorization = format!(
         "AWS4-HMAC-SHA256 Credential={ak}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
@@ -535,6 +591,34 @@ pub async fn create_folder(cfg: &S3Config, bucket_name: &str, prefix: &str) -> A
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presigned_url_carries_signature_and_escapes_the_key() {
+        let cfg = build_config(
+            "s3.example.com",
+            None,
+            "us-east-1",
+            true,
+            true,
+            "AKIDEXAMPLE",
+            "secret",
+        )
+        .unwrap();
+        let url = presign_get(&cfg, "bucket", "dir/a b.txt", 900);
+        assert!(url.starts_with("https://s3.example.com/bucket/dir/a%20b.txt?"));
+        assert!(url.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"));
+        assert!(url.contains("X-Amz-Expires=900"));
+        assert!(url.contains("X-Amz-Credential=AKIDEXAMPLE%2F"));
+        assert!(url.contains("&X-Amz-Signature="));
+        // Query params must be sorted for the signature to validate.
+        let q = url.split_once('?').unwrap().1;
+        let names: Vec<&str> = q.split('&').filter_map(|p| p.split('=').next()).collect();
+        let mut sorted = names.clone();
+        sorted.pop(); // X-Amz-Signature is appended after the signed set
+        let mut expected = sorted.clone();
+        expected.sort();
+        assert_eq!(sorted, expected);
+    }
 
     #[tokio::test]
     async fn rollback_removes_our_files_and_empty_dirs_but_keeps_existing() {

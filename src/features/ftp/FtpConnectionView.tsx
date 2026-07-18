@@ -6,7 +6,7 @@ export function FtpConnectionView({
   host,
   port,
   username,
-  password,
+  secretId,
   secure,
   allowInvalidCert,
   ignoreHostname,
@@ -15,7 +15,7 @@ export function FtpConnectionView({
   host: string
   port: number
   username: string
-  password: string
+  secretId: string | null
   secure: boolean
   allowInvalidCert: boolean
   ignoreHostname: boolean
@@ -32,7 +32,7 @@ export function FtpConnectionView({
     idRef.current = null
     setSessionId(null)
     setError(null)
-    connectFtp(host, port, username, password, secure, allowInvalidCert, ignoreHostname)
+    connectFtp(host, port, username, secretId, secure, allowInvalidCert, ignoreHostname)
       .then((sid) => {
         if (disposed) {
           disconnectFtp(sid).catch(() => {})
@@ -50,9 +50,17 @@ export function FtpConnectionView({
       disposed = true
       if (idRef.current) disconnectFtp(idRef.current).catch(() => {})
     }
-  }, [host, port, username, password, secure, allowInvalidCert, ignoreHostname, nonce])
+  }, [host, port, username, secretId, secure, allowInvalidCert, ignoreHostname, nonce])
 
-  if (sessionId) return <FtpPanel sessionId={sessionId} active={active} />
+  if (sessionId)
+    return (
+      <FtpPanel
+        sessionId={sessionId}
+        active={active}
+        origin={{ user: username, host, port }}
+        secure={secure}
+      />
+    )
 
   return (
     <div className="flex h-full flex-col items-center justify-center gap-2 text-sm">

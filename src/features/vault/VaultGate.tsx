@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { AppError } from '@/bindings'
 import { Button } from '@/components/ui/button'
 import {
@@ -12,16 +12,26 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { vaultStatus, vaultUnlock } from '@/lib/vault'
 
-export function VaultGate() {
+export function VaultGate({ onReady }: { onReady?: () => void } = {}) {
   const [needs, setNeeds] = useState(false)
   const [password, setPassword] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const readyRef = useRef(onReady)
+  readyRef.current = onReady
 
   useEffect(() => {
     vaultStatus()
-      .then((s) => setNeeds(s === 'needsPassword'))
-      .catch(() => setNeeds(false))
+      .then((s) => {
+        const locked = s === 'needsPassword'
+        setNeeds(locked)
+        if (!locked) readyRef.current?.()
+      })
+      .catch(() => {
+        // A status probe failure leaves the app usable, so the app-ready path must still run.
+        setNeeds(false)
+        readyRef.current?.()
+      })
   }, [])
 
   async function submit() {
@@ -32,6 +42,7 @@ export function VaultGate() {
       await vaultUnlock(password)
       setPassword('')
       setNeeds(false)
+      readyRef.current?.()
     } catch (e) {
       const err = e as AppError
       setError(

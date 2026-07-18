@@ -32,11 +32,11 @@ function apply(ctx: CanvasRenderingContext2D, canvas: HTMLCanvasElement, frame: 
 export function VncView({
   host,
   port,
-  password,
+  secretId,
 }: {
   host: string
   port: number
-  password: string
+  secretId: string | null
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const idRef = useRef<string | null>(null)
@@ -46,7 +46,7 @@ export function VncView({
     let disposed = false
     const ctxRef = { current: null as CanvasRenderingContext2D | null }
     const pending: FrameUpdate[] = []
-    openVnc(host, port, password, (frame) => {
+    openVnc(host, port, secretId, (frame) => {
       const canvas = canvasRef.current
       if (ctxRef.current && canvas) apply(ctxRef.current, canvas, frame)
       else pending.push(frame)
@@ -71,7 +71,7 @@ export function VncView({
       disposed = true
       if (idRef.current) vncClose(idRef.current)
     }
-  }, [host, port, password])
+  }, [host, port, secretId])
 
   const onMouse = (e: ReactMouseEvent) => {
     const id = idRef.current

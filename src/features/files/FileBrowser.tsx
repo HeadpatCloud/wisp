@@ -71,8 +71,12 @@ function joinPath(dir: string, name: string): string {
   return base ? `${base}/${name}` : `/${name}`
 }
 
+// Keeps the trailing slash on absolute paths: an S3 prefix without it lists the folder
+// alongside its siblings instead of listing what's inside it.
 function parentOf(path: string): string {
-  return path.replace(/\/[^/]+\/?$/, '') || '/'
+  const parent = path.replace(/\/[^/]+\/?$/, '')
+  if (!parent) return '/'
+  return parent.startsWith('/') && !parent.endsWith('/') ? `${parent}/` : parent
 }
 
 const DEFAULT_EXPIRY = 3600

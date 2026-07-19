@@ -166,11 +166,31 @@ test('edit locally re-uploads to the original directory when the file changes', 
       expect(backend.upload).toHaveBeenCalledWith(
         expect.any(String),
         '/tmp/wisp-edit/abc/a.txt',
-        '/dir',
+        '/dir/',
         expect.any(Function),
       ),
     { timeout: 4000 },
   )
+})
+
+// Going up must land *inside* the parent prefix; without the trailing slash S3 lists the
+// folder next to its siblings instead of its contents.
+test('up from a nested prefix lists inside the parent', async () => {
+  const user = userEvent.setup()
+  const backend = makeBackend()
+  backend.list = vi.fn().mockResolvedValue([])
+  render(<FileBrowser backend={backend} initialPath="/erp-beyond/packaging/fefco/" />)
+  await waitFor(() => expect(backend.list).toHaveBeenCalledWith('/erp-beyond/packaging/fefco/'))
+
+  await user.click(screen.getByRole('button', { name: 'Up' }))
+  await waitFor(() => expect(backend.list).toHaveBeenCalledWith('/erp-beyond/packaging/'))
+
+  await user.click(screen.getByRole('button', { name: 'Up' }))
+  await waitFor(() => expect(backend.list).toHaveBeenCalledWith('/erp-beyond/'))
+
+  // The bucket list is the last step up.
+  await user.click(screen.getByRole('button', { name: 'Up' }))
+  await waitFor(() => expect(backend.list).toHaveBeenCalledWith('/'))
 })
 
 test('hides dotfiles until the toggle is on', async () => {
@@ -211,7 +231,7 @@ test('arrow keys move the selection and Backspace navigates up', async () => {
   expect(screen.getByText('1 selected · 10 B')).toBeInTheDocument()
 
   await user.keyboard('{Backspace}')
-  await waitFor(() => expect(backend.list).toHaveBeenCalledWith('/one'))
+  await waitFor(() => expect(backend.list).toHaveBeenCalledWith('/one/'))
 })
 
 test('F2 renames inline and commits on Enter', async () => {

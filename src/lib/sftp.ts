@@ -74,7 +74,8 @@ export async function upload(
   const channel = new Channel<TransferProgress>()
   channel.onmessage = onProgress
   const name = basename(localPath)
-  const remotePath = remoteDir === '/' ? `/${name}` : `${remoteDir}/${name}`
+  // remoteDir may arrive with a trailing slash (breadcrumbs, S3-style prefixes).
+  const remotePath = `${remoteDir.replace(/\/+$/, '')}/${name}`
   unwrap(await commands.sftpUpload(sid, transferId, localPath, remotePath, channel))
   return name
 }

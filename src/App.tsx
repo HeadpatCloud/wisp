@@ -2,7 +2,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window'
 import { message } from '@tauri-apps/plugin-dialog'
 import { Settings } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
-import { events, type S3Profile, type ShellInfo } from '@/bindings'
+import { events, type S3Profile, type SftpProfile, type ShellInfo } from '@/bindings'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -23,6 +23,7 @@ import { ViewHost } from '@/features/sessions/ViewHost'
 import { VncConnectDialog } from '@/features/sessions/VncConnectDialog'
 import { VncView } from '@/features/sessions/VncView'
 import { SftpConnectDialog } from '@/features/sftp/SftpConnectDialog'
+import { SftpProfileDialog } from '@/features/sftp/SftpProfileDialog'
 import { AppShell } from '@/features/shell/AppShell'
 import { UpdateBanner } from '@/features/updater/UpdateBanner'
 import { VaultGate } from '@/features/vault/VaultGate'
@@ -46,6 +47,7 @@ import {
   type VncTab,
 } from '@/stores/sessionStore'
 import { useSettingsStore } from '@/stores/settingsStore'
+import { useSftpProfileStore } from '@/stores/sftpProfileStore'
 import { useTunnelStore } from '@/stores/tunnelStore'
 
 function cycleTab(delta: number) {
@@ -80,10 +82,12 @@ export default function App() {
   const openVnc = useSessionStore((s) => s.openVnc)
   const openSftp = useSessionStore((s) => s.openSftp)
   const openSftpAdhoc = useSessionStore((s) => s.openSftpAdhoc)
+  const openSftpProfile = useSessionStore((s) => s.openSftpProfile)
   const openFtp = useSessionStore((s) => s.openFtp)
   const openS3 = useSessionStore((s) => s.openS3)
   const loadSettings = useSettingsStore((s) => s.load)
   const loadS3 = useS3ProfileStore((s) => s.load)
+  const loadSftpProfiles = useSftpProfileStore((s) => s.load)
   const themeValue = useSettingsStore((s) => s.settings.theme)
   const settingsHotkeys = useSettingsStore((s) => s.settings.hotkeys ?? {})
   const [vncDialogOpen, setVncDialogOpen] = useState(false)
@@ -91,6 +95,8 @@ export default function App() {
   const [sftpDialogOpen, setSftpDialogOpen] = useState(false)
   const [s3DialogOpen, setS3DialogOpen] = useState(false)
   const [s3Editing, setS3Editing] = useState<S3Profile | null>(null)
+  const [sftpProfileDialogOpen, setSftpProfileDialogOpen] = useState(false)
+  const [sftpEditing, setSftpEditing] = useState<SftpProfile | null>(null)
   const [shells, setShells] = useState<ShellInfo[]>([])
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [vaultReady, setVaultReady] = useState(false)
@@ -175,6 +181,9 @@ export default function App() {
     loadS3().catch(console.error)
   }, [loadS3])
   useEffect(() => {
+    loadSftpProfiles().catch(console.error)
+  }, [loadSftpProfiles])
+  useEffect(() => {
     return watchSystemTheme(() =>
       themeValue === 'light' || themeValue === 'dark' ? themeValue : 'system',
     )
@@ -206,6 +215,7 @@ export default function App() {
     if (n === null) return
     await load()
     await loadS3()
+    await loadSftpProfiles()
     await message(`Imported ${n} profile${n === 1 ? '' : 's'}.`)
   }
   const exportToFile = async () => {
@@ -244,11 +254,23 @@ export default function App() {
         open={sftpDialogOpen}
         onOpenChange={setSftpDialogOpen}
         onPick={openSftp}
-        onConnect={async ({ secret, ...rest }) =>
-          openSftpAdhoc({ ...rest, secretId: secret ? await setSecret(secret) : null })
-        }
+        onConnect={async ({ secret, keyPath, authMethod, ...rest }) => {
+          const secretId = secret ? await setSecret(secret) : null
+          openSftpAdhoc({
+            ...rest,
+            authMethod,
+            // Quick connect takes one key; its passphrase is the same secret.
+            keys: authMethod === 'key' && keyPath ? [{ path: keyPath, secretId }] : [],
+            secretId: authMethod === 'key' ? null : secretId,
+          })
+        }}
       />
       <S3ProfileDialog open={s3DialogOpen} onOpenChange={setS3DialogOpen} editing={s3Editing} />
+      <SftpProfileDialog
+        open={sftpProfileDialogOpen}
+        onOpenChange={setSftpProfileDialogOpen}
+        editing={sftpEditing}
+      />
       <AppShell
         sidebar={
           <div className="flex h-full flex-col">
@@ -320,6 +342,15 @@ export default function App() {
                   setS3DialogOpen(true)
                 }}
                 onActivateS3={(p) => openS3(p.id, p.bucket, p.name)}
+                onNewSftpProfile={() => {
+                  setSftpEditing(null)
+                  setSftpProfileDialogOpen(true)
+                }}
+                onActivateSftpProfile={(p) => openSftpProfile(p.id, p.name)}
+                onEditSftpProfile={(p) => {
+                  setSftpEditing(p)
+                  setSftpProfileDialogOpen(true)
+                }}
                 onEditS3={(p) => {
                   setS3Editing(p)
                   setS3DialogOpen(true)
@@ -381,6 +412,7 @@ export default function App() {
                 >
                   <SftpConnectionView
                     profileId={t.profileId}
+                    sftpProfileId={t.sftpProfileId}
                     adhoc={t.adhoc}
                     active={t.id === activeTabId}
                   />

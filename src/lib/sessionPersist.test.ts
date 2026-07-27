@@ -61,16 +61,17 @@ test('keeps every connection tab and stores only vault references', () => {
       kind: 'sftp',
       title: 'adhoc',
       profileId: null,
+      sftpProfileId: null,
       adhoc: {
         host: 'h',
         port: 22,
         username: 'u',
         authMethod: 'password',
-        keyPath: '',
+        keys: [],
         secretId: 'vault-3',
       },
     },
-    { id: 't5', kind: 'sftp', title: 'saved', profileId: 'p1', adhoc: null },
+    { id: 't5', kind: 'sftp', title: 'saved', profileId: 'p1', sftpProfileId: null, adhoc: null },
     { id: 't6', kind: 'view', view: { kind: 'settings' }, title: 'Settings' },
   ]
   saveSnapshot({ tabs, sessions: { s1: pane('s1') }, activeTabId: 't2' })
@@ -142,6 +143,54 @@ test('closing a tab drops its vault secret, but not while a duplicate holds it',
 
   useSessionStore.getState().removeTab('b')
   expect(deleteSecret).toHaveBeenCalledWith('shared')
+})
+
+// A tab opened from a saved SFTP profile only references it by id, so closing the tab must
+// never touch the profile's vault entries.
+test('closing a saved-profile tab leaves the profile secrets alone', () => {
+  useSessionStore.setState({
+    tabs: [
+      {
+        id: 'a',
+        kind: 'sftp',
+        title: 'files',
+        profileId: null,
+        sftpProfileId: 'sftp-1',
+        adhoc: null,
+      },
+    ],
+    sessions: {},
+    activeTabId: 'a',
+  })
+  useSessionStore.getState().removeTab('a')
+  expect(deleteSecret).not.toHaveBeenCalled()
+})
+
+test('closing a quick-connect tab drops its password and key passphrases', () => {
+  useSessionStore.setState({
+    tabs: [
+      {
+        id: 'a',
+        kind: 'sftp',
+        title: 'adhoc',
+        profileId: null,
+        sftpProfileId: null,
+        adhoc: {
+          host: 'h',
+          port: 22,
+          username: 'u',
+          authMethod: 'key',
+          keys: [{ path: '/k', secretId: 'vault-key' }],
+          secretId: 'vault-pw',
+        },
+      },
+    ],
+    sessions: {},
+    activeTabId: 'a',
+  })
+  useSessionStore.getState().removeTab('a')
+  expect(deleteSecret).toHaveBeenCalledWith('vault-key')
+  expect(deleteSecret).toHaveBeenCalledWith('vault-pw')
 })
 
 test('returns null when nothing restorable was stored', () => {

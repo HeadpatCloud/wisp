@@ -5,7 +5,7 @@ use specta::Type;
 use tauri::{AppHandle, Manager, State};
 
 use crate::error::{AppError, AppResult};
-use crate::store::model::{Group, IconRef, Profile, S3Profile, Settings};
+use crate::store::model::{Group, IconRef, Profile, S3Profile, Settings, SftpProfile};
 use crate::store::Store;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
@@ -14,9 +14,11 @@ pub struct ProfileExport {
     pub version: u32,
     pub groups: Vec<Group>,
     pub profiles: Vec<Profile>,
-    // Defaulted so bundles exported before S3 support still import.
+    // Defaulted so bundles exported before S3/SFTP support still import.
     #[serde(default)]
     pub s3_profiles: Vec<S3Profile>,
+    #[serde(default)]
+    pub sftp_profiles: Vec<SftpProfile>,
 }
 
 fn poisoned() -> AppError {
@@ -132,6 +134,37 @@ pub fn delete_s3_profile(
     Ok(())
 }
 
+#[tauri::command]
+#[specta::specta]
+pub fn list_sftp_profiles(store: State<'_, Mutex<Store>>) -> AppResult<Vec<SftpProfile>> {
+    Ok(store.lock().map_err(|_| poisoned())?.sftp_profiles())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn upsert_sftp_profile(store: State<'_, Mutex<Store>>, profile: SftpProfile) -> AppResult<()> {
+    store.lock().map_err(|_| poisoned())?.upsert_sftp_profile(profile)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn delete_sftp_profile(
+    app: AppHandle,
+    store: State<'_, Mutex<Store>>,
+    id: String,
+) -> AppResult<()> {
+    let icon = {
+        let mut s = store.lock().map_err(|_| poisoned())?;
+        let icon = s.sftp_profiles().into_iter().find(|p| p.id == id).map(|p| p.icon);
+        s.delete_sftp_profile(&id)?;
+        icon
+    };
+    if let Some(icon) = icon {
+        remove_custom_icon(&app, &icon);
+    }
+    Ok(())
+}
+
 // Secrets stay in the vault and are never written here; an export carries only the
 // profile's secretId reference, which resolves again on the same machine.
 #[tauri::command]
@@ -144,6 +177,7 @@ pub fn export_profiles(store: State<'_, Mutex<Store>>, path: String) -> AppResul
             groups: s.groups(),
             profiles: s.profiles(),
             s3_profiles: s.s3_profiles(),
+            sftp_profiles: s.sftp_profiles(),
         }
     };
     let json = serde_json::to_string_pretty(&export)?;
@@ -174,6 +208,10 @@ pub fn import_profiles(store: State<'_, Mutex<Store>>, path: String) -> AppResul
         s.upsert_s3_profile(p)?;
         count += 1;
     }
+    for p in export.sftp_profiles {
+        s.upsert_sftp_profile(p)?;
+        count += 1;
+    }
     Ok(count)
 }
 
@@ -192,6 +230,7 @@ mod tests {
             username: "u".into(),
             auth_method: AuthMethod::Password,
             key_path: None,
+            keys: vec![],
             secret_id: None,
             icon: IconRef::default(),
             order: 0,
@@ -231,6 +270,7 @@ mod tests {
             }],
             profiles: vec![sample_profile("p1", "web")],
             s3_profiles: vec![sample_s3("s1", "backups")],
+            sftp_profiles: vec![],
         };
         let json = serde_json::to_string_pretty(&export).unwrap();
         assert!(json.contains("\"version\": 1"));
@@ -257,6 +297,7 @@ mod tests {
             groups: store.groups(),
             profiles: store.profiles(),
             s3_profiles: store.s3_profiles(),
+            sftp_profiles: store.sftp_profiles(),
         };
         let json = serde_json::to_string(&export).unwrap();
 

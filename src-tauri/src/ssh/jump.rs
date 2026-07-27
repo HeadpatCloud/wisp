@@ -44,6 +44,7 @@ mod tests {
             username: "me".into(),
             auth_method: AuthMethod::Agent,
             key_path: None,
+            keys: vec![],
             secret_id: None,
             icon: IconRef::default(),
             order: 0,

@@ -4,10 +4,40 @@ import {
   duplicateProfile,
   nextGroupOrder,
   nextProfileOrder,
+  profileSecretIds,
   reorderGroups,
   reorderProfiles,
   wouldCycle,
 } from './profiles'
+
+// Sharing a vault id between an original and its copy means editing either one deletes the
+// other's passphrase, so a duplicate must start with no secrets at all.
+test('duplicateProfile shares no vault reference, including per-key passphrases', () => {
+  const original = {
+    ...p('p1', null),
+    secretId: 'vault-pw',
+    keys: [
+      { path: '/k1', secretId: 'vault-k1' },
+      { path: '/k2', secretId: null },
+    ],
+  }
+  const copy = duplicateProfile(original)
+  expect(copy.id).not.toBe(original.id)
+  expect(profileSecretIds(copy)).toEqual([])
+  expect((copy.keys ?? []).map((k) => k.path)).toEqual(['/k1', '/k2'])
+  // The original is untouched.
+  expect(profileSecretIds(original)).toEqual(['vault-pw', 'vault-k1'])
+})
+
+test('profileSecretIds collects the password and every key passphrase', () => {
+  expect(
+    profileSecretIds({
+      secretId: 'pw',
+      keys: [{ secretId: 'a' }, { secretId: null }, { secretId: 'b' }],
+    }),
+  ).toEqual(['pw', 'a', 'b'])
+  expect(profileSecretIds({ secretId: null, keys: [] })).toEqual([])
+})
 
 const p = (id: string, jump: string | null): Profile => ({
   id,

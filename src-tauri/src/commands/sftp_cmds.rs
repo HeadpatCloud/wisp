@@ -13,7 +13,7 @@ use crate::commands::ssh_cmds::{self, KnownHostsState, Sessions};
 use crate::error::{AppError, AppResult};
 use crate::sftp::{self, transfer, SftpEntry};
 use crate::ssh::client::SshHandle;
-use crate::store::model::AuthMethod;
+use crate::store::model::{AuthMethod, ProfileKey};
 use crate::store::Store;
 use crate::vault::Vault;
 
@@ -75,6 +75,43 @@ pub async fn sftp_connect(
     register_standalone(&sftps, &conns, handle, bastions).await
 }
 
+// Connect a saved SFTP-only profile. Resolving it here means the tab holds just an id, so a
+// later edit is picked up on reconnect and no vault reference is duplicated into session state.
+#[tauri::command]
+#[specta::specta]
+pub async fn sftp_connect_saved(
+    store: State<'_, StdMutex<Store>>,
+    vault: State<'_, StdMutex<Vault>>,
+    known: State<'_, KnownHostsState>,
+    sftps: State<'_, SftpSessions>,
+    conns: State<'_, SftpConns>,
+    profile_id: String,
+) -> AppResult<String> {
+    let profile = {
+        let s = store.lock().map_err(|_| AppError::Internal("store lock poisoned".into()))?;
+        s.sftp_profiles()
+            .into_iter()
+            .find(|p| p.id == profile_id)
+            .ok_or_else(|| AppError::NotFound(format!("sftp profile {profile_id}")))?
+    };
+    let secret = match &profile.secret_id {
+        Some(id) => Some(ssh_cmds::secret_string(&vault, id)?),
+        None => None,
+    };
+    let resolved = ssh_cmds::resolve_keys(&vault, &profile.keys)?;
+    let handle = ssh_cmds::connect_adhoc(
+        &known,
+        &profile.host,
+        profile.port,
+        &profile.username,
+        profile.auth_method,
+        &resolved,
+        secret,
+    )
+    .await?;
+    register_standalone(&sftps, &conns, handle, Vec::new()).await
+}
+
 // Same as sftp_connect but for a one-off host with no saved profile (no jump chain).
 #[tauri::command]
 #[specta::specta]
@@ -87,24 +124,18 @@ pub async fn sftp_connect_adhoc(
     port: u16,
     username: String,
     auth_method: AuthMethod,
-    key_path: Option<String>,
+    keys: Vec<ProfileKey>,
     secret_id: Option<String>,
 ) -> AppResult<String> {
-    // The password/passphrase lives in the vault; the caller only holds a reference.
+    // Passwords and key passphrases live in the vault; the caller only holds references.
     let secret = match &secret_id {
         Some(id) => Some(ssh_cmds::secret_string(&vault, id)?),
         None => None,
     };
-    let handle = ssh_cmds::connect_adhoc(
-        &known,
-        &host,
-        port,
-        &username,
-        auth_method,
-        key_path.as_deref(),
-        secret,
-    )
-    .await?;
+    let resolved = ssh_cmds::resolve_keys(&vault, &keys)?;
+    let handle =
+        ssh_cmds::connect_adhoc(&known, &host, port, &username, auth_method, &resolved, secret)
+            .await?;
     register_standalone(&sftps, &conns, handle, Vec::new()).await
 }
 

@@ -60,6 +60,9 @@ export interface SftpTab {
   kind: 'sftp'
   title: string
   profileId: string | null
+  // A saved SFTP-only profile, resolved backend-side on connect so the tab never copies
+  // its credentials and picks up edits on reconnect.
+  sftpProfileId: string | null
   adhoc: SftpAdhocParams | null
 }
 
@@ -86,10 +89,16 @@ export interface S3Tab {
 
 export type Tab = SessionTab | ViewTab | LocalTab | VncTab | SftpTab | FtpTab | S3Tab
 
-export function tabSecretId(t: Tab): string | null {
-  if (t.kind === 'ftp' || t.kind === 'vnc') return t.secretId
-  if (t.kind === 'sftp') return t.adhoc?.secretId ?? null
-  return null
+// Vault entries a tab owns outright, so closing it can clean them up. Secrets belonging to
+// a saved profile are excluded - the profile owns those and outlives the tab.
+export function tabSecretIds(t: Tab): string[] {
+  if (t.kind === 'ftp' || t.kind === 'vnc') return t.secretId ? [t.secretId] : []
+  if (t.kind === 'sftp' && t.adhoc) {
+    return [t.adhoc.secretId, ...t.adhoc.keys.map((k) => k.secretId)].filter(
+      (id): id is string => !!id,
+    )
+  }
+  return []
 }
 
 function viewKey(v: TabView): string {
@@ -107,7 +116,8 @@ interface SessionState {
   openLocalShell: (program?: string | null, title?: string) => void
   openVnc: (host: string, port: number, secretId: string | null) => void
   openSftp: (profileId: string, title: string) => void
-  openSftpAdhoc: (params: SftpAdhocParams) => void
+  openSftpProfile: (sftpProfileId: string, title: string) => void
+  openSftpAdhoc: (params: SftpAdhocParams, title?: string) => void
   openFtp: (params: {
     host: string
     port: number
@@ -185,16 +195,36 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
   },
 
   openSftp: (profileId, title) => {
-    const tab: SftpTab = { id: crypto.randomUUID(), kind: 'sftp', title, profileId, adhoc: null }
-    set({ tabs: [...get().tabs, tab], activeTabId: tab.id })
-  },
-
-  openSftpAdhoc: (params) => {
     const tab: SftpTab = {
       id: crypto.randomUUID(),
       kind: 'sftp',
-      title: `${params.host}:${params.port}`,
+      title,
+      profileId,
+      sftpProfileId: null,
+      adhoc: null,
+    }
+    set({ tabs: [...get().tabs, tab], activeTabId: tab.id })
+  },
+
+  openSftpProfile: (sftpProfileId, title) => {
+    const tab: SftpTab = {
+      id: crypto.randomUUID(),
+      kind: 'sftp',
+      title,
       profileId: null,
+      sftpProfileId,
+      adhoc: null,
+    }
+    set({ tabs: [...get().tabs, tab], activeTabId: tab.id })
+  },
+
+  openSftpAdhoc: (params, title) => {
+    const tab: SftpTab = {
+      id: crypto.randomUUID(),
+      kind: 'sftp',
+      title: title ?? `${params.host}:${params.port}`,
+      profileId: null,
+      sftpProfileId: null,
       adhoc: params,
     }
     set({ tabs: [...get().tabs, tab], activeTabId: tab.id })
@@ -227,7 +257,8 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
     if (tab.kind === 'local') {
       get().openLocalShell(tab.program, tab.title)
     } else if (tab.kind === 'sftp') {
-      if (tab.adhoc) get().openSftpAdhoc(tab.adhoc)
+      if (tab.adhoc) get().openSftpAdhoc(tab.adhoc, tab.title)
+      else if (tab.sftpProfileId) get().openSftpProfile(tab.sftpProfileId, tab.title)
       else if (tab.profileId) get().openSftp(tab.profileId, tab.title)
     } else if (tab.kind === 'ftp') {
       get().openFtp(tab)
@@ -313,10 +344,10 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
     const sessions = { ...get().sessions }
     if (tab.kind === 'session') for (const id of tab.sessionIds) delete sessions[id]
     const tabs = get().tabs.filter((t) => t.id !== tabId)
-    // Drop the ad-hoc credential with its last tab; a duplicated tab still references it.
-    const secretId = tabSecretId(tab)
-    if (secretId && !tabs.some((t) => tabSecretId(t) === secretId)) {
-      deleteSecret(secretId).catch(() => {})
+    // Drop ad-hoc credentials with their last tab; a duplicated tab still references them.
+    const stillUsed = new Set(tabs.flatMap(tabSecretIds))
+    for (const secretId of tabSecretIds(tab)) {
+      if (!stillUsed.has(secretId)) deleteSecret(secretId).catch(() => {})
     }
     set({
       tabs,

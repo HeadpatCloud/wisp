@@ -23,14 +23,24 @@ export async function importProfilesFromFile(): Promise<number | null> {
   return unwrap(await commands.importProfiles(path))
 }
 
-// Clone a profile for "Duplicate". New ids (profile + tunnels), a "(copy)" name, and
-// no shared vault secret - the user re-enters the password on the copy.
+// Every vault entry a profile owns: the password plus one passphrase per key.
+export function profileSecretIds(p: {
+  secretId: string | null
+  keys?: { secretId: string | null }[] | null
+}): string[] {
+  return [p.secretId, ...(p.keys ?? []).map((k) => k.secretId)].filter((id): id is string => !!id)
+}
+
+// Clone a profile for "Duplicate". New ids (profile + tunnels), a "(copy)" name, and no
+// shared vault secret - including per-key passphrases, or editing either copy would delete
+// the other's. The user re-enters credentials on the copy.
 export function duplicateProfile(p: Profile): Profile {
   return {
     ...p,
     id: crypto.randomUUID(),
     name: `${p.name} (copy)`,
     secretId: null,
+    keys: (p.keys ?? []).map((k) => ({ ...k, secretId: null })),
     tunnels: (p.tunnels ?? []).map((t) => ({ ...t, id: crypto.randomUUID() })),
   }
 }

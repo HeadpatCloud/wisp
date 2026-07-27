@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { commands, type Group, type Profile } from '@/bindings'
 import { unwrap } from '@/lib/ipc'
+import { profileSecretIds } from '@/lib/profiles'
 
 interface ProfileState {
   groups: Group[]
@@ -49,8 +50,9 @@ export const useProfileStore = create<ProfileState>()((set, get) => ({
   },
   removeProfile: async (id) => {
     const target = get().profiles.find((p) => p.id === id)
-    if (target?.secretId) {
-      unwrap(await commands.deleteSecret(target.secretId))
+    // Best effort: a secret that's already gone must not block deleting the profile.
+    for (const secretId of target ? profileSecretIds(target) : []) {
+      await commands.deleteSecret(secretId).catch(() => {})
     }
     unwrap(await commands.deleteProfile(id))
     set({ profiles: unwrap(await commands.listProfiles()) })

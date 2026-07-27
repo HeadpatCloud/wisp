@@ -90,21 +90,46 @@ test('per-profile font size override is saved as appearance', async () => {
   )
 })
 
-test('Browse fills the key path from the file picker', async () => {
-  const user = userEvent.setup()
-  render(<ProfilePage profileId={null} tabId="t1" />)
+async function chooseKeyAuth(user: ReturnType<typeof userEvent.setup>) {
   await user.click(screen.getByLabelText('Auth method'))
   const items = await screen.findAllByText('Private key')
   await user.click(items[items.length - 1])
-  await user.click(await screen.findByRole('button', { name: /browse/i }))
+}
+
+test('Browse fills a key path from the file picker', async () => {
+  const user = userEvent.setup()
+  render(<ProfilePage profileId={null} tabId="t1" />)
+  await chooseKeyAuth(user)
+  await user.click(await screen.findByRole('button', { name: /add key/i }))
+  await user.click(screen.getByRole('button', { name: /browse/i }))
   await waitFor(() =>
-    expect((screen.getByLabelText('Key path') as HTMLInputElement).value).toBe(
-      '/home/me/.ssh/id_ed25519',
-    ),
+    expect(screen.getByDisplayValue('/home/me/.ssh/id_ed25519')).toBeInTheDocument(),
   )
 })
 
-test('editing a saved key-auth profile reflects the auth method (Key path shows)', async () => {
+test('keys can be added and reordered, and the order is what gets saved', async () => {
+  const user = userEvent.setup()
+  render(<ProfilePage profileId={null} tabId="t1" />)
+  await user.type(screen.getByLabelText('Name'), 'srv')
+  await user.type(screen.getByLabelText('Host'), 'h')
+  await user.type(screen.getByLabelText('Username'), 'u')
+  await chooseKeyAuth(user)
+
+  await user.click(await screen.findByRole('button', { name: /add key/i }))
+  await user.type(screen.getByPlaceholderText('/home/me/.ssh/id_ed25519'), '/keys/first')
+  await user.click(screen.getByRole('button', { name: /add key/i }))
+  const paths = screen.getAllByPlaceholderText('/home/me/.ssh/id_ed25519')
+  await user.type(paths[1], '/keys/second')
+
+  await user.click(screen.getByRole('button', { name: 'Move key 2 up' }))
+  await user.click(screen.getByRole('button', { name: /^save$/i }))
+
+  await waitFor(() => expect(saveProfile).toHaveBeenCalled())
+  const saved = saveProfile.mock.calls.at(-1)?.[0]
+  expect(saved.keys.map((k: { path: string }) => k.path)).toEqual(['/keys/second', '/keys/first'])
+})
+
+test('editing a saved key-auth profile shows its keys', async () => {
   const profile = {
     id: 'p1',
     name: 'srv',
@@ -113,7 +138,11 @@ test('editing a saved key-auth profile reflects the auth method (Key path shows)
     port: 22,
     username: 'u',
     authMethod: 'key',
-    keyPath: '/home/me/.ssh/id_ed25519',
+    keyPath: null,
+    keys: [
+      { path: '/home/me/.ssh/id_ed25519', secretId: null },
+      { path: '/home/me/.ssh/id_rsa', secretId: 'vault-1' },
+    ],
     secretId: null,
     icon: { kind: 'builtin', name: 'server' },
     order: 0,
@@ -122,7 +151,10 @@ test('editing a saved key-auth profile reflects the auth method (Key path shows)
   }
   useProfileStore.setState({ groups: [], profiles: [profile], loaded: true, saveProfile } as never)
   render(<ProfilePage profileId="p1" tabId="t1" />)
-  expect(await screen.findByLabelText('Key path')).toBeInTheDocument()
+  expect(await screen.findByDisplayValue('/home/me/.ssh/id_ed25519')).toBeInTheDocument()
+  expect(screen.getByDisplayValue('/home/me/.ssh/id_rsa')).toBeInTheDocument()
+  // A stored passphrase stays in the vault; the field only says one exists.
+  expect(screen.getByPlaceholderText('passphrase unchanged')).toBeInTheDocument()
 })
 
 test('cancel closes the tab without saving', async () => {

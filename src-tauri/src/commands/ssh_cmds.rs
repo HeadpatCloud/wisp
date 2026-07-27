@@ -17,7 +17,7 @@ use crate::ssh::client::{self, SshHandle};
 use crate::ssh::jump;
 use crate::ssh::known_hosts::KnownHosts;
 use crate::ssh::session::{open_pty, run_session};
-use crate::store::model::{AuthMethod, Profile};
+use crate::store::model::{AuthMethod, Profile, ProfileKey};
 use crate::store::Store;
 use crate::vault::Vault;
 
@@ -72,6 +72,29 @@ fn secret_for(
     }
 }
 
+pub(crate) struct ResolvedKey {
+    pub path: String,
+    pub passphrase: Option<Zeroizing<String>>,
+}
+
+// Pulls each key's passphrase out of the vault up front, so authenticate() needs no vault access.
+pub(crate) fn resolve_keys(
+    vault: &State<'_, StdMutex<Vault>>,
+    keys: &[ProfileKey],
+) -> AppResult<Vec<ResolvedKey>> {
+    keys.iter()
+        .map(|k| {
+            Ok(ResolvedKey {
+                path: k.path.clone(),
+                passphrase: match &k.secret_id {
+                    Some(id) => Some(secret_string(vault, id)?),
+                    None => None,
+                },
+            })
+        })
+        .collect()
+}
+
 pub(crate) async fn connect_via_chain(
     store: &State<'_, StdMutex<Store>>,
     vault: &State<'_, StdMutex<Vault>>,
@@ -92,7 +115,7 @@ pub(crate) async fn connect_via_chain(
         &mut prev,
         &root.username,
         root.auth_method,
-        root.key_path.as_deref(),
+        &resolve_keys(vault, &root.keys)?,
         secret_for(vault, root)?,
     )
     .await?;
@@ -117,7 +140,7 @@ pub(crate) async fn connect_via_chain(
             &mut next,
             &hop.username,
             hop.auth_method,
-            hop.key_path.as_deref(),
+            &resolve_keys(vault, &hop.keys)?,
             secret_for(vault, hop)?,
         )
         .await?;
@@ -133,11 +156,11 @@ pub(crate) async fn connect_adhoc(
     port: u16,
     username: &str,
     auth_method: AuthMethod,
-    key_path: Option<&str>,
+    keys: &[ResolvedKey],
     secret: Option<Zeroizing<String>>,
 ) -> AppResult<SshHandle> {
     let mut handle = client::connect(host, port, known.0.clone(), client::new_forwards()).await?;
-    authenticate(&mut handle, username, auth_method, key_path, secret).await?;
+    authenticate(&mut handle, username, auth_method, keys, secret).await?;
     Ok(handle)
 }
 
@@ -145,7 +168,7 @@ async fn authenticate(
     handle: &mut SshHandle,
     username: &str,
     auth_method: AuthMethod,
-    key_path: Option<&str>,
+    keys: &[ResolvedKey],
     secret: Option<Zeroizing<String>>,
 ) -> AppResult<()> {
     match auth_method {
@@ -169,9 +192,38 @@ async fn authenticate(
             }
         }
         AuthMethod::Key => {
-            let key_path = key_path.ok_or_else(|| AppError::Auth("no key path".into()))?;
-            let passphrase = secret.as_ref().map(|s| s.as_str());
-            client::auth_key(handle, username, key_path, passphrase).await
+            if keys.is_empty() {
+                return Err(AppError::Auth("no private key configured".into()));
+            }
+            let mut last: Option<AppError> = None;
+            // A passphrase problem is the user's to fix, so it outranks a plain rejection in
+            // the final message - but it must not stop the loop, because an unreadable key
+            // file reports the same way and the next key may well work.
+            let mut passphrase_err: Option<AppError> = None;
+            for key in keys {
+                match client::auth_key(
+                    handle,
+                    username,
+                    &key.path,
+                    key.passphrase.as_ref().map(|s| s.as_str()),
+                )
+                .await
+                {
+                    Ok(()) => return Ok(()),
+                    Err(e @ (AppError::PassphraseRequired | AppError::WrongPassphrase)) => {
+                        passphrase_err.get_or_insert(e);
+                    }
+                    Err(e) => last = Some(e),
+                }
+            }
+            Err(match (passphrase_err, last) {
+                (Some(e), _) => e,
+                (None, Some(e)) if keys.len() == 1 => e,
+                (None, Some(e)) => {
+                    AppError::Auth(format!("all {} keys rejected (last: {e})", keys.len()))
+                }
+                (None, None) => AppError::Auth("no private key configured".into()),
+            })
         }
         AuthMethod::Agent => client::auth_agent(handle, username).await,
     }

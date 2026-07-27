@@ -1,6 +1,7 @@
 import { Channel } from '@tauri-apps/api/core'
 import { open, save } from '@tauri-apps/plugin-dialog'
-import { type AuthMethod, commands, type SftpEntry, type TransferProgress } from '@/bindings'
+import type { AuthMethod, ProfileKey, SftpEntry, TransferProgress } from '@/bindings'
+import { commands } from '@/bindings'
 import { unwrap } from '@/lib/ipc'
 
 export interface SftpAdhocParams {
@@ -8,7 +9,7 @@ export interface SftpAdhocParams {
   port: number
   username: string
   authMethod: AuthMethod
-  keyPath: string
+  keys: ProfileKey[]
   secretId: string | null
 }
 
@@ -19,16 +20,23 @@ export async function connectSftp(profileId: string): Promise<string> {
   return res.data
 }
 
-// Throws the raw AppError, same as connectSftp.
+// Throws the raw AppError, same as connectSftp. `keys` is defaulted because snapshots
+// written by an older build predate it.
 export async function connectSftpAdhoc(p: SftpAdhocParams): Promise<string> {
   const res = await commands.sftpConnectAdhoc(
     p.host,
     p.port,
     p.username,
     p.authMethod,
-    p.keyPath || null,
+    p.keys ?? [],
     p.secretId,
   )
+  if (res.status === 'error') throw res.error
+  return res.data
+}
+
+export async function connectSftpProfile(profileId: string): Promise<string> {
+  const res = await commands.sftpConnectSaved(profileId)
   if (res.status === 'error') throw res.error
   return res.data
 }

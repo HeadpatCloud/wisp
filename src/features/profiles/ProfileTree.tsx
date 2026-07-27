@@ -12,7 +12,7 @@ import {
 } from 'lucide-react'
 import type { ReactNode, PointerEvent as ReactPointerEvent } from 'react'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { Group, Profile, S3Profile, ShellInfo } from '@/bindings'
+import type { Group, Profile, S3Profile, SftpProfile, ShellInfo } from '@/bindings'
 import {
   ContextMenu,
   ContextMenuContent,
@@ -32,6 +32,7 @@ import { Input } from '@/components/ui/input'
 import { duplicateProfile, reorderGroups, reorderProfiles } from '@/lib/profiles'
 import { useProfileStore } from '@/stores/profileStore'
 import { useS3ProfileStore } from '@/stores/s3ProfileStore'
+import { useSftpProfileStore } from '@/stores/sftpProfileStore'
 import { ProfileIcon } from './ProfileIcon'
 
 const COLLAPSED_KEY = 'sidebar-collapsed'
@@ -82,6 +83,9 @@ interface ProfileTreeProps {
   onNewS3: () => void
   onActivateS3: (profile: S3Profile) => void
   onEditS3: (profile: S3Profile) => void
+  onNewSftpProfile: () => void
+  onActivateSftpProfile: (profile: SftpProfile) => void
+  onEditSftpProfile: (profile: SftpProfile) => void
   onNewLocalShell: (program: string | null, title: string) => void
   onNewSftp: (profileId: string, title: string) => void
   onOpenSftpPicker: () => void
@@ -99,6 +103,9 @@ export function ProfileTree({
   onNewS3,
   onActivateS3,
   onEditS3,
+  onNewSftpProfile,
+  onActivateSftpProfile,
+  onEditSftpProfile,
   onNewLocalShell,
   onNewSftp,
   onOpenSftpPicker,
@@ -111,6 +118,8 @@ export function ProfileTree({
   const profiles = useProfileStore((s) => s.profiles)
   const s3Profiles = useS3ProfileStore((s) => s.profiles)
   const removeS3 = useS3ProfileStore((s) => s.remove)
+  const sftpProfiles = useSftpProfileStore((s) => s.profiles)
+  const removeSftpProfile = useSftpProfileStore((s) => s.remove)
   const removeProfile = useProfileStore((s) => s.removeProfile)
   const removeGroup = useProfileStore((s) => s.removeGroup)
   const saveProfile = useProfileStore((s) => s.saveProfile)
@@ -242,8 +251,11 @@ export function ProfileTree({
             <DropdownMenuItem onSelect={onNewProfile}>
               <Server /> SSH profile
             </DropdownMenuItem>
+            <DropdownMenuItem onSelect={onNewSftpProfile}>
+              <FolderTree /> SFTP profile
+            </DropdownMenuItem>
             <DropdownMenuItem onSelect={onOpenSftpPicker}>
-              <FolderTree /> SFTP connection
+              <FolderTree /> SFTP quick connect
             </DropdownMenuItem>
             <DropdownMenuItem onSelect={onNewFtp}>
               <Network /> FTP / FTPS
@@ -290,11 +302,14 @@ export function ProfileTree({
       </div>
 
       <div data-tree className="min-h-0 flex-1 overflow-y-auto px-1 pb-2">
-        {groups.length === 0 && profiles.length === 0 && s3Profiles.length === 0 && (
-          <div className="px-2 py-6 text-center text-muted-foreground text-xs">
-            No hosts yet. Use + to add a profile, or Import from ~/.ssh/config.
-          </div>
-        )}
+        {groups.length === 0 &&
+          profiles.length === 0 &&
+          s3Profiles.length === 0 &&
+          sftpProfiles.length === 0 && (
+            <div className="px-2 py-6 text-center text-muted-foreground text-xs">
+              No hosts yet. Use + to add a profile, or Import from ~/.ssh/config.
+            </div>
+          )}
         {sortedGroups.map((group) => {
           const members = filtered.filter((p) => p.groupId === group.id)
           const isCollapsed = collapsed[group.id]
@@ -359,6 +374,33 @@ export function ProfileTree({
             }}
           />
         ))}
+        {sftpProfiles.length > 0 && (
+          <div className="mt-2">
+            <div className="px-2 py-1 font-medium text-muted-foreground text-xs">SFTP</div>
+            {sftpProfiles
+              .filter((p) => {
+                const q = query.trim().toLowerCase()
+                return !q || p.name.toLowerCase().includes(q) || p.host.toLowerCase().includes(q)
+              })
+              .map((p) => (
+                <Row
+                  key={p.id}
+                  onEdit={() => onEditSftpProfile(p)}
+                  onDelete={() => removeSftpProfile(p.id)}
+                >
+                  <button
+                    type="button"
+                    onDoubleClick={() => onActivateSftpProfile(p)}
+                    className="flex w-full select-none items-center gap-1.5 rounded border-2 border-transparent px-1.5 py-1 text-sm hover:bg-muted"
+                  >
+                    <FolderTree className="size-4 text-muted-foreground" />
+                    <span className="truncate">{p.name}</span>
+                    <span className="ml-auto truncate text-muted-foreground text-xs">{p.host}</span>
+                  </button>
+                </Row>
+              ))}
+          </div>
+        )}
         {s3Profiles.length > 0 && (
           <div className="mt-2">
             <div className="px-2 py-1 font-medium text-muted-foreground text-xs">S3</div>

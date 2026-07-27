@@ -1,10 +1,9 @@
 import { zodResolver } from '@hookform/resolvers/zod'
-import { open } from '@tauri-apps/plugin-dialog'
 import type { ReactNode } from 'react'
 import { useEffect, useMemo, useState } from 'react'
 import { Controller, useFieldArray, useForm } from 'react-hook-form'
 import { z } from 'zod'
-import { commands, type IconRef, type Profile } from '@/bindings'
+import type { IconRef, Profile } from '@/bindings'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -16,11 +15,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { unwrap } from '@/lib/ipc'
-import { nextProfileOrder, wouldCycle } from '@/lib/profiles'
+import { nextProfileOrder, profileSecretIds, wouldCycle } from '@/lib/profiles'
+import { deleteSecret, setSecret } from '@/lib/vault'
 import { useProfileStore } from '@/stores/profileStore'
 import { useSessionStore } from '@/stores/sessionStore'
 import { IconPicker } from './IconPicker'
+import { type KeyDraft, KeyListEditor, persistKeys } from './KeyListEditor'
 
 const schema = z.object({
   name: z.string().min(1, 'Name is required'),
@@ -28,7 +28,6 @@ const schema = z.object({
   port: z.number().int().min(1).max(65535),
   username: z.string().min(1, 'Username is required'),
   authMethod: z.enum(['password', 'key', 'agent']),
-  keyPath: z.string(),
   password: z.string(),
   groupId: z.string(),
   jumpHostId: z.string(),
@@ -58,6 +57,7 @@ export function ProfilePage({ profileId, tabId }: { profileId: string | null; ta
   const [iconRef, setIconRef] = useState<IconRef>(
     profile?.icon ?? { kind: 'builtin', name: 'server' },
   )
+  const [keys, setKeys] = useState<KeyDraft[]>([])
 
   const formValues = useMemo<FormValues>(
     () => ({
@@ -66,7 +66,6 @@ export function ProfilePage({ profileId, tabId }: { profileId: string | null; ta
       port: profile?.port ?? 22,
       username: profile?.username ?? '',
       authMethod: profile?.authMethod ?? 'password',
-      keyPath: profile?.keyPath ?? '',
       password: '',
       groupId: profile?.groupId ?? '',
       jumpHostId: profile?.jumpHostId ?? '',
@@ -86,7 +85,6 @@ export function ProfilePage({ profileId, tabId }: { profileId: string | null; ta
     register,
     handleSubmit,
     watch,
-    setValue,
     control,
     formState: { errors, isSubmitting },
   } = useForm<FormValues>({
@@ -98,16 +96,30 @@ export function ProfilePage({ profileId, tabId }: { profileId: string | null; ta
 
   useEffect(() => {
     setIconRef(profile?.icon ?? { kind: 'builtin', name: 'server' })
+    setKeys(
+      (profile?.keys ?? []).map((k) => ({
+        path: k.path,
+        secretId: k.secretId,
+        passphrase: '',
+      })),
+    )
   }, [profile])
 
   const authMethod = watch('authMethod')
 
   async function onSubmit(values: FormValues) {
-    let secretId = profile?.secretId ?? null
-    if (values.password) {
-      const newId = unwrap(await commands.setSecret(values.password))
-      if (profile?.secretId) await commands.deleteSecret(profile.secretId)
-      secretId = newId
+    const usesPassword = values.authMethod === 'password'
+    let secretId = usesPassword ? (profile?.secretId ?? null) : null
+    if (usesPassword && values.password) {
+      secretId = await setSecret(values.password)
+      if (profile?.secretId) await deleteSecret(profile.secretId).catch(() => {})
+    }
+    const nextKeys = values.authMethod === 'key' ? await persistKeys(keys) : []
+    // Drop vault entries this profile no longer references (auth method switched, or a key
+    // removed), or they linger forever with nothing pointing at them.
+    const kept = new Set([secretId, ...nextKeys.map((k) => k.secretId)].filter(Boolean))
+    for (const stale of profileSecretIds(profile ?? { secretId: null, keys: [] })) {
+      if (!kept.has(stale)) await deleteSecret(stale).catch(() => {})
     }
     const appearance =
       values.appFontFamily || values.appFontSize
@@ -126,7 +138,8 @@ export function ProfilePage({ profileId, tabId }: { profileId: string | null; ta
       port: values.port,
       username: values.username,
       authMethod: values.authMethod,
-      keyPath: values.authMethod === 'key' ? values.keyPath || null : null,
+      keyPath: null,
+      keys: nextKeys,
       secretId,
       icon: iconRef,
       order: profile?.order ?? nextProfileOrder(profiles, values.groupId || null),
@@ -216,26 +229,8 @@ export function ProfilePage({ profileId, tabId }: { profileId: string | null; ta
             )}
           />
         </div>
-        {authMethod === 'key' && (
-          <Field htmlFor="keyPath" label="Key path">
-            <div className="flex gap-2">
-              <Input id="keyPath" {...register('keyPath')} />
-              <Button
-                type="button"
-                variant="secondary"
-                onClick={async () => {
-                  const picked = await open({ multiple: false, directory: false })
-                  if (typeof picked === 'string') {
-                    setValue('keyPath', picked, { shouldDirty: true })
-                  }
-                }}
-              >
-                Browse
-              </Button>
-            </div>
-          </Field>
-        )}
-        {authMethod !== 'agent' && (
+        {authMethod === 'key' && <KeyListEditor keys={keys} onChange={setKeys} />}
+        {authMethod === 'password' && (
           <Field htmlFor="password" label="Password">
             <Input
               id="password"

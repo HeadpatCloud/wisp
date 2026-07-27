@@ -4,7 +4,7 @@ pub mod model;
 use std::path::PathBuf;
 
 use crate::error::{AppError, AppResult};
-use model::{Group, Profile, ProfileStore, S3Profile, Settings};
+use model::{AuthMethod, Group, Profile, ProfileKey, ProfileStore, S3Profile, SftpProfile, Settings};
 
 pub struct Store {
     dir: PathBuf,
@@ -12,11 +12,27 @@ pub struct Store {
     settings: Settings,
 }
 
+// Folds a pre-multi-key profile's single key_path into the keys list. Runs on every read and
+// write path, not just load, so profiles arriving from an import or the ssh-config importer
+// are normalized too. The secret *moves* rather than being copied: two owners of one vault
+// entry means whichever side is edited first deletes the other's passphrase.
+pub(crate) fn normalize_keys(p: &mut Profile) {
+    let Some(path) = p.key_path.take() else { return };
+    if !p.keys.is_empty() {
+        return;
+    }
+    let secret_id = if p.auth_method == AuthMethod::Key { p.secret_id.take() } else { None };
+    p.keys.push(ProfileKey { path, secret_id });
+}
+
 impl Store {
     pub fn load(dir: PathBuf) -> AppResult<Self> {
         let mut data: ProfileStore = io::read_json(&dir.join("profiles.json"))?;
         if data.version < ProfileStore::CURRENT_VERSION {
             data.version = ProfileStore::CURRENT_VERSION;
+        }
+        for p in data.profiles.iter_mut() {
+            normalize_keys(p);
         }
         let settings: Settings = io::read_json(&dir.join("settings.json"))?;
         Ok(Self { dir, data, settings })
@@ -64,7 +80,8 @@ impl Store {
         self.persist_profiles()
     }
 
-    pub fn upsert_profile(&mut self, profile: Profile) -> AppResult<()> {
+    pub fn upsert_profile(&mut self, mut profile: Profile) -> AppResult<()> {
+        normalize_keys(&mut profile);
         match self.data.profiles.iter_mut().find(|p| p.id == profile.id) {
             Some(existing) => *existing = profile,
             None => self.data.profiles.push(profile),
@@ -84,6 +101,27 @@ impl Store {
     pub fn set_settings(&mut self, settings: Settings) -> AppResult<()> {
         self.settings = settings;
         self.persist_settings()
+    }
+
+    pub fn sftp_profiles(&self) -> Vec<SftpProfile> {
+        self.data.sftp_profiles.clone()
+    }
+
+    pub fn upsert_sftp_profile(&mut self, profile: SftpProfile) -> AppResult<()> {
+        match self.data.sftp_profiles.iter_mut().find(|p| p.id == profile.id) {
+            Some(existing) => *existing = profile,
+            None => self.data.sftp_profiles.push(profile),
+        }
+        self.persist_profiles()
+    }
+
+    pub fn delete_sftp_profile(&mut self, id: &str) -> AppResult<()> {
+        let before = self.data.sftp_profiles.len();
+        self.data.sftp_profiles.retain(|p| p.id != id);
+        if self.data.sftp_profiles.len() == before {
+            return Err(AppError::NotFound(format!("sftp profile {id}")));
+        }
+        self.persist_profiles()
     }
 
     pub fn s3_profiles(&self) -> Vec<S3Profile> {
@@ -123,6 +161,7 @@ mod tests {
             username: "u".into(),
             auth_method: AuthMethod::Password,
             key_path: None,
+            keys: vec![],
             secret_id: None,
             icon: IconRef::default(),
             order: 0,
@@ -159,6 +198,83 @@ mod tests {
         store.upsert_profile(profile("p1", Some("g1"))).unwrap();
         store.delete_group("g1").unwrap();
         assert_eq!(store.profiles()[0].group_id, None);
+    }
+
+    // Profiles written before multi-key support carry key_path + a passphrase in secret_id.
+    #[test]
+    fn load_migrates_a_legacy_single_key() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("profiles.json"),
+            r#"{"version":1,"groups":[],"profiles":[
+                {"id":"p1","name":"p1","groupId":null,"host":"h","port":22,"username":"u",
+                 "authMethod":"key","keyPath":"/keys/id_ed25519","secretId":"vault-1",
+                 "order":0,"jumpHostId":null},
+                {"id":"p2","name":"p2","groupId":null,"host":"h","port":22,"username":"u",
+                 "authMethod":"password","keyPath":null,"secretId":"vault-2",
+                 "order":1,"jumpHostId":null}
+            ]}"#,
+        )
+        .unwrap();
+        let store = Store::load(dir.path().to_path_buf()).unwrap();
+        let profiles = store.profiles();
+
+        let key_profile = profiles.iter().find(|p| p.id == "p1").unwrap();
+        assert_eq!(key_profile.key_path, None);
+        assert_eq!(key_profile.keys.len(), 1);
+        assert_eq!(key_profile.keys[0].path, "/keys/id_ed25519");
+        // The old profile secret was that key's passphrase, and it MOVED - leaving it on the
+        // profile too would give one vault entry two owners, and whichever is edited first
+        // would delete the other's secret.
+        assert_eq!(key_profile.keys[0].secret_id.as_deref(), Some("vault-1"));
+        assert_eq!(key_profile.secret_id, None);
+
+        // Password auth keeps its secret where it was, with no phantom key.
+        let pw_profile = profiles.iter().find(|p| p.id == "p2").unwrap();
+        assert!(pw_profile.keys.is_empty());
+        assert_eq!(pw_profile.secret_id.as_deref(), Some("vault-2"));
+    }
+
+    // Imports and the ssh-config importer write through upsert, never through load.
+    #[test]
+    fn upsert_normalizes_a_legacy_key_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        let mut p = profile("p1", None);
+        p.auth_method = AuthMethod::Key;
+        p.key_path = Some("/keys/id_rsa".into());
+        p.secret_id = Some("vault-9".into());
+        store.upsert_profile(p).unwrap();
+
+        let saved = &store.profiles()[0];
+        assert_eq!(saved.key_path, None);
+        assert_eq!(saved.keys.len(), 1);
+        assert_eq!(saved.keys[0].path, "/keys/id_rsa");
+        assert_eq!(saved.keys[0].secret_id.as_deref(), Some("vault-9"));
+        assert_eq!(saved.secret_id, None);
+    }
+
+    #[test]
+    fn sftp_profiles_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        store
+            .upsert_sftp_profile(SftpProfile {
+                id: "s1".into(),
+                name: "files".into(),
+                host: "h".into(),
+                port: 22,
+                username: "u".into(),
+                auth_method: AuthMethod::Key,
+                keys: vec![ProfileKey { path: "/keys/a".into(), secret_id: None }],
+                secret_id: None,
+                icon: IconRef::default(),
+                order: 0,
+            })
+            .unwrap();
+        assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().sftp_profiles().len(), 1);
+        store.delete_sftp_profile("s1").unwrap();
+        assert!(store.sftp_profiles().is_empty());
     }
 
     #[test]

@@ -50,6 +50,33 @@ pub struct Tunnel {
     pub auto_start: bool,
 }
 
+// One private key and its own optional passphrase (a vault reference, never the passphrase
+// itself). A profile holds several and tries them in order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileKey {
+    pub path: String,
+    pub secret_id: Option<String>,
+}
+
+// A saved SFTP-only connection: a file-transfer host with no shell, jump chain or tunnels.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpProfile {
+    pub id: String,
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub auth_method: AuthMethod,
+    #[serde(default)]
+    pub keys: Vec<ProfileKey>,
+    pub secret_id: Option<String>,
+    #[serde(default)]
+    pub icon: IconRef,
+    pub order: u32,
+}
+
 // A saved S3 / S3-compatible connection. The secret access key never lives here - only a
 // secret_id pointing at the encrypted vault. The access key id is not secret, so it stays inline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -91,7 +118,11 @@ pub struct Profile {
     pub port: u16,
     pub username: String,
     pub auth_method: AuthMethod,
+    // Legacy single key: migrated into `keys` on load and cleared. Kept so older files parse.
+    #[serde(default)]
     pub key_path: Option<String>,
+    #[serde(default)]
+    pub keys: Vec<ProfileKey>,
     pub secret_id: Option<String>,
     #[serde(default)]
     pub icon: IconRef,
@@ -195,6 +226,8 @@ impl Default for Settings {
 #[serde(rename_all = "camelCase")]
 pub struct ProfileStore {
     pub version: u32,
+    #[serde(default)]
+    pub sftp_profiles: Vec<SftpProfile>,
     pub groups: Vec<Group>,
     pub profiles: Vec<Profile>,
     #[serde(default)]
@@ -218,7 +251,11 @@ mod tests {
             port: 22,
             username: "root".into(),
             auth_method: AuthMethod::Key,
-            key_path: Some("/home/me/.ssh/id_ed25519".into()),
+            key_path: None,
+            keys: vec![ProfileKey {
+                path: "/home/me/.ssh/id_ed25519".into(),
+                secret_id: None,
+            }],
             secret_id: None,
             icon: IconRef::Builtin { name: "server".into() },
             order: 0,

@@ -7,7 +7,6 @@ use specta::Type;
 use tauri::ipc::Channel;
 use tauri::State;
 use tokio::sync::Mutex as TokioMutex;
-use zeroize::Zeroizing;
 
 use crate::commands::ssh_cmds::{self, KnownHostsState, Sessions};
 use crate::error::{AppError, AppResult};

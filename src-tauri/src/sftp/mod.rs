@@ -57,7 +57,15 @@ pub(crate) fn sort_entries(entries: &mut [SftpEntry]) {
 pub async fn open_sftp(handle: &SshHandle) -> AppResult<SftpSession> {
     let channel = handle.channel_open_session().await?;
     channel.request_subsystem(true, "sftp").await?;
-    let sftp = SftpSession::new(channel.into_stream()).await?;
+    // SFTP is request/response, so throughput is (bytes in flight) / round-trip. The default
+    // of 8 outstanding writes caps uploads well below the link on anything but a LAN; the
+    // server's own limits still clamp max_packet_len during negotiation.
+    let cfg = russh_sftp::client::Config {
+        max_concurrent_writes: 64,
+        request_timeout_secs: 30,
+        ..Default::default()
+    };
+    let sftp = SftpSession::new_with_config(channel.into_stream(), cfg).await?;
     Ok(sftp)
 }
 

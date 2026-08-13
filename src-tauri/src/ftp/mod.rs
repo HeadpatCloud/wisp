@@ -23,7 +23,7 @@ pub fn connect(
     ignore_hostname: bool,
 ) -> AppResult<FtpStream> {
     // A non-FTP greeting here is almost always an SSH server (SFTP vs FTPS mix-up).
-    let mut ftp = NativeTlsFtpStream::connect(format!("{host}:{port}")).map_err(|e| match e {
+    let mut ftp = NativeTlsFtpStream::connect(crate::net::authority(host, port)).map_err(|e| match e {
         FtpError::BadResponse => AppError::Ftp(
             "Server did not reply with FTP. If this is an SFTP (SSH) server, use an SFTP connection instead.".into(),
         ),

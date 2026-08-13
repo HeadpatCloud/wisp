@@ -1,6 +1,7 @@
 mod commands;
 mod error;
 mod ftp;
+mod net;
 mod s3;
 mod sftp;
 mod ssh;

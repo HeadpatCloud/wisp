@@ -48,9 +48,11 @@ pub fn build_config(
     let scheme = if use_tls { "https" } else { "http" };
     let default_port = if use_tls { 443 } else { 80 };
     // The Host header (and the signed host) carries the port only when it's non-default.
+    // Both come from this one string, so an IPv6 endpoint stays consistent with what
+    // reqwest actually sends - a signature over a differently-formatted host would fail.
     let authority = match port {
-        Some(p) if p != default_port => format!("{host}:{p}"),
-        _ => host.to_string(),
+        Some(p) if p != default_port => crate::net::authority(host, p),
+        _ => crate::net::url_host(host),
     };
     Ok(S3Config {
         endpoint: format!("{scheme}://{authority}"),
@@ -618,6 +620,25 @@ mod tests {
         let mut expected = sorted.clone();
         expected.sort();
         assert_eq!(sorted, expected);
+    }
+
+    // The signature covers the host header, so the endpoint and the signed host have to
+    // agree on how an IPv6 literal is written.
+    #[test]
+    fn ipv6_endpoint_is_bracketed_consistently() {
+        let cfg =
+            build_config("2001:db8::1", Some(9000), "us-east-1", false, true, "AK", "secret")
+                .unwrap();
+        assert_eq!(cfg.endpoint, "http://[2001:db8::1]:9000");
+        assert_eq!(cfg.host, "[2001:db8::1]:9000");
+
+        let url = presign_get(&cfg, "bucket", "a.txt", 900);
+        assert!(url.starts_with("http://[2001:db8::1]:9000/bucket/a.txt?"));
+
+        // A default port leaves the port implicit but still needs the brackets.
+        let tls = build_config("[2001:db8::1]", None, "us-east-1", true, true, "AK", "s").unwrap();
+        assert_eq!(tls.endpoint, "https://[2001:db8::1]");
+        assert_eq!(tls.host, "[2001:db8::1]");
     }
 
     #[tokio::test]

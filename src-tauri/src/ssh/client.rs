@@ -104,8 +104,10 @@ pub async fn connect(
     remote_forwards: RemoteForwards,
 ) -> AppResult<SshHandle> {
     let config = client_config();
-    let handler = ClientHandler { known_hosts, host: host.to_string(), port, remote_forwards };
-    let handle = client::connect(config, (host, port), handler).await?;
+    let host = crate::net::normalize_host(host);
+    let handler =
+        ClientHandler { known_hosts, host: host.clone(), port, remote_forwards };
+    let handle = client::connect(config, (host.as_str(), port), handler).await?;
     Ok(handle)
 }
 
@@ -244,6 +246,20 @@ pub async fn auth_agent(handle: &mut SshHandle, user: &str) -> AppResult<()> {
 mod tests {
     use russh::keys::{Algorithm, HashAlg};
     use crate::error::AppError;
+
+    // A bare literal resolves via the (host, port) tuple on every platform; a bracketed one
+    // only happens to work on Windows, which is why connect() normalizes first.
+    #[test]
+    fn bare_ipv6_literal_resolves() {
+        use std::net::ToSocketAddrs;
+        let addrs: Vec<_> = (crate::net::normalize_host("[2001:db8::1]").as_str(), 22)
+            .to_socket_addrs()
+            .unwrap()
+            .collect();
+        assert_eq!(addrs.len(), 1);
+        assert!(addrs[0].is_ipv6());
+        assert_eq!(addrs[0].port(), 22);
+    }
 
     // Pure logic: RSA -> Sha512, everything else -> None.
     fn hash_for(alg: &Algorithm) -> Option<HashAlg> {

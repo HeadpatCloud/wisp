@@ -31,7 +31,7 @@ pub struct VncInit {
 // RFB 3.8 client handshake: version, security (None or VNC-password), ServerInit,
 // then request our fixed 32bpp format and Raw-only encoding.
 pub async fn connect(host: &str, port: u16, password: &str) -> AppResult<VncInit> {
-    let mut stream = TcpStream::connect((host, port)).await?;
+    let mut stream = TcpStream::connect((crate::net::normalize_host(host).as_str(), port)).await?;
 
     let mut version = [0u8; 12];
     stream.read_exact(&mut version).await?;

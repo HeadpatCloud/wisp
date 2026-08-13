@@ -25,7 +25,7 @@ pub async fn tunnel_start(
         let s = map.get(&session_id).ok_or_else(|| AppError::NotFound(format!("session {session_id}")))?;
         (s.handle.clone(), s.remote_forwards.clone())
     };
-    let bind = format!("{}:{}", tunnel.bind_host, tunnel.bind_port);
+    let bind = crate::net::authority(&tunnel.bind_host, tunnel.bind_port);
     let started = match tunnel.kind {
         TunnelKind::Local => {
             let host = tunnel.target_host.ok_or_else(|| AppError::Tunnel("local tunnel needs a target host".into()))?;

@@ -1,7 +1,7 @@
 {
   "name": "wisp",
   "private": true,
-  "version": "0.4.0",
+  "version": "0.4.1",
   "author": "Faye",
   "type": "module",
   "scripts": {

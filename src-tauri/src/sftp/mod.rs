@@ -1,9 +1,15 @@
 pub mod transfer;
 
+use std::ops::Deref;
+use std::pin::Pin;
+use std::task::{Context, Poll, Waker};
+
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::FileAttributes;
 use serde::Serialize;
 use specta::Type;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::watch;
 
 use crate::error::AppResult;
 use crate::ssh::client::SshHandle;
@@ -54,7 +60,88 @@ pub(crate) fn sort_entries(entries: &mut [SftpEntry]) {
     });
 }
 
-pub async fn open_sftp(handle: &SshHandle) -> AppResult<SftpSession> {
+pub struct Sftp {
+    session: SftpSession,
+    alive: watch::Sender<()>,
+}
+
+impl Sftp {
+    // Once the channel ends, russh-sftp still leaves requests in flight waiting out their
+    // timeout, and pipelined writes have none. This resolves when reads hit the end instead.
+    pub async fn closed(&self) {
+        self.alive.closed().await
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.alive.is_closed()
+    }
+}
+
+impl Deref for Sftp {
+    type Target = SftpSession;
+
+    fn deref(&self) -> &SftpSession {
+        &self.session
+    }
+}
+
+struct Watched<S> {
+    inner: S,
+    alive: Option<watch::Receiver<()>>,
+    // russh parks a write until the server grants more window, which never comes once the
+    // connection is gone. Failing it lets russh-sftp's writer exit and free its queue.
+    parked: Option<Waker>,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Watched<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let (wanted, before) = (buf.remaining() > 0, buf.filled().len());
+        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+        let ended = match &poll {
+            Poll::Ready(Ok(())) => wanted && buf.filled().len() == before,
+            Poll::Ready(Err(_)) => true,
+            Poll::Pending => false,
+        };
+        if ended {
+            self.alive = None;
+            if let Some(waker) = self.parked.take() {
+                waker.wake();
+            }
+        }
+        poll
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Watched<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.alive.is_none() {
+            return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+        }
+        let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if poll.is_pending() {
+            self.parked = Some(cx.waker().clone());
+        }
+        poll
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+pub async fn open_sftp(handle: &SshHandle) -> AppResult<Sftp> {
     let channel = handle.channel_open_session().await?;
     channel.request_subsystem(true, "sftp").await?;
     // SFTP is request/response, so throughput is (bytes in flight) / round-trip. The default
@@ -65,8 +152,10 @@ pub async fn open_sftp(handle: &SshHandle) -> AppResult<SftpSession> {
         request_timeout_secs: 30,
         ..Default::default()
     };
-    let sftp = SftpSession::new_with_config(channel.into_stream(), cfg).await?;
-    Ok(sftp)
+    let (alive, watch) = watch::channel(());
+    let stream = Watched { inner: channel.into_stream(), alive: Some(watch), parked: None };
+    let session = SftpSession::new_with_config(stream, cfg).await?;
+    Ok(Sftp { session, alive })
 }
 
 pub async fn list(sftp: &SftpSession, path: &str) -> AppResult<Vec<SftpEntry>> {

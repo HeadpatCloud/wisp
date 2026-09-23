@@ -53,7 +53,7 @@ pub enum SshStatus {
 }
 
 pub(crate) fn secret_string(
-    vault: &State<'_, StdMutex<Vault>>,
+    vault: &StdMutex<Vault>,
     secret_id: &str,
 ) -> AppResult<Zeroizing<String>> {
     let v = vault.lock().map_err(|_| AppError::Internal("vault lock poisoned".into()))?;
@@ -63,7 +63,7 @@ pub(crate) fn secret_string(
 }
 
 fn secret_for(
-    vault: &State<'_, StdMutex<Vault>>,
+    vault: &StdMutex<Vault>,
     profile: &Profile,
 ) -> AppResult<Option<Zeroizing<String>>> {
     match &profile.secret_id {
@@ -79,7 +79,7 @@ pub(crate) struct ResolvedKey {
 
 // Pulls each key's passphrase out of the vault up front, so authenticate() needs no vault access.
 pub(crate) fn resolve_keys(
-    vault: &State<'_, StdMutex<Vault>>,
+    vault: &StdMutex<Vault>,
     keys: &[ProfileKey],
 ) -> AppResult<Vec<ResolvedKey>> {
     keys.iter()
@@ -96,9 +96,9 @@ pub(crate) fn resolve_keys(
 }
 
 pub(crate) async fn connect_via_chain(
-    store: &State<'_, StdMutex<Store>>,
-    vault: &State<'_, StdMutex<Vault>>,
-    known: &State<'_, KnownHostsState>,
+    store: &StdMutex<Store>,
+    vault: &StdMutex<Vault>,
+    known: &KnownHostsState,
     target_id: &str,
 ) -> AppResult<(SshHandle, Vec<SshHandle>, crate::ssh::client::RemoteForwards)> {
     let profiles = {
@@ -151,7 +151,7 @@ pub(crate) async fn connect_via_chain(
 }
 
 pub(crate) async fn connect_adhoc(
-    known: &State<'_, KnownHostsState>,
+    known: &KnownHostsState,
     host: &str,
     port: u16,
     username: &str,

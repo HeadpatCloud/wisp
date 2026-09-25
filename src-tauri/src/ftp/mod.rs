@@ -145,7 +145,7 @@ pub fn download(
             }
         }
     }
-    ftp.finalize_retr_stream(stream)?;
+    stream.finish()?;
     Ok(())
 }
 

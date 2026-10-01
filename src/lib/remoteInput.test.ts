@@ -205,6 +205,16 @@ describe('HeldKeys', () => {
     expect(held.has('KeyA')).toBe(false)
   })
 
+  it('lists the held codes', () => {
+    const held = new HeldKeys()
+    expect(held.codes()).toEqual([])
+    held.press('ShiftLeft', 0xffe1)
+    held.press('KeyA', 0x41)
+    held.press('KeyB', 0x42)
+    held.release('KeyA')
+    expect(held.codes()).toEqual(['ShiftLeft', 'KeyB'])
+  })
+
   it('releases the keysym that was pressed after Shift was let go', () => {
     const held = new HeldKeys()
     held.press('ShiftLeft', 0xffe1)
@@ -483,21 +493,27 @@ describe('RemoteKeyboard', () => {
     ])
   })
 
-  it('releases both Shift keys on a single Shift keyup on Windows', () => {
-    const { kb, sent } = keyboard('windows')
-    kb.keydown({ code: 'ShiftLeft', key: 'Shift' })
-    kb.keydown({ code: 'ShiftRight', key: 'Shift' })
-    expect(kb.keyup({ code: 'ShiftRight', key: 'Shift' })).toBe(true)
-    expect(sent).toEqual([
-      [true, 0xffe1],
-      [true, 0xffe2],
-      [false, 0xffe2],
-      [false, 0xffe1],
-    ])
-    kb.keyup({ code: 'ShiftLeft', key: 'Shift' })
-    kb.releaseAll()
-    expect(sent).toHaveLength(4)
-  })
+  it.each([
+    ['ShiftRight', 0xffe2, 'ShiftLeft', 0xffe1],
+    ['ShiftLeft', 0xffe1, 'ShiftRight', 0xffe2],
+  ])(
+    'releases both Shift keys on a single %s keyup on Windows',
+    (code, keysym, other, otherKeysym) => {
+      const { kb, sent } = keyboard('windows')
+      kb.keydown({ code: 'ShiftLeft', key: 'Shift' })
+      kb.keydown({ code: 'ShiftRight', key: 'Shift' })
+      expect(kb.keyup({ code, key: 'Shift' })).toBe(true)
+      expect(sent).toEqual([
+        [true, 0xffe1],
+        [true, 0xffe2],
+        [false, keysym],
+        [false, otherKeysym],
+      ])
+      kb.keyup({ code: other, key: 'Shift' })
+      kb.releaseAll()
+      expect(sent).toHaveLength(4)
+    },
+  )
 
   it.each([
     ['ShiftLeft', 0xffe1],
@@ -643,7 +659,7 @@ describe('RemoteKeyboard', () => {
     const { kb, sent } = keyboard('mac')
     kb.keydown({ code: 'ShiftLeft', key: 'Shift' })
     kb.keydown({ code: 'MetaLeft', key: 'Meta' })
-    kb.keydown({ code: 'KeyZ', key: 'Z' })
+    kb.keydown({ code: 'KeyZ', key: 'Z', metaKey: true })
     kb.keyup({ code: 'MetaLeft', key: 'Meta' })
     kb.keydown({ code: 'ArrowRight', key: 'ArrowRight' })
     expect(sent).toEqual([
@@ -726,6 +742,85 @@ describe('RemoteKeyboard', () => {
     expect(sent.slice(2)).toEqual([[false, keysym]])
   })
 
+  it('releases a key held from before Cmd when Cmd goes up on macOS', () => {
+    const { kb, sent } = keyboard('mac')
+    kb.keydown({ code: 'KeyX', key: 'x' })
+    kb.keydown({ code: 'MetaLeft', key: 'Meta', metaKey: true })
+    kb.keydown({ code: 'KeyX', key: 'x', metaKey: true })
+    expect(sent).toHaveLength(3)
+    kb.keyup({ code: 'MetaLeft', key: 'Meta' })
+    expect(sent).toEqual([
+      [true, 0x78],
+      [true, 0xffeb],
+      [true, 0x78],
+      [false, 0x78],
+      [false, 0xffeb],
+    ])
+    expect(kb.keyup({ code: 'KeyX', key: 'x' })).toBe(true)
+    kb.releaseAll()
+    expect(sent).toHaveLength(5)
+  })
+
+  // Accepted: a key that is still physically down when Cmd goes up is released on the server then.
+  it('releases a key that is still down when Cmd goes up on macOS', () => {
+    const { kb, sent } = keyboard('mac')
+    kb.keydown({ code: 'KeyX', key: 'x' })
+    kb.keydown({ code: 'MetaLeft', key: 'Meta', metaKey: true })
+    kb.keyup({ code: 'MetaLeft', key: 'Meta' })
+    kb.releaseAll()
+    expect(sent).toEqual([
+      [true, 0x78],
+      [true, 0xffeb],
+      [false, 0x78],
+      [false, 0xffeb],
+    ])
+  })
+
+  it('clicks a key under a Cmd that releaseAll has forgotten on macOS', () => {
+    const { kb, sent } = keyboard('mac')
+    kb.keydown({ code: 'MetaLeft', key: 'Meta', metaKey: true })
+    kb.releaseAll()
+    kb.keydown({ code: 'KeyC', key: 'c', metaKey: true })
+    expect(sent).toEqual([
+      [true, 0xffeb],
+      [false, 0xffeb],
+      [true, 0x63],
+      [false, 0x63],
+    ])
+    expect(kb.keyup({ code: 'MetaLeft', key: 'Meta' })).toBe(true)
+    kb.releaseAll()
+    expect(sent).toHaveLength(4)
+  })
+
+  it('holds a modifier under a Cmd that releaseAll has forgotten on macOS', () => {
+    const { kb, sent } = keyboard('mac')
+    kb.keydown({ code: 'ShiftLeft', key: 'Shift', metaKey: true })
+    expect(sent).toEqual([[true, 0xffe1]])
+    kb.keyup({ code: 'MetaLeft', key: 'Meta' })
+    expect(sent).toEqual([[true, 0xffe1]])
+    kb.keyup({ code: 'ShiftLeft', key: 'Shift' })
+    expect(sent).toEqual([
+      [true, 0xffe1],
+      [false, 0xffe1],
+    ])
+  })
+
+  it('releases held keys only with the last Cmd on macOS', () => {
+    const { kb, sent } = keyboard('mac')
+    kb.keydown({ code: 'KeyX', key: 'x' })
+    kb.keydown({ code: 'MetaLeft', key: 'Meta', metaKey: true })
+    kb.keydown({ code: 'MetaRight', key: 'Meta', metaKey: true })
+    kb.keyup({ code: 'MetaLeft', key: 'Meta', metaKey: true })
+    expect(sent.slice(3)).toEqual([[false, 0xffeb]])
+    kb.keyup({ code: 'MetaRight', key: 'Meta' })
+    expect(sent.slice(4)).toEqual([
+      [false, 0x78],
+      [false, 0xffec],
+    ])
+    kb.releaseAll()
+    expect(sent).toHaveLength(6)
+  })
+
   it('sends a full Caps Lock press for each Caps Lock event on macOS', () => {
     const { kb, sent } = keyboard('mac')
     expect(kb.keydown({ code: 'CapsLock', key: 'CapsLock' })).toBe(true)
@@ -778,8 +873,8 @@ describe('RemoteKeyboard', () => {
     'keeps other keys held when Meta is released on %s',
     (platform) => {
       const { kb, sent } = keyboard(platform)
-      kb.keydown({ code: 'MetaLeft', key: 'Meta' })
-      kb.keydown({ code: 'KeyC', key: 'c' })
+      kb.keydown({ code: 'MetaLeft', key: 'Meta', metaKey: true })
+      kb.keydown({ code: 'KeyC', key: 'c', metaKey: true })
       kb.keyup({ code: 'MetaLeft', key: 'Meta' })
       kb.keyup({ code: 'KeyC', key: 'c' })
       expect(sent).toEqual([

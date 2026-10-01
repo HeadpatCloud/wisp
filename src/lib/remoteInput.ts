@@ -134,6 +134,10 @@ export class HeldKeys {
     return this.held.has(code)
   }
 
+  codes(): string[] {
+    return [...this.held.keys()]
+  }
+
   release(code: string): number | null {
     const keysym = this.held.get(code)
     if (keysym === undefined) return null
@@ -169,7 +173,7 @@ export class RemoteKeyboard {
     private platform: Platform,
   ) {}
 
-  keydown(e: { code: string; key: string; timeStamp?: number }): boolean {
+  keydown(e: { code: string; key: string; timeStamp?: number; metaKey?: boolean }): boolean {
     const pending = this.pendingControl
     if (pending) {
       if (e.code === 'ControlLeft') return true
@@ -185,7 +189,13 @@ export class RemoteKeyboard {
     }
     const keysym = keysymFor(e)
     if (keysym === null) return false
-    if (hasNoCode(e.code) || this.macCapsLock(e.code) || this.lostKeyup(e.code)) {
+    // macOS reports no keyup for a non-modifier key pressed while Cmd is down.
+    const underCmd =
+      this.platform === 'mac' &&
+      !MODIFIERS.has(e.code) &&
+      !this.held.has(e.code) &&
+      (e.metaKey === true || this.held.has('MetaLeft') || this.held.has('MetaRight'))
+    if (hasNoCode(e.code) || this.macCapsLock(e.code) || underCmd) {
       this.click(keysym)
     } else if (
       this.platform === 'windows' &&
@@ -200,21 +210,30 @@ export class RemoteKeyboard {
     return true
   }
 
-  keyup(e: { code: string; key: string; timeStamp?: number }): boolean {
+  keyup(e: { code: string; key: string; timeStamp?: number; metaKey?: boolean }): boolean {
     this.flush()
     const mapped = keysymFor(e)
     if (mapped !== null && this.macCapsLock(e.code)) {
       this.click(mapped)
       return true
     }
-    const keysym = this.held.release(e.code)
-    if (keysym !== null) this.send(false, keysym)
+    // macOS never reports the keyup of a non-modifier key let go while Cmd was down, so those
+    // keys go up with the last Cmd.
+    if (
+      this.platform === 'mac' &&
+      (e.code === 'MetaLeft' || e.code === 'MetaRight') &&
+      !this.held.has(e.code === 'MetaLeft' ? 'MetaRight' : 'MetaLeft')
+    ) {
+      for (const code of this.held.codes()) {
+        if (!MODIFIERS.has(code)) this.up(code)
+      }
+    }
+    const wasHeld = this.up(e.code)
     // Windows delivers a single keyup when both Shift keys were down.
     if (this.platform === 'windows' && (e.code === 'ShiftLeft' || e.code === 'ShiftRight')) {
-      const other = this.held.release(e.code === 'ShiftLeft' ? 'ShiftRight' : 'ShiftLeft')
-      if (other !== null) this.send(false, other)
+      this.up(e.code === 'ShiftLeft' ? 'ShiftRight' : 'ShiftLeft')
     }
-    return keysym !== null || mapped !== null
+    return wasHeld || mapped !== null
   }
 
   flush(): void {
@@ -234,18 +253,16 @@ export class RemoteKeyboard {
     this.send(false, keysym)
   }
 
+  private up(code: string): boolean {
+    const keysym = this.held.release(code)
+    if (keysym === null) return false
+    this.send(false, keysym)
+    return true
+  }
+
   // macOS reports Caps Lock turning on as a keydown and turning off as a keyup.
   private macCapsLock(code: string): boolean {
     return this.platform === 'mac' && code === 'CapsLock'
-  }
-
-  // macOS delivers no keyup for a non-modifier key pressed while Cmd is held.
-  private lostKeyup(code: string): boolean {
-    return (
-      this.platform === 'mac' &&
-      !MODIFIERS.has(code) &&
-      (this.held.has('MetaLeft') || this.held.has('MetaRight'))
-    )
   }
 
   private cancelControl(): void {

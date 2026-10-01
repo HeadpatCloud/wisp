@@ -128,6 +128,34 @@ test('unticking the only member of a ticked group clears the group', async () =>
   expect(screen.getByRole('button', { name: 'Export' })).toBeDisabled()
 })
 
+test('ticking a group includes its empty subgroups', async () => {
+  const icon = { kind: 'builtin', name: 'folder' }
+  useProfileStore.setState({
+    groups: [
+      { id: 'g', name: 'Prod', parentId: null, icon, order: 0 },
+      { id: 'e', name: 'Spare', parentId: 'g', icon, order: 0 },
+    ],
+  } as never)
+  const user = userEvent.setup()
+  render(<ExportPage tabId="t" />)
+  const parent = screen.getByLabelText<HTMLInputElement>('Prod')
+  const child = screen.getByLabelText<HTMLInputElement>('Spare')
+  await user.click(parent)
+  expect(child).toBeChecked()
+  await user.click(child)
+  expect(parent).not.toBeChecked()
+  expect(parent.indeterminate).toBe(true)
+  await user.click(child)
+  expect(parent).toBeChecked()
+  await user.click(screen.getByRole('button', { name: 'Export' }))
+  expect(exportBundle).toHaveBeenCalledWith(
+    { groupIds: ['g', 'e'], profileIds: ['a'], sftpIds: [], s3Ids: [] },
+    { includeSecrets: false, includeKeys: false },
+    null,
+    'C:/out.json',
+  )
+})
+
 test('a group whose parent is gone is listed at the top level', async () => {
   useProfileStore.setState({
     groups: [

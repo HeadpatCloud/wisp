@@ -14,9 +14,7 @@ import { TriCheckbox } from './TriCheckbox'
 
 function leaves(groupId: string, groups: Group[], profiles: Profile[]): string[] {
   const keys = profiles.filter((p) => p.groupId === groupId).map((p) => `ssh:${p.id}`)
-  for (const g of groups)
-    if (g.parentId === groupId)
-      keys.push(...leaves(g.id, groups, profiles).filter((k) => k.startsWith('ssh:')))
+  for (const g of groups) if (g.parentId === groupId) keys.push(...leaves(g.id, groups, profiles))
   return keys.length > 0 ? keys : [`group:${groupId}`]
 }
 

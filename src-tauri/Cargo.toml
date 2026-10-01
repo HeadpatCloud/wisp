@@ -52,6 +52,10 @@ futures-util = "0.3"
 same-file = "1"
 tokio-rustls = { version = "0.26", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+num-bigint = "0.4"
+md5 = "0.8"
+aes = "0.9"
+flate2 = "1"
 
 [dev-dependencies]
 tempfile = "3"

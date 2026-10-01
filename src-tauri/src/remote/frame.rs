@@ -1,6 +1,7 @@
 use specta::Type;
 use tauri::ipc::{InvokeResponseBody, IpcResponse};
 
+#[cfg_attr(test, derive(Debug, PartialEq))]
 pub enum FrameOp {
     Rect { x: u16, y: u16, w: u16, h: u16, rgba: Vec<u8> },
     Copy { x: u16, y: u16, w: u16, h: u16, src_x: u16, src_y: u16 },

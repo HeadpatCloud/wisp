@@ -142,7 +142,8 @@ pub async fn handshake(
         types
     };
     let has_password = !login.password.is_empty();
-    let usable: Vec<u8> = offered.iter().copied().filter(|t| matches!(t, 1 | 2 | 19)).collect();
+    let usable: Vec<u8> =
+        offered.iter().copied().filter(|t| matches!(t, 1 | 2 | 19 | 30)).collect();
     let security = match choose_security(&usable, has_password) {
         Ok(security) => security,
         Err(reason) if reason == NEEDS_PASSWORD => return Err(err(reason)),
@@ -161,6 +162,9 @@ pub async fn handshake(
     }
     if security == 19 {
         stream = super::vencrypt::negotiate(stream, login, tls).await?;
+    }
+    if security == 30 {
+        super::ard::login(&mut stream, login).await?;
     }
 
     // Before 3.8 a server sends no SecurityResult for type 1.
@@ -629,13 +633,46 @@ mod tests {
 
     #[tokio::test]
     async fn only_types_with_a_login_are_chosen() {
-        let mut script = offering("RFB 003.008\n", &[30, 16, 2]);
+        let mut script = offering("RFB 003.008\n", &[18, 16, 2]);
         script.extend([Read(1), Write(vec![7; 16]), Read(16), Write(vec![0, 0, 0, 1, 0, 0, 0, 0])]);
         let outcome = play(script, "hunter2").await;
         assert_eq!(outcome.sent[12], 2);
 
-        let outcome = play(offering("RFB 003.008\n", &[16, 30]), "hunter2").await;
-        assert!(refusal(&outcome).contains("the server offers only: Tight, Apple Remote Desktop"));
+        let outcome = play(offering("RFB 003.008\n", &[16, 18]), "hunter2").await;
+        assert!(refusal(&outcome).contains("the server offers only: Tight, TLS"));
+        assert_eq!(outcome.sent, b"RFB 003.008\n");
+    }
+
+    // Generator 5, an 8-byte key holding the prime 4294967291, and a server public key.
+    const APPLE_KEY: [u8; 20] =
+        [0, 5, 0, 8, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xfb, 0, 0, 0, 0, 0x26, 0x20, 0x59, 0x5a];
+
+    #[tokio::test]
+    async fn apple_login_is_preferred_to_the_vnc_password() {
+        let mut script = offering("RFB 003.889\n", &[2, 30]);
+        script.extend([Read(1), Write(APPLE_KEY.into()), Read(128 + 8), Write(vec![0; 4])]);
+        script.extend([Read(1), Write(server_init(800, 600, "mac"))]);
+        let outcome = play(script, "hunter2").await;
+        assert_eq!(outcome.sent.len(), 12 + 1 + 128 + 8 + 1);
+        assert_eq!(&outcome.sent[..13], b"RFB 003.008\n\x1e");
+        assert_eq!(outcome.sent[149], 1);
+        assert_eq!(outcome.result.unwrap().name, "mac");
+    }
+
+    #[tokio::test]
+    async fn apple_login_refused_is_a_wrong_password() {
+        let mut script = offering("RFB 003.889\n", &[30]);
+        script.extend([Read(1), Write(APPLE_KEY.into()), Read(128 + 8)]);
+        script.push(Write([&[0, 0, 0, 1][..], &reason("")].concat()));
+        let outcome = play(script, "hunter2").await;
+        assert!(refusal(&outcome).contains("wrong password"));
+        assert_eq!(outcome.sent.len(), 12 + 1 + 128 + 8);
+    }
+
+    #[tokio::test]
+    async fn apple_login_needs_a_password() {
+        let outcome = play(offering("RFB 003.889\n", &[30]), "").await;
+        assert!(refusal(&outcome).contains("this server needs a password"));
         assert_eq!(outcome.sent, b"RFB 003.008\n");
     }
 

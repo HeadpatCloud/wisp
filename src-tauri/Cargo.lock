@@ -7289,16 +7289,20 @@ dependencies = [
 name = "wisp"
 version = "0.1.0"
 dependencies = [
+ "aes 0.9.1",
  "argon2 0.5.3",
  "base64 0.22.1",
  "bytes",
  "chacha20poly1305",
  "des",
  "embed-resource",
+ "flate2",
  "futures-util",
  "getrandom 0.4.3",
  "hmac 0.12.1",
  "keyring",
+ "md5",
+ "num-bigint",
  "portable-pty",
  "reqwest 0.13.4",
  "russh",

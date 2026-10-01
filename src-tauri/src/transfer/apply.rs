@@ -148,19 +148,25 @@ impl<'a> Stager<'a> {
                 Some(f) => STANDARD.decode(f.data.as_bytes()).ok().map(|b| digest(&b)),
                 None => self.env.read_file(&k.path).map(|b| digest(&b)),
             };
-            let path = match embedded {
-                Some(f) => {
+            let same =
+                local_digests.iter().find(|(d, _)| d.is_some() && *d == content).map(|(_, l)| *l);
+            let path = match (embedded, same) {
+                // The same key is already here, so the profile keeps following the user's own
+                // file instead of an app-managed copy.
+                (Some(_), Some(l)) => l.path.clone(),
+                (Some(f), None) => {
                     self.key_files.push(f);
                     format!("{KEY_PREFIX}{}", self.key_files.len() - 1)
                 }
-                None => k.path.clone(),
+                (None, _) => k.path.clone(),
             };
-            let secret_id = self.secret(k.secret_id.as_deref()).or_else(|| {
-                local_digests
-                    .iter()
-                    .find(|(d, _)| d.is_some() && *d == content)
-                    .and_then(|(_, l)| l.secret_id.clone())
-            });
+            let kept = same.and_then(|l| l.secret_id.clone());
+            let incoming = k.secret_id.as_deref().and_then(|id| self.payload.secrets.get(id));
+            let current = kept.as_deref().and_then(|id| self.env.secret(id));
+            let secret_id = match (incoming, current) {
+                (Some(new), Some(old)) if old.as_slice() == new.as_bytes() => kept,
+                _ => self.secret(k.secret_id.as_deref()).or(kept),
+            };
             out.push(ProfileKey { path, secret_id });
         }
         let kept: HashSet<&str> = out.iter().filter_map(|k| k.secret_id.as_deref()).collect();
@@ -920,6 +926,53 @@ mod tests {
         let staged = run(&store_of(vec![]), &payload, &[accept("ssh:n", &[])]).unwrap();
         assert!(staged.data.profiles[0].keys.is_empty());
         assert!(staged.key_files.is_empty());
+    }
+
+    #[test]
+    fn embedded_key_identical_to_a_local_one_keeps_the_local_key() {
+        let mut pc = profile("pc", "web", "h1");
+        pc.auth_method = AuthMethod::Key;
+        pc.keys = vec![
+            ProfileKey { path: "C:\\keys\\a".into(), secret_id: Some("pp-a".into()) },
+            ProfileKey { path: "C:\\keys\\b".into(), secret_id: None },
+        ];
+        let mut mac = pc.clone();
+        mac.id = "mac".into();
+        mac.keys = vec![
+            ProfileKey { path: "/Users/me/a".into(), secret_id: Some("mac-pp".into()) },
+            ProfileKey { path: "/Users/me/c".into(), secret_id: None },
+        ];
+        let mut payload = Payload { profiles: vec![mac], ..Default::default() };
+        for (path, content) in [("/Users/me/a", b"A"), ("/Users/me/c", b"C")] {
+            let data = Zeroizing::new(STANDARD.encode(content));
+            payload.key_files.insert(path.into(), KeyFile { file_name: "id".into(), data });
+        }
+        payload.secrets.insert("mac-pp".into(), Zeroizing::new("pass".into()));
+        let mut env = MapEnv::default();
+        env.files.insert("C:\\keys\\a".into(), b"A".to_vec());
+        env.files.insert("C:\\keys\\b".into(), b"B".to_vec());
+        env.secrets.insert("pp-a".into(), b"pass".to_vec());
+        let local = store_of(vec![pc.clone()]);
+        let decisions = [accept("ssh:mac", &["keys"])];
+
+        let staged =
+            stage(&local, &payload, &plan(&local, &payload, &env), &decisions, &env).unwrap();
+        let keys = &staged.data.profiles[0].keys;
+        assert_eq!(keys[0], pc.keys[0]);
+        assert_eq!(keys[1].path, format!("{KEY_PREFIX}0"));
+        assert_eq!(staged.key_files.len(), 1);
+        assert_eq!(STANDARD.decode(staged.key_files[0].data.as_bytes()).unwrap(), b"C");
+        assert!(staged.secrets.is_empty());
+        assert!(staged.replaced_secrets.is_empty());
+
+        // A different passphrase in the export still replaces the stored one.
+        payload.secrets.insert("mac-pp".into(), Zeroizing::new("other".into()));
+        let staged =
+            stage(&local, &payload, &plan(&local, &payload, &env), &decisions, &env).unwrap();
+        let keys = &staged.data.profiles[0].keys;
+        assert_eq!(keys[0].path, "C:\\keys\\a");
+        assert_eq!(keys[0].secret_id, Some(format!("{SECRET_PREFIX}0")));
+        assert_eq!(staged.replaced_secrets, ["pp-a"]);
     }
 
     #[test]

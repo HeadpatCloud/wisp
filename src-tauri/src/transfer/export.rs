@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use super::bundle::{KeyFile, Payload};
@@ -9,7 +10,15 @@ use super::{Env, ExportOptions, ExportSelection};
 use crate::store::model::{ProfileKey, ProfileStore};
 
 fn file_name(path: &str) -> String {
-    path.rsplit(['/', '\\']).next().filter(|s| !s.is_empty()).unwrap_or("key").to_string()
+    let name = path.rsplit(['/', '\\']).next().filter(|s| !s.is_empty()).unwrap_or("key");
+    // A key imported earlier is stored as `<uuid>-name`; exported like that, the prefix would
+    // grow with every hop.
+    name.get(..36)
+        .filter(|id| Uuid::parse_str(id).is_ok())
+        .and_then(|_| name[36..].strip_prefix('-'))
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(name)
+        .to_string()
 }
 
 pub fn build(
@@ -221,6 +230,25 @@ mod tests {
         let key = full.key_files.get("/keys/web").unwrap();
         assert_eq!(key.file_name, "web");
         assert_eq!(STANDARD.decode(key.data.as_bytes()).unwrap(), b"KEY");
+    }
+
+    #[test]
+    fn app_managed_key_is_exported_under_its_original_name() {
+        let id = "6f1c2a9e-8d0b-4c57-9a3e-2b7d5e41f0c8";
+        assert_eq!(file_name(&format!("C:\\cfg\\keys\\{id}-id_ed25519")), "id_ed25519");
+        assert_eq!(file_name(&format!("/cfg/keys/{id}-{id}-id")), format!("{id}-id"));
+        assert_eq!(file_name(&format!("/cfg/keys/{id}-")), format!("{id}-"));
+        assert_eq!(file_name(&format!("/cfg/keys/{id}")), id);
+        assert_eq!(file_name("/home/me/.ssh/my-server-key"), "my-server-key");
+        assert_eq!(file_name("/home/me/.ssh/"), "key");
+
+        let mut data = store();
+        data.profiles[0].keys[0].path = format!("/cfg/keys/{id}-id");
+        let mut env = MapEnv::default();
+        env.files.insert(format!("/cfg/keys/{id}-id"), b"KEY".to_vec());
+        let opts = ExportOptions { include_secrets: false, include_keys: true };
+        let (payload, _) = build(&data, &env, &select(&["web"]), &opts);
+        assert_eq!(payload.key_files[&format!("/cfg/keys/{id}-id")].file_name, "id");
     }
 
     #[test]

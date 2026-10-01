@@ -743,7 +743,9 @@ pub fn remove_unreferenced_keys(keys_dir: &Path, data: &ProfileStore) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::model::{AuthMethod, Group, IconRef, Profile, ProfileKey, SftpProfile};
+    use crate::store::model::{
+        AuthMethod, Group, IconRef, Profile, ProfileKey, S3Profile, SftpProfile,
+    };
     use crate::transfer::bundle::KeyFile;
     use crate::transfer::plan::plan;
     use crate::transfer::{LocalEnv, MapEnv};
@@ -779,6 +781,23 @@ mod tests {
             auth_method: AuthMethod::Password,
             keys: vec![],
             secret_id: None,
+            icon: IconRef::default(),
+            order: 0,
+        }
+    }
+
+    fn s3(id: &str, name: &str) -> S3Profile {
+        S3Profile {
+            id: id.into(),
+            name: name.into(),
+            endpoint: "s3.example.com".into(),
+            port: None,
+            region: "us-east-1".into(),
+            use_tls: true,
+            path_style: false,
+            access_key_id: "AK".into(),
+            secret_id: None,
+            bucket: None,
             icon: IconRef::default(),
             order: 0,
         }
@@ -1085,6 +1104,98 @@ mod tests {
         assert!(problems[0].message.contains("parent groups would form a loop"));
     }
 
+    #[test]
+    fn matched_sftp_profile_takes_only_the_accepted_fields() {
+        let mut pc = sftp("pc", "files", "h1");
+        pc.secret_id = Some("old".into());
+        let mut mac = sftp("mac", "files (mac)", "h1");
+        mac.auth_method = AuthMethod::Agent;
+        mac.secret_id = Some("mac-pw".into());
+        let mut payload = Payload { sftp_profiles: vec![mac], ..Default::default() };
+        payload.secrets.insert("mac-pw".into(), Zeroizing::new("new".into()));
+        let local = ProfileStore { sftp_profiles: vec![pc], ..store_of(vec![]) };
+        let staged =
+            run(&local, &payload, &[accept("sftp:mac", &["authMethod", "password"])]).unwrap();
+        let p = &staged.data.sftp_profiles[0];
+        assert_eq!(
+            (p.id.as_str(), p.name.as_str(), p.auth_method),
+            ("pc", "files", AuthMethod::Agent)
+        );
+        assert_eq!(p.secret_id, Some(format!("{SECRET_PREFIX}0")));
+        assert_eq!(staged.secrets[0].as_str(), "new");
+        assert_eq!(staged.replaced_secrets, ["old"]);
+        assert_eq!(staged.summary, ApplySummary { added: 0, updated: 1 });
+    }
+
+    #[test]
+    fn keys_row_carries_over_or_replaces_the_local_passphrases() {
+        let mut pc = profile("pc", "web", "h1");
+        pc.auth_method = AuthMethod::Key;
+        pc.keys = vec![
+            ProfileKey { path: "C:\\keys\\a".into(), secret_id: Some("pp-a".into()) },
+            ProfileKey { path: "C:\\keys\\b".into(), secret_id: Some("pp-b".into()) },
+        ];
+        let mut mac = pc.clone();
+        mac.id = "mac".into();
+        mac.keys = vec![
+            ProfileKey { path: "/Users/me/a".into(), secret_id: Some("mac-pp-a".into()) },
+            ProfileKey { path: "/Users/me/c".into(), secret_id: Some("mac-pp-c".into()) },
+        ];
+        let mut payload = Payload { profiles: vec![mac], ..Default::default() };
+        for (path, content) in [("/Users/me/a", b"A"), ("/Users/me/c", b"C")] {
+            let data = Zeroizing::new(STANDARD.encode(content));
+            payload.key_files.insert(path.into(), KeyFile { file_name: "id".into(), data });
+        }
+        // The export carries no passphrase for the first key.
+        payload.secrets.insert("mac-pp-c".into(), Zeroizing::new("pass-c".into()));
+        let mut env = MapEnv::default();
+        env.files.insert("C:\\keys\\a".into(), b"A".to_vec());
+        env.files.insert("C:\\keys\\b".into(), b"B".to_vec());
+        env.secrets.insert("pp-a".into(), b"pass-a".to_vec());
+        env.secrets.insert("pp-b".into(), b"pass-b".to_vec());
+        let local = store_of(vec![pc]);
+
+        let planned = plan(&local, &payload, &env);
+        let staged =
+            stage(&local, &payload, &planned, &[accept("ssh:mac", &["keys"])], &env).unwrap();
+        let keys = &staged.data.profiles[0].keys;
+        assert_eq!(keys[0].secret_id.as_deref(), Some("pp-a"));
+        assert_eq!(keys[1].secret_id, Some(format!("{SECRET_PREFIX}0")));
+        assert_eq!(staged.secrets[0].as_str(), "pass-c");
+        assert_eq!(staged.replaced_secrets, ["pp-b"]);
+    }
+
+    #[test]
+    fn jump_host_reference_lands_on_the_matched_local_profile() {
+        let local = store_of(vec![profile("b-pc", "bastion", "hb"), profile("w-pc", "web", "h1")]);
+        let mut web = profile("w-mac", "web", "h1");
+        web.jump_host_id = Some("b-mac".into());
+        let bastion = profile("b-mac", "bastion", "hb");
+        let payload = Payload { profiles: vec![web, bastion], ..Default::default() };
+        let staged = run(&local, &payload, &[accept("ssh:w-mac", &["jumpHostId"])]).unwrap();
+        assert_eq!(staged.data.profiles.len(), 2);
+        assert_eq!(staged.data.profiles[1].jump_host_id.as_deref(), Some("b-pc"));
+    }
+
+    #[test]
+    fn jump_host_reference_follows_a_jump_host_added_as_new() {
+        let local = store_of(vec![profile("b-pc", "bastion", "hb")]);
+        let mut web = profile("w-mac", "web", "h1");
+        web.jump_host_id = Some("b-mac".into());
+        let mut bastion = profile("b-mac", "bastion", "hb");
+        bastion.auth_method = AuthMethod::Agent;
+        let payload = Payload { profiles: vec![web, bastion], ..Default::default() };
+        let as_new =
+            ItemDecision { key: "ssh:b-mac".into(), accept: true, as_new: true, fields: vec![] };
+        let staged = run(&local, &payload, &[accept("ssh:w-mac", &[]), as_new]).unwrap();
+        let profiles = &staged.data.profiles;
+        assert_eq!(profiles.len(), 3);
+        let added = profiles.iter().find(|p| p.auth_method == AuthMethod::Agent).unwrap();
+        assert!(added.id != "b-pc" && added.id != "b-mac");
+        let web = profiles.iter().find(|p| p.name == "web").unwrap();
+        assert_eq!(web.jump_host_id.as_ref(), Some(&added.id));
+    }
+
     fn vault(dir: &std::path::Path) -> Vault {
         Vault::open_with_key(dir.join("vault.enc"), Zeroizing::new([3u8; 32])).unwrap()
     }
@@ -1146,6 +1257,56 @@ mod tests {
             let mode = std::fs::metadata(dir.path().join("keys")).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o700);
         }
+    }
+
+    #[test]
+    fn new_sftp_profile_is_written_with_its_embedded_key_and_secrets() {
+        let mut inc = sftp("f", "files", "h9");
+        inc.auth_method = AuthMethod::Key;
+        inc.secret_id = Some("mac-pw".into());
+        inc.keys =
+            vec![ProfileKey { path: "/Users/me/id".into(), secret_id: Some("mac-pp".into()) }];
+        let mut payload = Payload { sftp_profiles: vec![inc], ..Default::default() };
+        payload.secrets.insert("mac-pw".into(), Zeroizing::new("pw".into()));
+        payload.secrets.insert("mac-pp".into(), Zeroizing::new("pp".into()));
+        payload.key_files.insert(
+            "/Users/me/id".into(),
+            KeyFile { file_name: "id".into(), data: Zeroizing::new(STANDARD.encode(b"K")) },
+        );
+        let local =
+            ProfileStore { sftp_profiles: vec![sftp("x", "other", "h1")], ..store_of(vec![]) };
+        let staged = run(&local, &payload, &[accept("sftp:f", &[])]).unwrap();
+        assert_eq!(staged.summary, ApplySummary { added: 1, updated: 0 });
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        let mut v = vault(dir.path());
+        execute(&mut store, &mut v, &dir.path().join("keys"), staged).unwrap();
+        let p = &store.sftp_profiles()[1];
+        assert_eq!((p.id.as_str(), p.name.as_str(), p.order), ("f", "files", 1));
+        assert_eq!(p.keys.len(), 1);
+        assert_eq!(std::fs::read(&p.keys[0].path).unwrap(), b"K");
+        let secret = |id: &Option<String>| v.get_secret(id.as_deref().unwrap()).unwrap().to_vec();
+        assert_eq!(secret(&p.keys[0].secret_id), b"pp");
+        assert_eq!(secret(&p.secret_id), b"pw");
+    }
+
+    #[test]
+    fn new_s3_profile_is_written_with_its_secret() {
+        let mut inc = s3("s", "backups");
+        inc.secret_id = Some("mac-sk".into());
+        let mut payload = Payload { s3_profiles: vec![inc.clone()], ..Default::default() };
+        payload.secrets.insert("mac-sk".into(), Zeroizing::new("sk".into()));
+        let staged = run(&store_of(vec![]), &payload, &[accept("s3:s", &[])]).unwrap();
+        assert_eq!(staged.summary, ApplySummary { added: 1, updated: 0 });
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        let mut v = vault(dir.path());
+        execute(&mut store, &mut v, &dir.path().join("keys"), staged).unwrap();
+        let p = &store.s3_profiles()[0];
+        assert_eq!(v.get_secret(p.secret_id.as_deref().unwrap()).unwrap().as_slice(), b"sk");
+        assert_eq!(S3Profile { secret_id: inc.secret_id.clone(), ..p.clone() }, inc);
     }
 
     #[test]

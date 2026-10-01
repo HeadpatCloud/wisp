@@ -753,11 +753,17 @@ pub fn remove_unreferenced_keys(keys_dir: &Path, previous: &[ProfileKey], data: 
         // Case is ignored: on Windows and macOS a differently cased path is the same file.
         // A stored path can also reach the file under another name (a trailing dot, a stream
         // suffix, a link), so the files themselves are compared too. A path that cannot be
-        // opened is not this file.
+        // opened is not this file. Network paths and anything but a regular file are not even
+        // tried: tidying up must not reach out to a share (on Windows that sends the user's
+        // credentials to it) or wait on a pipe.
         if app_made
             && !used.iter().any(|u| u.file_name().is_some_and(|n| n.eq_ignore_ascii_case(name)))
             && std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
-            && !used.iter().any(|u| matches!(is_same_file(u, path), Ok(true)))
+            && !used.iter().any(|u| {
+                u.to_str().is_some_and(|s| !super::is_network_path(s))
+                    && std::fs::metadata(u).is_ok_and(|m| m.is_file())
+                    && matches!(is_same_file(u, path), Ok(true))
+            })
         {
             // Best-effort: a leftover key file must never fail the save or delete that got here.
             let _ = std::fs::remove_file(path);
@@ -1682,6 +1688,67 @@ mod tests {
         let gone = keys.join("gone").to_string_lossy().into_owned();
         web.keys = vec![ProfileKey { path: gone, secret_id: None }];
         remove_unreferenced_keys(&keys, &[dropped.clone()], &store_of(vec![web]));
+        assert!(!on_disk(&dropped));
+    }
+
+    #[test]
+    fn stored_path_to_a_directory_does_not_keep_another_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = dir.path().join("keys");
+        std::fs::create_dir(&keys).unwrap();
+        let dropped = app_key(&keys, 1);
+        let mut web = profile("w", "web", "h1");
+        let folder = dir.path().to_string_lossy().into_owned();
+        web.keys = vec![ProfileKey { path: folder, secret_id: None }];
+        remove_unreferenced_keys(&keys, &[dropped.clone()], &store_of(vec![web]));
+        assert!(!on_disk(&dropped));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stored_network_path_is_not_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = dir.path().join("keys");
+        std::fs::create_dir(&keys).unwrap();
+        let dropped = app_key(&keys, 1);
+        let mut web = profile("w", "web", "h1");
+        // An address reserved for documentation: nothing answers there, and Windows needs about
+        // 20 seconds to find that out.
+        let share = "\\\\192.0.2.1\\share\\id".to_string();
+        web.keys = vec![ProfileKey { path: share, secret_id: None }];
+        let started = std::time::Instant::now();
+        remove_unreferenced_keys(&keys, &[dropped.clone()], &store_of(vec![web]));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "{:?}", started.elapsed());
+        assert!(!on_disk(&dropped));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stored_path_to_a_fifo_is_not_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = dir.path().join("keys");
+        std::fs::create_dir(&keys).unwrap();
+        let fifo = dir.path().join("fifo");
+        match std::process::Command::new("mkfifo").arg(&fifo).status() {
+            Ok(status) if status.success() => {}
+            failed => {
+                eprintln!("skipped: mkfifo could not create a FIFO ({failed:?})");
+                return;
+            }
+        }
+        let dropped = app_key(&keys, 1);
+        let previous = [dropped.clone()];
+        let mut web = profile("w", "web", "h1");
+        web.keys = vec![ProfileKey { path: fifo.to_string_lossy().into_owned(), secret_id: None }];
+        let data = store_of(vec![web]);
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            remove_unreferenced_keys(&keys, &previous, &data);
+            done.send(()).unwrap();
+        });
+        // Opening a FIFO for reading waits for a writer that never comes.
+        let waited = finished.recv_timeout(std::time::Duration::from_secs(5));
+        assert!(waited.is_ok(), "blocked on the FIFO");
         assert!(!on_disk(&dropped));
     }
 

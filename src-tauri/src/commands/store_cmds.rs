@@ -5,6 +5,7 @@ use tauri::{AppHandle, Manager, State};
 use crate::error::{AppError, AppResult};
 use crate::store::model::{Group, IconRef, Profile, ProfileStore, S3Profile, Settings, SftpProfile};
 use crate::store::{is_icon_path, Store};
+use crate::transfer::apply::remove_unreferenced_keys;
 
 fn poisoned() -> AppError {
     AppError::Internal("store lock poisoned".into())
@@ -27,6 +28,12 @@ fn remove_custom_icon(app: &AppHandle, icon: &IconRef, data: &ProfileStore) {
         if let Ok(dir) = app.path().app_config_dir() {
             let _ = std::fs::remove_file(dir.join(path));
         }
+    }
+}
+
+fn remove_unused_keys(app: &AppHandle, store: &Store) {
+    if let Ok(dir) = app.path().app_config_dir() {
+        remove_unreferenced_keys(&dir.join("keys"), &store.snapshot());
     }
 }
 
@@ -68,8 +75,15 @@ pub fn delete_group(app: AppHandle, store: State<'_, Mutex<Store>>, id: String) 
 
 #[tauri::command]
 #[specta::specta]
-pub fn upsert_profile(store: State<'_, Mutex<Store>>, profile: Profile) -> AppResult<()> {
-    store.lock().map_err(|_| poisoned())?.upsert_profile(profile)
+pub fn upsert_profile(
+    app: AppHandle,
+    store: State<'_, Mutex<Store>>,
+    profile: Profile,
+) -> AppResult<()> {
+    let mut s = store.lock().map_err(|_| poisoned())?;
+    s.upsert_profile(profile)?;
+    remove_unused_keys(&app, &s);
+    Ok(())
 }
 
 #[tauri::command]
@@ -81,6 +95,7 @@ pub fn delete_profile(app: AppHandle, store: State<'_, Mutex<Store>>, id: String
     if let Some(icon) = icon {
         remove_custom_icon(&app, &icon, &s.snapshot());
     }
+    remove_unused_keys(&app, &s);
     Ok(())
 }
 
@@ -126,8 +141,15 @@ pub fn list_sftp_profiles(store: State<'_, Mutex<Store>>) -> AppResult<Vec<SftpP
 
 #[tauri::command]
 #[specta::specta]
-pub fn upsert_sftp_profile(store: State<'_, Mutex<Store>>, profile: SftpProfile) -> AppResult<()> {
-    store.lock().map_err(|_| poisoned())?.upsert_sftp_profile(profile)
+pub fn upsert_sftp_profile(
+    app: AppHandle,
+    store: State<'_, Mutex<Store>>,
+    profile: SftpProfile,
+) -> AppResult<()> {
+    let mut s = store.lock().map_err(|_| poisoned())?;
+    s.upsert_sftp_profile(profile)?;
+    remove_unused_keys(&app, &s);
+    Ok(())
 }
 
 #[tauri::command]
@@ -143,6 +165,7 @@ pub fn delete_sftp_profile(
     if let Some(icon) = icon {
         remove_custom_icon(&app, &icon, &s.snapshot());
     }
+    remove_unused_keys(&app, &s);
     Ok(())
 }
 

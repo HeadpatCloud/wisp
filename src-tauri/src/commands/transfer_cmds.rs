@@ -151,7 +151,9 @@ pub fn transfer_apply(
         apply::stage_reviewed(&snapshot, payload, reviewed, &decisions, &env)?
             .map_err(|p| AppError::Import(format!("{} item(s) still need attention", p.len())))?
     };
-    let summary = apply::execute(&mut s, &mut v, &dir.join("keys"), staged)?;
+    let keys_dir = dir.join("keys");
+    let summary = apply::execute(&mut s, &mut v, &keys_dir, staged)?;
+    apply::remove_unreferenced_keys(&keys_dir, &s.snapshot());
     pending.remove(&review_id);
     Ok(summary)
 }

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::Path;
 
 use base64::engine::general_purpose::STANDARD;
@@ -615,6 +616,19 @@ fn write_private(path: &Path, bytes: &[u8]) -> AppResult<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn create_private_dir(path: &Path) -> AppResult<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(path: &Path) -> AppResult<()> {
+    std::fs::create_dir_all(path)?;
+    Ok(())
+}
+
 fn placeholder(value: &str, prefix: &str, real: &[String]) -> Option<String> {
     value
         .strip_prefix(prefix)
@@ -663,7 +677,7 @@ pub fn execute(
     let result = (|| -> AppResult<()> {
         let mut key_paths = Vec::new();
         if !key_files.is_empty() {
-            std::fs::create_dir_all(keys_dir)?;
+            create_private_dir(keys_dir)?;
         }
         for f in &key_files {
             let bytes = Zeroizing::new(
@@ -699,10 +713,31 @@ pub fn execute(
     Ok(summary)
 }
 
+pub fn remove_unreferenced_keys(keys_dir: &Path, data: &ProfileStore) {
+    let Ok(entries) = std::fs::read_dir(keys_dir) else { return };
+    let used: Vec<&OsStr> = data
+        .profiles
+        .iter()
+        .flat_map(|p| &p.keys)
+        .chain(data.sftp_profiles.iter().flat_map(|p| &p.keys))
+        .filter_map(|k| Path::new(&k.path).file_name())
+        .collect();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        // Case is ignored: on Windows and macOS a differently cased path is the same file.
+        if entry.file_type().is_ok_and(|t| t.is_file())
+            && !used.iter().any(|u| u.eq_ignore_ascii_case(&name))
+        {
+            // Best-effort: a leftover key file must never fail the save or delete that got here.
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::model::{AuthMethod, Group, IconRef, Profile, ProfileKey};
+    use crate::store::model::{AuthMethod, Group, IconRef, Profile, ProfileKey, SftpProfile};
     use crate::transfer::bundle::KeyFile;
     use crate::transfer::plan::plan;
     use crate::transfer::{LocalEnv, MapEnv};
@@ -725,6 +760,21 @@ mod tests {
             jump_host_id: None,
             tunnels: vec![],
             appearance: None,
+        }
+    }
+
+    fn sftp(id: &str, name: &str, host: &str) -> SftpProfile {
+        SftpProfile {
+            id: id.into(),
+            name: name.into(),
+            host: host.into(),
+            port: 22,
+            username: "me".into(),
+            auth_method: AuthMethod::Password,
+            keys: vec![],
+            secret_id: None,
+            icon: IconRef::default(),
+            order: 0,
         }
     }
 
@@ -1040,6 +1090,8 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&p.keys[0].path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
+            let mode = std::fs::metadata(dir.path().join("keys")).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
         }
     }
 
@@ -1190,6 +1242,39 @@ mod tests {
         let p = &store.profiles()[0];
         assert_eq!(v.get_secret(p.secret_id.as_deref().unwrap()).unwrap().as_slice(), b"new");
         assert!(!v.has_secret(&old));
+    }
+
+    #[test]
+    fn only_unreferenced_files_directly_in_the_keys_folder_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = dir.path().join("keys");
+        remove_unreferenced_keys(&keys, &store_of(vec![]));
+        assert!(!keys.exists());
+
+        std::fs::create_dir_all(keys.join("sub")).unwrap();
+        let used = keys.join("1-id");
+        let used_by_sftp = keys.join("2-id");
+        let other_case = keys.join("3-id");
+        let unused = keys.join("4-id");
+        let nested = keys.join("sub").join("5-id");
+        let outside = dir.path().join("6-id");
+        for path in [&used, &used_by_sftp, &other_case, &unused, &nested, &outside] {
+            std::fs::write(path, b"K").unwrap();
+        }
+        let key = |path: &Path| ProfileKey {
+            path: path.to_string_lossy().into_owned(),
+            secret_id: None,
+        };
+        let mut web = profile("p", "web", "h1");
+        web.keys = vec![key(&used), key(&keys.join("3-ID"))];
+        let mut files = sftp("f", "files", "h1");
+        files.keys = vec![key(&used_by_sftp)];
+        let data = ProfileStore { sftp_profiles: vec![files], ..store_of(vec![web]) };
+
+        remove_unreferenced_keys(&keys, &data);
+        assert!(used.is_file() && used_by_sftp.is_file() && other_case.is_file());
+        assert!(!unused.exists());
+        assert!(nested.is_file() && outside.is_file());
     }
 
     #[test]

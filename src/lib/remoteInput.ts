@@ -56,9 +56,26 @@ const NUMPAD_CHARACTERS = new Map([
 ])
 for (let digit = 0; digit <= 9; digit++) NUMPAD_CHARACTERS.set(`Numpad${digit}`, 0xffb0 + digit)
 
+const MODIFIERS = new Set([
+  'ShiftLeft',
+  'ShiftRight',
+  'ControlLeft',
+  'ControlRight',
+  'AltLeft',
+  'AltRight',
+  'MetaLeft',
+  'MetaRight',
+  'CapsLock',
+])
+
+// Virtual keyboards and input injectors report keys without a usable code.
+function hasNoCode(code: string): boolean {
+  return code === '' || code === 'Unidentified'
+}
+
 export function keysymFor(e: { code: string; key: string }): number | null {
   if (e.code === 'AltRight' && e.key === 'AltGraph') return 0xfe03
-  const named = KEYSYMS.get(e.code)
+  const named = KEYSYMS.get(hasNoCode(e.code) ? e.key : e.code)
   if (named !== undefined) return named
   if (e.key === 'Dead' || e.key === 'Process' || e.key === 'Unidentified') return null
   const cp = e.key.codePointAt(0)
@@ -85,7 +102,7 @@ export class WheelSteps {
   private x = 0
   private y = 0
 
-  // One step is 50 pixels; a line counts as 19 pixels and a page as 800, as in noVNC.
+  // One step is 50 pixels; a line counts as 19 pixels and a page as 800.
   push(deltaX: number, deltaY: number, deltaMode: number): number[] {
     const scale = deltaMode === 1 ? 19 : deltaMode === 2 ? 800 : 1
     const stepsY = this.take('y', deltaY * scale)
@@ -97,6 +114,7 @@ export class WheelSteps {
   }
 
   private take(axis: 'x' | 'y', delta: number): number {
+    if (!Number.isFinite(delta)) return 0
     const total = (this[axis] * delta < 0 ? 0 : this[axis]) + delta
     this[axis] = total % 50
     return Math.trunc(total / 50)
@@ -111,6 +129,10 @@ export class HeldKeys {
     if (held !== undefined) return held
     this.held.set(code, keysym)
     return keysym
+  }
+
+  has(code: string): boolean {
+    return this.held.has(code)
   }
 
   release(code: string): number | null {
@@ -137,44 +159,66 @@ export function detectPlatform(userAgent: string): Platform {
 
 export class RemoteKeyboard {
   private held = new HeldKeys()
-  private pendingControl: { keysym: number; timer: ReturnType<typeof setTimeout> } | null = null
+  private pendingControl: {
+    keysym: number
+    timeStamp?: number
+    timer: ReturnType<typeof setTimeout>
+  } | null = null
 
   constructor(
     private send: (down: boolean, keysym: number) => void,
     private platform: Platform,
   ) {}
 
-  keydown(e: { code: string; key: string }): boolean {
-    if (this.pendingControl) {
+  keydown(e: { code: string; key: string; timeStamp?: number }): boolean {
+    const pending = this.pendingControl
+    if (pending) {
       if (e.code === 'ControlLeft') return true
-      if (e.code === 'AltRight' && e.key === 'AltGraph') this.cancelControl()
-      else this.flushControl()
+      // Windows reports AltGr as ControlLeft followed at once by AltRight; that Control is not sent.
+      const altGr =
+        e.code === 'AltRight' &&
+        e.key === 'AltGraph' &&
+        (e.timeStamp === undefined ||
+          pending.timeStamp === undefined ||
+          e.timeStamp - pending.timeStamp < 50)
+      if (altGr) this.cancelControl()
+      else this.flush()
     }
     const keysym = keysymFor(e)
     if (keysym === null) return false
-    if (e.code === '' || e.code === 'Unidentified') {
+    if (hasNoCode(e.code) || this.lostKeyup(e.code)) {
       this.send(true, keysym)
       this.send(false, keysym)
-    } else if (this.platform === 'windows' && e.code === 'ControlLeft') {
-      // Windows reports AltGr as ControlLeft then AltRight, so Control waits for the next event.
-      const timer = setTimeout(() => this.flushControl(), 100)
-      this.pendingControl = { keysym, timer }
+    } else if (
+      this.platform === 'windows' &&
+      e.code === 'ControlLeft' &&
+      !this.held.has('ControlLeft')
+    ) {
+      const timer = setTimeout(() => this.flush(), 100)
+      this.pendingControl = { keysym, timeStamp: e.timeStamp, timer }
     } else {
       this.send(true, this.held.press(e.code, keysym))
     }
     return true
   }
 
-  keyup(e: { code: string; key: string }): boolean {
-    this.flushControl()
+  keyup(e: { code: string; key: string; timeStamp?: number }): boolean {
+    this.flush()
     const keysym = this.held.release(e.code)
-    // macOS delivers no keyup for the other keys while Meta is held.
-    if (this.platform === 'mac' && (e.code === 'MetaLeft' || e.code === 'MetaRight')) {
-      this.releaseAll()
+    if (keysym !== null) this.send(false, keysym)
+    // Windows delivers a single keyup when both Shift keys were down.
+    if (this.platform === 'windows' && (e.code === 'ShiftLeft' || e.code === 'ShiftRight')) {
+      const other = this.held.release(e.code === 'ShiftLeft' ? 'ShiftRight' : 'ShiftLeft')
+      if (other !== null) this.send(false, other)
     }
-    if (keysym === null) return keysymFor(e) !== null
-    this.send(false, keysym)
-    return true
+    return keysym !== null || keysymFor(e) !== null
+  }
+
+  flush(): void {
+    const pending = this.pendingControl
+    if (!pending) return
+    this.cancelControl()
+    this.send(true, this.held.press('ControlLeft', pending.keysym))
   }
 
   releaseAll(): void {
@@ -182,15 +226,17 @@ export class RemoteKeyboard {
     for (const keysym of this.held.releaseAll()) this.send(false, keysym)
   }
 
+  // macOS delivers no keyup for a non-modifier key pressed while Cmd is held.
+  private lostKeyup(code: string): boolean {
+    return (
+      this.platform === 'mac' &&
+      !MODIFIERS.has(code) &&
+      (this.held.has('MetaLeft') || this.held.has('MetaRight'))
+    )
+  }
+
   private cancelControl(): void {
     clearTimeout(this.pendingControl?.timer)
     this.pendingControl = null
-  }
-
-  private flushControl(): void {
-    const pending = this.pendingControl
-    if (!pending) return
-    this.cancelControl()
-    this.send(true, this.held.press('ControlLeft', pending.keysym))
   }
 }

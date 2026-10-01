@@ -162,9 +162,49 @@ describe('keysymFor', () => {
   ])('returns null for %s (%j)', (code, key) => {
     expect(keysymFor({ code, key })).toBeNull()
   })
+
+  it.each([
+    ['', 'Enter', 0xff0d],
+    ['', 'Backspace', 0xff08],
+    ['', 'Tab', 0xff09],
+    ['', 'Escape', 0xff1b],
+    ['', 'Delete', 0xffff],
+    ['', 'ArrowLeft', 0xff51],
+    ['', 'ArrowUp', 0xff52],
+    ['', 'ArrowRight', 0xff53],
+    ['', 'ArrowDown', 0xff54],
+    ['', 'Home', 0xff50],
+    ['', 'End', 0xff57],
+    ['', 'PageUp', 0xff55],
+    ['', 'PageDown', 0xff56],
+    ['', 'F1', 0xffbe],
+    ['Unidentified', 'Enter', 0xff0d],
+    ['Unidentified', 'F12', 0xffc9],
+  ])('maps a key without a code (%j) by its name %s', (code, key, keysym) => {
+    expect(keysymFor({ code, key })).toBe(keysym)
+  })
+
+  it.each([
+    ['', 'Shift'],
+    ['Unidentified', 'Control'],
+    ['', 'AudioVolumeUp'],
+    ['KeyA', 'Enter'],
+  ])('does not map %j by the name %s', (code, key) => {
+    expect(keysymFor({ code, key })).toBeNull()
+  })
 })
 
 describe('HeldKeys', () => {
+  it('knows which codes are held', () => {
+    const held = new HeldKeys()
+    expect(held.has('KeyA')).toBe(false)
+    held.press('KeyA', 0x61)
+    expect(held.has('KeyA')).toBe(true)
+    expect(held.has('KeyB')).toBe(false)
+    held.release('KeyA')
+    expect(held.has('KeyA')).toBe(false)
+  })
+
   it('releases the keysym that was pressed after Shift was let go', () => {
     const held = new HeldKeys()
     held.press('ShiftLeft', 0xffe1)
@@ -313,6 +353,18 @@ describe('RemoteKeyboard', () => {
     expect(sent).toHaveLength(4)
   })
 
+  it('clicks a named key without a code', () => {
+    const { kb, sent } = keyboard('other')
+    expect(kb.keydown({ code: '', key: 'Enter' })).toBe(true)
+    expect(sent).toEqual([
+      [true, 0xff0d],
+      [false, 0xff0d],
+    ])
+    expect(kb.keyup({ code: '', key: 'Enter' })).toBe(true)
+    kb.releaseAll()
+    expect(sent).toHaveLength(2)
+  })
+
   it('sends AltGr on Windows without the Control that announces it', () => {
     const { kb, sent } = keyboard('windows')
     expect(kb.keydown({ code: 'ControlLeft', key: 'Control' })).toBe(true)
@@ -344,6 +396,134 @@ describe('RemoteKeyboard', () => {
       [true, 0xfe03],
       [false, 0xfe03],
     ])
+  })
+
+  it.each([40, 49])('drops the Control when AltGr follows %d ms later', (delay) => {
+    const { kb, sent } = keyboard('windows')
+    kb.keydown({ code: 'ControlLeft', key: 'Control', timeStamp: 1000 })
+    kb.keydown({ code: 'AltRight', key: 'AltGraph', timeStamp: 1000 + delay })
+    vi.advanceTimersByTime(100)
+    expect(sent).toEqual([[true, 0xfe03]])
+  })
+
+  it.each([50, 200])('sends a real Control before an AltGr that comes %d ms later', (delay) => {
+    const { kb, sent } = keyboard('windows')
+    kb.keydown({ code: 'ControlLeft', key: 'Control', timeStamp: 1000 })
+    kb.keydown({ code: 'AltRight', key: 'AltGraph', timeStamp: 1000 + delay })
+    expect(sent).toEqual([
+      [true, 0xffe3],
+      [true, 0xfe03],
+    ])
+  })
+
+  it.each([
+    [undefined, 200],
+    [0, undefined],
+  ])('takes a missing timeStamp (%s, %s) as an AltGr', (control, altGr) => {
+    const { kb, sent } = keyboard('windows')
+    kb.keydown({ code: 'ControlLeft', key: 'Control', timeStamp: control })
+    kb.keydown({ code: 'AltRight', key: 'AltGraph', timeStamp: altGr })
+    vi.advanceTimersByTime(100)
+    expect(sent).toEqual([[true, 0xfe03]])
+  })
+
+  it('resends a held Control at once when it repeats', () => {
+    const { kb, sent } = keyboard('windows')
+    kb.keydown({ code: 'ControlLeft', key: 'Control', timeStamp: 0 })
+    vi.advanceTimersByTime(100)
+    expect(sent).toEqual([[true, 0xffe3]])
+    kb.keydown({ code: 'ControlLeft', key: 'Control', timeStamp: 500 })
+    expect(sent).toHaveLength(2)
+    kb.keydown({ code: 'ControlLeft', key: 'Control', timeStamp: 530 })
+    expect(sent).toHaveLength(3)
+    expect(vi.getTimerCount()).toBe(0)
+    kb.keyup({ code: 'ControlLeft', key: 'Control', timeStamp: 560 })
+    vi.advanceTimersByTime(100)
+    expect(sent).toEqual([
+      [true, 0xffe3],
+      [true, 0xffe3],
+      [true, 0xffe3],
+      [false, 0xffe3],
+    ])
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  // Accepted limit, as in noVNC: AltGr's fake Control keyup releases a Control that is still down.
+  it('lets the fake Control keyup of AltGr release a held Control', () => {
+    const { kb, sent } = keyboard('windows')
+    kb.keydown({ code: 'ControlLeft', key: 'Control', timeStamp: 0 })
+    vi.advanceTimersByTime(100)
+    kb.keydown({ code: 'ControlLeft', key: 'Control', timeStamp: 1000 })
+    kb.keydown({ code: 'AltRight', key: 'AltGraph', timeStamp: 1000 })
+    kb.keyup({ code: 'AltRight', key: 'AltGraph', timeStamp: 1100 })
+    kb.keyup({ code: 'ControlLeft', key: 'Control', timeStamp: 1100 })
+    expect(sent).toEqual([
+      [true, 0xffe3],
+      [true, 0xffe3],
+      [true, 0xfe03],
+      [false, 0xfe03],
+      [false, 0xffe3],
+    ])
+  })
+
+  it('flush sends a pending Control once', () => {
+    const { kb, sent } = keyboard('windows')
+    kb.flush()
+    expect(sent).toEqual([])
+    kb.keydown({ code: 'ControlLeft', key: 'Control' })
+    kb.flush()
+    expect(sent).toEqual([[true, 0xffe3]])
+    kb.flush()
+    vi.advanceTimersByTime(100)
+    expect(sent).toEqual([[true, 0xffe3]])
+    kb.keyup({ code: 'ControlLeft', key: 'Control' })
+    expect(sent).toEqual([
+      [true, 0xffe3],
+      [false, 0xffe3],
+    ])
+  })
+
+  it('releases both Shift keys on a single Shift keyup on Windows', () => {
+    const { kb, sent } = keyboard('windows')
+    kb.keydown({ code: 'ShiftLeft', key: 'Shift' })
+    kb.keydown({ code: 'ShiftRight', key: 'Shift' })
+    expect(kb.keyup({ code: 'ShiftRight', key: 'Shift' })).toBe(true)
+    expect(sent).toEqual([
+      [true, 0xffe1],
+      [true, 0xffe2],
+      [false, 0xffe2],
+      [false, 0xffe1],
+    ])
+    kb.keyup({ code: 'ShiftLeft', key: 'Shift' })
+    kb.releaseAll()
+    expect(sent).toHaveLength(4)
+  })
+
+  it.each([
+    ['ShiftLeft', 0xffe1],
+    ['ShiftRight', 0xffe2],
+  ])('releases a lone %s as usual on Windows', (code, keysym) => {
+    const { kb, sent } = keyboard('windows')
+    kb.keydown({ code, key: 'Shift' })
+    kb.keyup({ code, key: 'Shift' })
+    expect(sent).toEqual([
+      [true, keysym],
+      [false, keysym],
+    ])
+  })
+
+  it.each(['mac', 'other'] as const)('releases only the Shift that came up on %s', (platform) => {
+    const { kb, sent } = keyboard(platform)
+    kb.keydown({ code: 'ShiftLeft', key: 'Shift' })
+    kb.keydown({ code: 'ShiftRight', key: 'Shift' })
+    kb.keyup({ code: 'ShiftRight', key: 'Shift' })
+    expect(sent).toEqual([
+      [true, 0xffe1],
+      [true, 0xffe2],
+      [false, 0xffe2],
+    ])
+    kb.keyup({ code: 'ShiftLeft', key: 'Shift' })
+    expect(sent.slice(3)).toEqual([[false, 0xffe1]])
   })
 
   it('sends a pending Control before the next key on Windows', () => {
@@ -459,22 +639,102 @@ describe('RemoteKeyboard', () => {
     expect(sent).toHaveLength(5)
   })
 
+  it('keeps Shift down on macOS when Cmd is released', () => {
+    const { kb, sent } = keyboard('mac')
+    kb.keydown({ code: 'ShiftLeft', key: 'Shift' })
+    kb.keydown({ code: 'MetaLeft', key: 'Meta' })
+    kb.keydown({ code: 'KeyZ', key: 'Z' })
+    kb.keyup({ code: 'MetaLeft', key: 'Meta' })
+    kb.keydown({ code: 'ArrowRight', key: 'ArrowRight' })
+    expect(sent).toEqual([
+      [true, 0xffe1],
+      [true, 0xffeb],
+      [true, 0x5a],
+      [false, 0x5a],
+      [false, 0xffeb],
+      [true, 0xff53],
+    ])
+    kb.keyup({ code: 'ArrowRight', key: 'ArrowRight' })
+    kb.keyup({ code: 'ShiftLeft', key: 'Shift' })
+    expect(sent.slice(6)).toEqual([
+      [false, 0xff53],
+      [false, 0xffe1],
+    ])
+  })
+
   it.each([
     ['MetaLeft', 0xffeb],
     ['MetaRight', 0xffec],
-  ])('releases every other key before %s on macOS', (code, meta) => {
+  ])('clicks keys pressed while %s is held on macOS', (code, meta) => {
     const { kb, sent } = keyboard('mac')
     kb.keydown({ code, key: 'Meta' })
     kb.keydown({ code: 'KeyC', key: 'c' })
-    expect(kb.keyup({ code, key: 'Meta' })).toBe(true)
+    kb.keydown({ code: 'KeyV', key: 'v' })
+    kb.keydown({ code: 'Tab', key: 'Tab' })
+    kb.keydown({ code: 'Tab', key: 'Tab' })
+    expect(kb.keyup({ code: 'KeyC', key: 'c' })).toBe(true)
+    kb.keyup({ code, key: 'Meta' })
+    kb.releaseAll()
     expect(sent).toEqual([
       [true, meta],
       [true, 0x63],
       [false, 0x63],
+      [true, 0x76],
+      [false, 0x76],
+      [true, 0xff09],
+      [false, 0xff09],
+      [true, 0xff09],
+      [false, 0xff09],
       [false, meta],
     ])
-    kb.keydown({ code: 'KeyC', key: 'C' })
-    expect(sent.slice(4)).toEqual([[true, 0x43]])
+  })
+
+  it('releases only the Meta that came up on macOS', () => {
+    const { kb, sent } = keyboard('mac')
+    kb.keydown({ code: 'MetaLeft', key: 'Meta' })
+    kb.keydown({ code: 'MetaRight', key: 'Meta' })
+    kb.keyup({ code: 'MetaLeft', key: 'Meta' })
+    expect(sent).toEqual([
+      [true, 0xffeb],
+      [true, 0xffec],
+      [false, 0xffeb],
+    ])
+    kb.keydown({ code: 'KeyC', key: 'c' })
+    expect(sent.slice(3)).toEqual([
+      [true, 0x63],
+      [false, 0x63],
+    ])
+  })
+
+  it.each([
+    ['ShiftLeft', 'Shift', 0xffe1],
+    ['ShiftRight', 'Shift', 0xffe2],
+    ['ControlLeft', 'Control', 0xffe3],
+    ['ControlRight', 'Control', 0xffe4],
+    ['AltLeft', 'Alt', 0xffe9],
+    ['AltRight', 'Alt', 0xffea],
+    ['CapsLock', 'CapsLock', 0xffe5],
+    ['MetaRight', 'Meta', 0xffec],
+  ])('holds %s pressed while Cmd is held on macOS', (code, key, keysym) => {
+    const { kb, sent } = keyboard('mac')
+    kb.keydown({ code: 'MetaLeft', key: 'Meta' })
+    kb.keydown({ code, key })
+    expect(sent).toEqual([
+      [true, 0xffeb],
+      [true, keysym],
+    ])
+    kb.keyup({ code, key })
+    expect(sent.slice(2)).toEqual([[false, keysym]])
+  })
+
+  it('holds MetaLeft pressed while the right Cmd is held on macOS', () => {
+    const { kb, sent } = keyboard('mac')
+    kb.keydown({ code: 'MetaRight', key: 'Meta' })
+    kb.keydown({ code: 'MetaLeft', key: 'Meta' })
+    expect(sent).toEqual([
+      [true, 0xffec],
+      [true, 0xffeb],
+    ])
   })
 
   it.each(['windows', 'other'] as const)(
@@ -545,6 +805,16 @@ describe('WheelSteps', () => {
     expect(wheel.push(30, 0, 0)).toEqual([])
     expect(wheel.push(0, 30, 0)).toEqual([])
     expect(wheel.push(30, 30, 0)).toEqual([16, 64])
+  })
+
+  it('ignores a delta that is not finite', () => {
+    const wheel = new WheelSteps()
+    expect(wheel.push(0, Number.NaN, 0)).toEqual([])
+    expect(wheel.push(0, 100, 0)).toEqual([16, 16])
+    expect(wheel.push(0, Number.POSITIVE_INFINITY, 0)).toEqual([])
+    expect(wheel.push(Number.NEGATIVE_INFINITY, 30, 0)).toEqual([])
+    expect(wheel.push(Number.NaN, 20, 0)).toEqual([16])
+    expect(wheel.push(100, 0, 0)).toEqual([64, 64])
   })
 
   it('yields at most 10 steps per axis and drops the rest', () => {

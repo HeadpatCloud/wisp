@@ -1,5 +1,6 @@
 pub mod bundle;
 pub mod export;
+pub mod plan;
 
 #[cfg(test)]
 use std::collections::{HashMap, HashSet};

@@ -46,6 +46,22 @@ impl Store {
         io::write_json_atomic(&self.dir.join("settings.json"), &self.settings)
     }
 
+    pub fn snapshot(&self) -> ProfileStore {
+        self.data.clone()
+    }
+
+    // Writes first and swaps only on success, so a failed import leaves memory and disk as they
+    // were.
+    pub fn commit(&mut self, mut data: ProfileStore) -> AppResult<()> {
+        data.version = ProfileStore::CURRENT_VERSION;
+        for p in data.profiles.iter_mut() {
+            normalize_keys(p);
+        }
+        io::write_json_atomic(&self.dir.join("profiles.json"), &data)?;
+        self.data = data;
+        Ok(())
+    }
+
     pub fn groups(&self) -> Vec<Group> {
         self.data.groups.clone()
     }
@@ -294,5 +310,24 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed["version"].as_u64(), Some(ProfileStore::CURRENT_VERSION as u64));
+    }
+
+    #[test]
+    fn commit_persists_and_a_failed_commit_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        let mut data = store.snapshot();
+        data.profiles.push(profile("p1", None));
+        store.commit(data).unwrap();
+        assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().profiles().len(), 1);
+
+        // A directory where profiles.json should be makes the final rename fail.
+        let blocked = tempfile::tempdir().unwrap();
+        let mut store = Store::load(blocked.path().to_path_buf()).unwrap();
+        std::fs::create_dir(blocked.path().join("profiles.json")).unwrap();
+        let mut data = store.snapshot();
+        data.profiles.push(profile("p2", None));
+        assert!(store.commit(data).is_err());
+        assert!(store.profiles().is_empty());
     }
 }

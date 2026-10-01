@@ -34,6 +34,8 @@ pub enum AppError {
     Ftp(String),
     #[error("tunnel error: {0}")]
     Tunnel(String),
+    #[error("import error: {0}")]
+    Import(String),
     #[error("internal error: {0}")]
     Internal(String),
 }

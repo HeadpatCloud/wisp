@@ -31,6 +31,8 @@ const setPointerCapture = vi.fn()
 const requestFullscreen = vi.fn()
 const exitFullscreen = vi.fn()
 let fullscreenElement: Element | null = null
+let localText = 'local'
+let heldWrites: (() => void)[] | null = null
 let frames: FrameRequestCallback[] = []
 
 function setClipboardSync(on: boolean) {
@@ -58,8 +60,22 @@ beforeEach(() => {
     configurable: true,
     get: () => fullscreenElement,
   })
-  clipboard.readText.mockResolvedValue('local')
-  clipboard.writeText.mockResolvedValue(undefined)
+  localText = 'local'
+  heldWrites = null
+  clipboard.readText.mockReset()
+  clipboard.writeText.mockReset()
+  clipboard.readText.mockImplementation(async () => localText)
+  clipboard.writeText.mockImplementation(
+    (text: string) =>
+      new Promise<void>((resolve) => {
+        const land = () => {
+          localText = text
+          resolve()
+        }
+        if (heldWrites) heldWrites.push(land)
+        else land()
+      }),
+  )
   Object.defineProperty(navigator, 'clipboard', { configurable: true, value: clipboard })
   vi.mocked(trustHostKey).mockResolvedValue(undefined)
   useSessionStore.setState({ removeTab } as never)
@@ -147,6 +163,29 @@ function displayAt(canvas: HTMLCanvasElement, left: number, top: number, w: numb
     x: left,
     y: top,
     toJSON: () => ({}),
+  })
+}
+
+async function connectSynced() {
+  setClipboardSync(true)
+  const view = await connect()
+  await act(async () => view.canvas.focus())
+  await act(async () => view.canvas.blur())
+  expect(view.driver.clipboard.mock.calls).toEqual([['s1', 'local']])
+  view.driver.clipboard.mockClear()
+  clipboard.readText.mockClear()
+  clipboard.writeText.mockClear()
+  return view
+}
+
+async function focusAgain(canvas: HTMLCanvasElement) {
+  await act(async () => canvas.blur())
+  await act(async () => canvas.focus())
+}
+
+async function landWrites(count: number) {
+  await act(async () => {
+    for (const land of heldWrites?.splice(0, count) ?? []) land()
   })
 }
 
@@ -1096,73 +1135,163 @@ test('a refused clipboard write shows no error', async () => {
   expect(screen.getByRole('button', { name: 'Disconnect' })).toBeInTheDocument()
 })
 
-test('remote text that could not be written is written on the next focus, not overwritten', async () => {
-  setClipboardSync(true)
+test('refused remote text gives way to text copied locally since', async () => {
+  const view = await connectSynced()
   clipboard.writeText.mockRejectedValueOnce(new Error('not focused'))
-  const view = await connect()
   await view.emit({ kind: 'clipboard', text: 'remote' })
+  localText = 'copied here'
+
+  await act(async () => view.canvas.focus())
+  expect(view.driver.clipboard.mock.calls).toEqual([['s1', 'copied here']])
   expect(clipboard.writeText.mock.calls).toEqual([['remote']])
+  expect(localText).toBe('copied here')
+
+  await focusAgain(view.canvas)
+  expect(view.driver.clipboard).toHaveBeenCalledTimes(1)
+  expect(clipboard.writeText).toHaveBeenCalledTimes(1)
+  expect(localText).toBe('copied here')
+})
+
+test('refused remote text is written again on the next focus when nothing was copied locally', async () => {
+  const view = await connectSynced()
+  clipboard.writeText.mockRejectedValueOnce(new Error('not focused'))
+  await view.emit({ kind: 'clipboard', text: 'remote' })
+  expect(localText).toBe('local')
 
   await act(async () => view.canvas.focus())
   expect(clipboard.writeText.mock.calls).toEqual([['remote'], ['remote']])
-  expect(clipboard.readText).not.toHaveBeenCalled()
+  expect(localText).toBe('remote')
   expect(view.driver.clipboard).not.toHaveBeenCalled()
 
-  clipboard.readText.mockResolvedValue('remote')
-  await act(async () => view.canvas.blur())
-  await act(async () => view.canvas.focus())
+  await focusAgain(view.canvas)
   expect(clipboard.writeText).toHaveBeenCalledTimes(2)
-  expect(clipboard.readText).toHaveBeenCalledTimes(1)
   expect(view.driver.clipboard).not.toHaveBeenCalled()
 })
 
-test('remote text stays pending while writing it keeps being refused', async () => {
-  setClipboardSync(true)
+test('text copied locally wins after the remote text was refused on several focuses', async () => {
+  const view = await connectSynced()
   clipboard.writeText.mockRejectedValue(new Error('not focused'))
-  const view = await connect()
   await view.emit({ kind: 'clipboard', text: 'remote' })
   await act(async () => view.canvas.focus())
-  await view.setActive(false)
-  await view.setActive(true)
+  await focusAgain(view.canvas)
   expect(clipboard.writeText.mock.calls).toEqual([['remote'], ['remote'], ['remote']])
-
-  await view.emit({ kind: 'clipboard', text: 'newer' })
-  await act(async () => view.canvas.focus())
-  expect(clipboard.writeText.mock.calls.slice(3)).toEqual([['newer'], ['newer']])
-  expect(clipboard.readText).not.toHaveBeenCalled()
   expect(view.driver.clipboard).not.toHaveBeenCalled()
+
+  localText = 'copied here'
+  await focusAgain(view.canvas)
+  expect(view.driver.clipboard.mock.calls).toEqual([['s1', 'copied here']])
+  expect(clipboard.writeText).toHaveBeenCalledTimes(3)
+
+  await focusAgain(view.canvas)
+  expect(view.driver.clipboard).toHaveBeenCalledTimes(1)
+  expect(clipboard.writeText).toHaveBeenCalledTimes(3)
 })
 
-test('an older write that succeeds late does not clear newer pending text', async () => {
-  setClipboardSync(true)
-  let finish: () => void = () => {}
-  clipboard.writeText
-    .mockReturnValueOnce(
-      new Promise<void>((resolve) => {
-        finish = resolve
-      }),
-    )
-    .mockRejectedValueOnce(new Error('not focused'))
-  const view = await connect()
-  await view.emit({ kind: 'clipboard', text: 'older' })
-  await view.emit({ kind: 'clipboard', text: 'newer' })
-  await act(async () => finish())
-
-  await act(async () => view.canvas.focus())
-  expect(clipboard.writeText.mock.calls).toEqual([['older'], ['newer'], ['newer']])
-  expect(clipboard.readText).not.toHaveBeenCalled()
-})
-
-test('pending remote text is not written once clipboard sync is turned off', async () => {
-  setClipboardSync(true)
-  clipboard.writeText.mockRejectedValue(new Error('not focused'))
-  const view = await connect()
+test('remote text refused before clipboard sync was switched off is dropped', async () => {
+  const view = await connectSynced()
+  clipboard.writeText.mockRejectedValueOnce(new Error('not focused'))
   await view.emit({ kind: 'clipboard', text: 'remote' })
+
   setClipboardSync(false)
   await act(async () => view.canvas.focus())
-
-  expect(clipboard.writeText).toHaveBeenCalledTimes(1)
   expect(clipboard.readText).not.toHaveBeenCalled()
+
+  setClipboardSync(true)
+  await focusAgain(view.canvas)
+  expect(clipboard.writeText.mock.calls).toEqual([['remote']])
+  expect(view.driver.clipboard).not.toHaveBeenCalled()
+
+  localText = 'copied here'
+  await focusAgain(view.canvas)
+  expect(clipboard.writeText.mock.calls).toEqual([['remote']])
+  expect(view.driver.clipboard.mock.calls).toEqual([['s1', 'copied here']])
+})
+
+test('remote text that arrives with clipboard sync off clears what was pending', async () => {
+  const view = await connectSynced()
+  clipboard.writeText.mockRejectedValueOnce(new Error('not focused'))
+  await view.emit({ kind: 'clipboard', text: 'remote' })
+  setClipboardSync(false)
+  await view.emit({ kind: 'clipboard', text: 'ignored' })
+  setClipboardSync(true)
+
+  await act(async () => view.canvas.focus())
+  expect(clipboard.writeText.mock.calls).toEqual([['remote']])
+  expect(view.driver.clipboard).not.toHaveBeenCalled()
+})
+
+test('local text read before newer remote text arrived is not sent', async () => {
+  const view = await connectSynced()
+  let finish: (text: string) => void = () => {}
+  clipboard.readText.mockReturnValueOnce(
+    new Promise<string>((resolve) => {
+      finish = resolve
+    }),
+  )
+  await act(async () => view.canvas.focus())
+  await view.emit({ kind: 'clipboard', text: 'remote' })
+  await act(async () => finish('stale'))
+
+  expect(view.driver.clipboard).not.toHaveBeenCalled()
+  expect(localText).toBe('remote')
+})
+
+test('two remote texts in a row are not sent back and the second one ends up local', async () => {
+  const view = await connectSynced()
+  heldWrites = []
+  await view.emit({ kind: 'clipboard', text: 'first' })
+  await view.emit({ kind: 'clipboard', text: 'second' })
+  await act(async () => view.canvas.focus())
+  await landWrites(3)
+
+  expect(view.driver.clipboard).not.toHaveBeenCalled()
+  expect(localText).toBe('second')
+
+  heldWrites = null
+  await focusAgain(view.canvas)
+  expect(view.driver.clipboard).not.toHaveBeenCalled()
+  expect(localText).toBe('second')
+})
+
+test('an older remote text that lands first is not taken for a local copy', async () => {
+  const view = await connectSynced()
+  heldWrites = []
+  await view.emit({ kind: 'clipboard', text: 'first' })
+  await view.emit({ kind: 'clipboard', text: 'second' })
+  await landWrites(1)
+  expect(localText).toBe('first')
+
+  await act(async () => view.canvas.focus())
+  await landWrites(2)
+  expect(view.driver.clipboard).not.toHaveBeenCalled()
+  expect(localText).toBe('second')
+})
+
+test('an older remote text that lands late does not clear newer refused text', async () => {
+  const view = await connectSynced()
+  heldWrites = []
+  await view.emit({ kind: 'clipboard', text: 'first' })
+  clipboard.writeText.mockRejectedValueOnce(new Error('not focused'))
+  await view.emit({ kind: 'clipboard', text: 'second' })
+  await landWrites(1)
+  heldWrites = null
+  expect(localText).toBe('first')
+
+  await act(async () => view.canvas.focus())
+  expect(localText).toBe('second')
+  expect(view.driver.clipboard).not.toHaveBeenCalled()
+})
+
+test('local text equal to the refused remote text is not sent back', async () => {
+  const view = await connectSynced()
+  clipboard.writeText.mockRejectedValueOnce(new Error('not focused'))
+  await view.emit({ kind: 'clipboard', text: 'remote' })
+  localText = 'remote'
+
+  await act(async () => view.canvas.focus())
+  await focusAgain(view.canvas)
+  expect(view.driver.clipboard).not.toHaveBeenCalled()
+  expect(clipboard.writeText.mock.calls).toEqual([['remote']])
 })
 
 test('local text read for a session that ended meanwhile is not sent', async () => {
@@ -1375,7 +1504,7 @@ test('fullscreen owned by another element is left alone', async () => {
   expect(exitFullscreen).not.toHaveBeenCalled()
 })
 
-test('a closed or failed session moves focus to Reconnect', async () => {
+test('a session that ends with focus in the view moves it to Reconnect', async () => {
   const view = await connect()
   act(() => view.canvas.focus())
   await view.emit({ kind: 'closed', reason: 'bye' })
@@ -1391,6 +1520,49 @@ test('a closed or failed session moves focus to Reconnect', async () => {
   act(() => screen.getByRole('button', { name: 'Disconnect' }).focus())
   fireEvent.click(screen.getByRole('button', { name: 'Disconnect' }))
   expect(screen.getByRole('button', { name: 'Reconnect' })).toHaveFocus()
+})
+
+test('focus that moved within the view still counts when the session ends', async () => {
+  const view = await connect()
+  act(() => view.canvas.focus())
+  act(() => screen.getByRole('button', { name: 'Ctrl+Alt+Del' }).focus())
+  await view.emit({ kind: 'closed', reason: 'bye' })
+
+  expect(screen.getByRole('button', { name: 'Reconnect' })).toHaveFocus()
+})
+
+test('a session that ends while focus is elsewhere in the window leaves it there', async () => {
+  const elsewhere = document.createElement('button')
+  document.body.appendChild(elsewhere)
+  const view = await connect()
+  act(() => view.canvas.focus())
+  act(() => elsewhere.focus())
+  await view.emit({ kind: 'closed', reason: 'bye' })
+
+  expect(screen.getByRole('button', { name: 'Reconnect' })).toBeInTheDocument()
+  expect(elsewhere).toHaveFocus()
+  elsewhere.remove()
+})
+
+test('a session that ends before the view ever had focus does not take it', async () => {
+  const view = await connect()
+  await view.emit({ kind: 'closed', reason: 'bye' })
+  expect(document.body).toHaveFocus()
+
+  fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }))
+  await view.fail({ kind: 'internal', message: 'timed out' })
+  expect(screen.getByRole('button', { name: 'Reconnect' })).toBeInTheDocument()
+  expect(document.body).toHaveFocus()
+})
+
+test('a session that ends in a hidden tab does not take focus', async () => {
+  const view = await connect()
+  act(() => view.canvas.focus())
+  await view.setActive(false)
+  await view.emit({ kind: 'closed', reason: 'bye' })
+
+  expect(screen.getByRole('button', { name: 'Reconnect' })).toBeInTheDocument()
+  expect(document.body).toHaveFocus()
 })
 
 test('a rejected certificate moves focus to Reconnect', async () => {
@@ -1434,36 +1606,101 @@ test('trusting a certificate connects with the driver the view has by then', asy
   expect(next.driver.open).toHaveBeenCalledTimes(2)
 })
 
-test('a failing acknowledgement is not reported as a picture error', async () => {
+test('a certificate that could not be stored is not reported once a newer attempt runs', async () => {
+  let refuse: (error: Error) => void = () => {}
+  vi.mocked(trustHostKey).mockReturnValue(
+    new Promise<void>((_, reject) => {
+      refuse = reject
+    }),
+  )
+  const view = start()
+  await view.fail({
+    kind: 'hostKeyUnknown',
+    message: { host: 'vnc/h', port: 5900, fingerprint: 'SHA256:ab' },
+  })
+  await act(async () => {
+    fireEvent.click(screen.getByRole('button', { name: 'Trust' }))
+  })
+  const next = fakeDriver()
+  await act(async () => {
+    view.rerender(<RemoteDesktopView tabId="t1" driver={next.driver} active />)
+  })
+  await act(async () => refuse(new Error('io: disk full')))
+
+  expect(screen.queryByText('io: disk full')).toBeNull()
+  expect(screen.getByText('Connecting…')).toBeInTheDocument()
+  expect(next.driver.open).toHaveBeenCalledTimes(1)
+  expect(view.driver.open).toHaveBeenCalledTimes(1)
+})
+
+test('a failing acknowledgement does not stop later messages', async () => {
+  const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
   const view = await connect()
+  const broke = new Error('ack broke')
   Object.assign(view.driver, {
     ack: () => {
-      throw new Error('ack broke')
+      throw broke
     },
   })
+  await view.emit({ kind: 'sync' }, rect(1, 1, 1, 1))
 
-  await expect(view.emit({ kind: 'sync' })).rejects.toThrow('ack broke')
+  expect(errors.mock.calls).toEqual([[broke]])
+  expect(ctx.putImageData).toHaveBeenCalledTimes(1)
   expect(screen.queryByText(PICTURE_ERROR)).toBeNull()
   expect(screen.getByRole('button', { name: 'Disconnect' })).toBeInTheDocument()
   expect(view.driver.close).not.toHaveBeenCalled()
 })
 
-test('a failing clipboard write is not reported as a picture error', async () => {
+test('a failing clipboard write does not stop later messages', async () => {
+  const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
   setClipboardSync(true)
+  const broke = new Error('no clipboard')
   Object.defineProperty(navigator, 'clipboard', {
     configurable: true,
     value: {
       writeText: () => {
-        throw new Error('no clipboard')
+        throw broke
       },
     },
   })
   const view = await connect()
+  await view.emit({ kind: 'clipboard', text: 'remote' }, rect(1, 1, 1, 1), { kind: 'sync' })
 
-  await expect(view.emit({ kind: 'clipboard', text: 'remote' })).rejects.toThrow('no clipboard')
+  expect(errors.mock.calls).toEqual([[broke]])
+  expect(ctx.putImageData).toHaveBeenCalledTimes(1)
+  expect(view.driver.ack.mock.calls).toEqual([['s1']])
   expect(screen.queryByText(PICTURE_ERROR)).toBeNull()
   expect(screen.getByRole('button', { name: 'Disconnect' })).toBeInTheDocument()
   expect(view.driver.close).not.toHaveBeenCalled()
+})
+
+test('a queued clipboard message that throws does not stop the rest of the queue', async () => {
+  const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+  setClipboardSync(true)
+  const broke = new Error('no clipboard')
+  Object.defineProperty(navigator, 'clipboard', {
+    configurable: true,
+    value: {
+      writeText: () => {
+        throw broke
+      },
+    },
+  })
+  const view = start()
+  await view.emit(
+    { kind: 'clipboard', text: 'remote' },
+    rect(1, 1, 1, 1),
+    { kind: 'sync' },
+    { kind: 'clipboard', text: 'again' },
+    { kind: 'sync' },
+  )
+  await view.open()
+
+  expect(errors.mock.calls).toEqual([[broke], [broke]])
+  expect(ctx.putImageData).toHaveBeenCalledTimes(1)
+  expect(view.driver.ack.mock.calls).toEqual([['s1'], ['s1']])
+  expect(view.canvas.parentElement).not.toHaveClass('hidden')
+  expect(screen.queryByText(PICTURE_ERROR)).toBeNull()
 })
 
 test('a message that cannot be painted closes the session with a reason', async () => {

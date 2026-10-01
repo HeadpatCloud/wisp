@@ -31,8 +31,9 @@ interface Live {
   x: number
   y: number
   move: number
-  clipboard: string
+  synced: string
   pending: string | null
+  received: number
 }
 
 const PICTURE_ERROR = 'The picture could not be updated.'
@@ -70,7 +71,7 @@ function writeClipboard(live: Live, text: string) {
   live.pending = text
   navigator.clipboard.writeText(text).then(
     () => {
-      live.clipboard = text
+      live.synced = text
       if (live.pending === text) live.pending = null
     },
     // Refused while the window is not focused; it stays pending for the next focus.
@@ -94,10 +95,13 @@ export function RemoteDesktopView({
   const reconnectRef = useRef<HTMLButtonElement>(null)
   const liveRef = useRef<Live | null>(null)
   const stopRef = useRef(() => {})
+  const attemptRef = useRef(0)
+  const focusWithinRef = useRef(false)
   const removeTab = useSessionStore((s) => s.removeTab)
 
   const connect = useCallback(() => {
     stopRef.current()
+    attemptRef.current += 1
     const canvas = canvasRef.current
     if (!canvas) return
     const ctx = canvas.getContext('2d')
@@ -131,13 +135,23 @@ export function RemoteDesktopView({
 
     const apply = (session: Live, m: FrameMessage) => {
       if (ended) return
-      if (m.kind === 'clipboard') {
-        if (useSettingsStore.getState().settings.vncClipboardSync) writeClipboard(session, m.text)
-        return
-      }
-      if (m.kind === 'sync') {
-        // The session may already be gone.
-        driver.ack(session.id).catch(() => {})
+      if (m.kind === 'clipboard' || m.kind === 'sync') {
+        try {
+          if (m.kind === 'sync') {
+            // The session may already be gone.
+            driver.ack(session.id).catch(() => {})
+          } else {
+            session.received += 1
+            if (useSettingsStore.getState().settings.vncClipboardSync) {
+              writeClipboard(session, m.text)
+            } else {
+              session.pending = null
+            }
+          }
+        } catch (e) {
+          // Reported, not thrown: the messages after this one still have to be applied.
+          console.error(e)
+        }
         return
       }
       if (m.kind === 'closed') {
@@ -206,8 +220,9 @@ export function RemoteDesktopView({
             x: 0,
             y: 0,
             move: 0,
-            clipboard: '',
+            synced: '',
             pending: null,
+            received: 0,
           }
           live = session
           liveRef.current = session
@@ -246,18 +261,26 @@ export function RemoteDesktopView({
     return () => stopRef.current()
   }, [connect])
 
-  const pushClipboard = useCallback(() => {
+  const syncClipboard = useCallback(() => {
     const live = liveRef.current
-    if (!live || !useSettingsStore.getState().settings.vncClipboardSync) return
-    if (live.pending !== null) {
-      writeClipboard(live, live.pending)
+    if (!live) return
+    if (!useSettingsStore.getState().settings.vncClipboardSync) {
+      live.pending = null
       return
     }
+    const received = live.received
     navigator.clipboard.readText().then(
-      (text) => {
-        if (liveRef.current !== live || text === live.clipboard) return
-        live.clipboard = text
-        driver.clipboard(live.id, text)
+      (local) => {
+        if (liveRef.current !== live || live.received !== received) return
+        if (local === live.synced) {
+          if (live.pending !== null) writeClipboard(live, live.pending)
+          return
+        }
+        // Text copied here since the last sync is newer than server text that was never written.
+        const fromServer = local === live.pending
+        live.synced = local
+        live.pending = null
+        if (!fromServer) driver.clipboard(live.id, local)
       },
       // Reading is refused while the window is not focused.
       () => {},
@@ -266,7 +289,7 @@ export function RemoteDesktopView({
 
   useEffect(() => {
     if (active) {
-      pushClipboard()
+      syncClipboard()
       return
     }
     const live = liveRef.current
@@ -275,7 +298,7 @@ export function RemoteDesktopView({
       live.keyboard.releaseAll()
     }
     canvasRef.current?.blur()
-  }, [active, pushClipboard, driver])
+  }, [active, syncClipboard, driver])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -311,8 +334,9 @@ export function RemoteDesktopView({
   }, [fullscreen, state.status, active])
 
   useEffect(() => {
-    if (state.status === 'closed' || state.status === 'failed') reconnectRef.current?.focus()
-  }, [state.status])
+    if (state.status !== 'closed' && state.status !== 'failed') return
+    if (active && focusWithinRef.current) reconnectRef.current?.focus()
+  }, [state.status, active])
 
   const onPointer = (e: PointerEvent<HTMLCanvasElement>) => {
     const live = liveRef.current
@@ -365,7 +389,17 @@ export function RemoteDesktopView({
     state.status === 'closed' ? state.reason : state.status === 'failed' ? state.error : null
 
   return (
-    <div ref={containerRef} className="flex h-full w-full flex-col bg-background">
+    <div
+      ref={containerRef}
+      onFocusCapture={() => {
+        focusWithinRef.current = true
+      }}
+      onBlurCapture={(e) => {
+        // Focus that goes nowhere (a hidden canvas, a removed button) still counts as ours.
+        if (e.relatedTarget) focusWithinRef.current = false
+      }}
+      className="flex h-full w-full flex-col bg-background"
+    >
       {state.status === 'connected' && (
         <div className="flex shrink-0 items-center gap-1 border-border border-b p-1">
           <button
@@ -427,7 +461,7 @@ export function RemoteDesktopView({
           onContextMenu={(e) => e.preventDefault()}
           onKeyDown={onKey}
           onKeyUp={onKey}
-          onFocus={pushClipboard}
+          onFocus={syncClipboard}
           onBlur={() => {
             const live = liveRef.current
             if (!live) return
@@ -477,10 +511,12 @@ export function RemoteDesktopView({
         onAccept={async () => {
           if (state.status !== 'trust') return
           const p = state.prompt
+          const attempt = attemptRef.current
           setState({ status: 'connecting' })
           try {
             await trustHostKey(p.host, p.port, p.kind === 'unknown' ? p.fingerprint : p.offered)
           } catch (e) {
+            if (attemptRef.current !== attempt) return
             setState({ status: 'failed', error: e instanceof Error ? e.message : String(e) })
             return
           }

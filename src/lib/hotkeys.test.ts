@@ -72,6 +72,29 @@ test('ignores chords typed into inputs but not into the terminal', () => {
   xterm.remove()
 })
 
+test('leaves chords pressed inside a remote desktop to it', () => {
+  const closeTab = vi.fn()
+  renderHook(() => useHotkeys({ closeTab }, {}))
+  const chord = { key: 'W', ctrlKey: true, shiftKey: true }
+
+  const canvas = document.createElement('canvas')
+  canvas.setAttribute('data-remote-desktop', '')
+  const inner = document.createElement('span')
+  canvas.appendChild(inner)
+  const outside = document.createElement('canvas')
+  document.body.append(canvas, outside)
+
+  expect(press(chord, canvas).defaultPrevented).toBe(false)
+  expect(press(chord, inner).defaultPrevented).toBe(false)
+  expect(closeTab).not.toHaveBeenCalled()
+
+  expect(press(chord, outside).defaultPrevented).toBe(true)
+  expect(closeTab).toHaveBeenCalledTimes(1)
+
+  canvas.remove()
+  outside.remove()
+})
+
 // Ctrl+W is readline's kill-word; stealing it would break the terminal.
 test('defaults leave bare Ctrl+letter chords to the terminal', () => {
   for (const a of HOTKEY_ACTIONS) {

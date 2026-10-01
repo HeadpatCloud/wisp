@@ -77,6 +77,8 @@ function isTypingTarget(t: EventTarget | null): boolean {
   const el = t as HTMLElement | null
   if (!el) return false
   if (el.classList?.contains('xterm-helper-textarea')) return false
+  // A remote desktop gets every key pressed inside it.
+  if (el.closest?.('[data-remote-desktop]')) return true
   return el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable
 }
 

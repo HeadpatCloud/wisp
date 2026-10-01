@@ -4,6 +4,7 @@ import {
   HeldKeys,
   keysymFor,
   type Platform,
+  pointerButtons,
   RemoteKeyboard,
   WheelSteps,
   wheelButtons,
@@ -271,6 +272,22 @@ describe('wheelButtons', () => {
     [100, 0, 64],
   ])('maps deltaX %d, deltaY %d to %d', (deltaX, deltaY, mask) => {
     expect(wheelButtons(deltaX, deltaY)).toBe(mask)
+  })
+})
+
+describe('pointerButtons', () => {
+  it('remaps DOM button bits to VNC order', () => {
+    expect(pointerButtons(0)).toBe(0)
+    expect(pointerButtons(1)).toBe(1)
+    expect(pointerButtons(2)).toBe(4)
+    expect(pointerButtons(4)).toBe(2)
+    expect(pointerButtons(1 | 2)).toBe(1 | 4)
+    expect(pointerButtons(1 | 2 | 4)).toBe(7)
+  })
+
+  it('ignores the back and forward buttons', () => {
+    expect(pointerButtons(8 | 16)).toBe(0)
+    expect(pointerButtons(1 | 8)).toBe(1)
   })
 })
 

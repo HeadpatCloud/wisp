@@ -9,6 +9,9 @@ import { useSettingsStore } from '@/stores/settingsStore'
 import { RemoteDesktopView } from './RemoteDesktopView'
 
 vi.mock('@/lib/ssh', () => ({ trustHostKey: vi.fn() }))
+vi.mock('@/lib/vnc', () => {
+  throw new Error('the view must not load lib/vnc')
+})
 
 const WINDOWS = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 const PICTURE_ERROR = 'The picture could not be updated.'
@@ -149,6 +152,13 @@ function displayAt(canvas: HTMLCanvasElement, left: number, top: number, w: numb
 
 function runFrames() {
   for (const run of frames.splice(0)) run(0)
+}
+
+function setFullscreen(element: Element | null) {
+  fullscreenElement = element
+  act(() => {
+    document.dispatchEvent(new Event('fullscreenchange'))
+  })
 }
 
 // The frontend is compiled without Node's types, and jsdom has no unhandledrejection event.
@@ -502,42 +512,59 @@ test('keys the canvas consumes do not reach listeners on the window', async () =
   ])
 })
 
-test('global hotkeys do not fire while the canvas has focus', async () => {
+test('global hotkeys do not fire for keys pressed on the canvas', async () => {
   const closeTab = vi.fn()
   renderHook(() => useHotkeys({ closeTab }, {}))
   const view = await connect()
   const chord = { code: 'KeyW', key: 'W', ctrlKey: true, shiftKey: true }
 
-  act(() => view.canvas.focus())
   fireEvent.keyDown(view.canvas, chord)
   expect(closeTab).not.toHaveBeenCalled()
   expect(keys(view.driver)).toEqual([[true, 0x57]])
 
-  act(() => view.canvas.blur())
   fireEvent.keyDown(document.body, chord)
   expect(closeTab).toHaveBeenCalledTimes(1)
 })
 
-test('global hotkeys work again after the view unmounts with the canvas focused', async () => {
+test('focus and blur leave a hotkey suspension set elsewhere alone', async () => {
   const closeTab = vi.fn()
   renderHook(() => useHotkeys({ closeTab }, {}))
   const view = await connect()
-  act(() => view.canvas.focus())
-  view.unmount()
+  const chord = { code: 'KeyW', key: 'W', ctrlKey: true, shiftKey: true }
 
-  fireEvent.keyDown(document.body, { code: 'KeyW', key: 'W', ctrlKey: true, shiftKey: true })
+  suspendHotkeys(true)
+  act(() => view.canvas.focus())
+  act(() => view.canvas.blur())
+  fireEvent.keyDown(document.body, chord)
+  expect(closeTab).not.toHaveBeenCalled()
+
+  suspendHotkeys(false)
+  act(() => view.canvas.focus())
+  fireEvent.keyDown(document.body, chord)
   expect(closeTab).toHaveBeenCalledTimes(1)
 })
 
-test('global hotkeys work again when the session closes with the canvas focused', async () => {
-  const closeTab = vi.fn()
-  renderHook(() => useHotkeys({ closeTab }, {}))
+test('a key pressed during composition is neither sent nor consumed', async () => {
   const view = await connect()
-  act(() => view.canvas.focus())
-  await view.emit({ kind: 'closed', reason: 'bye' })
+  const seen = vi.fn()
+  window.addEventListener('keydown', seen)
+  window.addEventListener('keyup', seen)
+  expect(fireEvent.keyDown(view.canvas, { code: 'KeyA', key: 'a', isComposing: true })).toBe(true)
+  expect(fireEvent.keyUp(view.canvas, { code: 'KeyA', key: 'a', isComposing: true })).toBe(true)
+  window.removeEventListener('keydown', seen)
+  window.removeEventListener('keyup', seen)
 
-  fireEvent.keyDown(document.body, { code: 'KeyW', key: 'W', ctrlKey: true, shiftKey: true })
-  expect(closeTab).toHaveBeenCalledTimes(1)
+  expect(view.driver.key).not.toHaveBeenCalled()
+  expect(seen).toHaveBeenCalledTimes(2)
+})
+
+test('the canvas is labelled, marked for the hotkey handler and shows its focus', async () => {
+  const view = await connect()
+
+  expect(screen.getByLabelText('Remote desktop')).toBe(view.canvas)
+  expect(view.canvas).toHaveAttribute('data-remote-desktop')
+  expect(view.canvas).toHaveClass('touch-none')
+  expect(view.canvas.parentElement).toHaveClass('border-transparent', 'focus-within:border-ring')
 })
 
 test('blur releases everything held', async () => {
@@ -581,6 +608,15 @@ test('an inactive tab releases keys even when the canvas never had focus', async
   await view.setActive(false)
 
   expect(keys(view.driver)).toEqual([[false, 0x61]])
+})
+
+test('a session that ends takes focus off the hidden canvas', async () => {
+  const view = await connect()
+  act(() => view.canvas.focus())
+  fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }))
+
+  expect(view.canvas.parentElement).toHaveClass('hidden')
+  expect(document.activeElement).not.toBe(view.canvas)
 })
 
 test('reconnecting releases held keys on the old session before closing it', async () => {
@@ -677,6 +713,129 @@ test.each([
     expect(points(view.driver)).toEqual([[1, x, y]])
   },
 )
+
+test('a box of another shape than the picture is mapped through its letterbox', async () => {
+  const view = await connect()
+  await view.emit({ kind: 'resize', w: 100, h: 100 })
+  displayAt(view.canvas, 10, 0, 200, 50)
+  fireEvent.pointerDown(view.canvas, { clientX: 110, clientY: 25, buttons: 1, pointerId: 1 })
+  fireEvent.pointerUp(view.canvas, { clientX: 20, clientY: 25, buttons: 0, pointerId: 1 })
+  fireEvent.pointerDown(view.canvas, { clientX: 134.9, clientY: 49.9, buttons: 1, pointerId: 1 })
+  fireEvent.pointerUp(view.canvas, { clientX: 200, clientY: 0, buttons: 0, pointerId: 1 })
+  fireEvent.pointerDown(view.canvas, { clientX: 85, clientY: 0, buttons: 1, pointerId: 1 })
+
+  expect(points(view.driver)).toEqual([
+    [1, 50, 50],
+    [0, 0, 50],
+    [1, 99, 99],
+    [0, 99, 0],
+    [1, 0, 0],
+  ])
+})
+
+test('a taller box than the picture is mapped through its letterbox too', async () => {
+  const view = await connect()
+  await view.emit({ kind: 'resize', w: 100, h: 100 })
+  displayAt(view.canvas, 0, 10, 50, 200)
+  fireEvent.pointerDown(view.canvas, { clientX: 25, clientY: 110, buttons: 1, pointerId: 1 })
+  fireEvent.pointerUp(view.canvas, { clientX: 25, clientY: 20, buttons: 0, pointerId: 1 })
+  fireEvent.pointerDown(view.canvas, { clientX: 49.9, clientY: 134.9, buttons: 1, pointerId: 1 })
+  fireEvent.pointerUp(view.canvas, { clientX: 0, clientY: 200, buttons: 0, pointerId: 1 })
+
+  expect(points(view.driver)).toEqual([
+    [1, 50, 50],
+    [0, 50, 0],
+    [1, 99, 99],
+    [0, 0, 99],
+  ])
+})
+
+test.each([
+  ['a display rectangle without width', 200, 100, 0, 50],
+  ['a display rectangle without height', 200, 100, 100, 0],
+  ['a framebuffer without width', 0, 100, 100, 50],
+  ['a framebuffer without height', 200, 0, 100, 50],
+])('nothing is sent for %s', async (_, w, h, shownW, shownH) => {
+  const view = await connect()
+  await view.emit({ kind: 'resize', w, h })
+  displayAt(view.canvas, 0, 0, shownW, shownH)
+  fireEvent.pointerDown(view.canvas, { clientX: 5, clientY: 5, buttons: 1, pointerId: 1 })
+  fireEvent.pointerMove(view.canvas, { clientX: 6, clientY: 6, buttons: 1, pointerId: 1 })
+  fireEvent.pointerUp(view.canvas, { clientX: 6, clientY: 6, buttons: 0, pointerId: 1 })
+  fireEvent.wheel(view.canvas, { deltaY: 100, clientX: 5, clientY: 5 })
+  runFrames()
+
+  expect(view.driver.pointer).not.toHaveBeenCalled()
+})
+
+test.each(['pointerCancel', 'lostPointerCapture'] as const)(
+  '%s releases the held buttons at the last position',
+  async (event) => {
+    const view = await connect()
+    displayAt(view.canvas, 0, 0, 200, 100)
+    fireEvent.pointerDown(view.canvas, { clientX: 20, clientY: 30, buttons: 1 | 2, pointerId: 1 })
+    fireEvent.pointerMove(view.canvas, { clientX: 40, clientY: 50, buttons: 1 | 2, pointerId: 1 })
+    fireEvent[event](view.canvas, { pointerId: 1 })
+    runFrames()
+
+    expect(points(view.driver)).toEqual([
+      [5, 20, 30],
+      [0, 40, 50],
+    ])
+
+    fireEvent[event](view.canvas, { pointerId: 1 })
+    expect(view.driver.pointer).toHaveBeenCalledTimes(2)
+  },
+)
+
+test('blur releases the held buttons', async () => {
+  const view = await connect()
+  displayAt(view.canvas, 0, 0, 200, 100)
+  fireEvent.pointerDown(view.canvas, { clientX: 20, clientY: 30, buttons: 1, pointerId: 1 })
+  act(() => view.canvas.blur())
+
+  expect(points(view.driver)).toEqual([
+    [1, 20, 30],
+    [0, 20, 30],
+  ])
+})
+
+test('the tab becoming inactive releases the held buttons once', async () => {
+  const view = await connect()
+  displayAt(view.canvas, 0, 0, 200, 100)
+  fireEvent.pointerDown(view.canvas, { clientX: 20, clientY: 30, buttons: 4, pointerId: 1 })
+  await view.setActive(false)
+
+  expect(points(view.driver)).toEqual([
+    [2, 20, 30],
+    [0, 20, 30],
+  ])
+})
+
+test('an inactive tab releases buttons even when the canvas never had focus', async () => {
+  const view = await connect()
+  displayAt(view.canvas, 0, 0, 200, 100)
+  fireEvent.pointerMove(view.canvas, { clientX: 20, clientY: 30, buttons: 1, pointerId: 1 })
+  await view.setActive(false)
+
+  expect(points(view.driver)).toEqual([
+    [1, 20, 30],
+    [0, 20, 30],
+  ])
+})
+
+test('with no button held, cancel, lost capture, blur and inactive send nothing', async () => {
+  const view = await connect()
+  displayAt(view.canvas, 0, 0, 200, 100)
+  fireEvent.pointerDown(view.canvas, { clientX: 20, clientY: 30, buttons: 1, pointerId: 1 })
+  fireEvent.pointerUp(view.canvas, { clientX: 20, clientY: 30, buttons: 0, pointerId: 1 })
+  fireEvent.pointerCancel(view.canvas, { pointerId: 1 })
+  fireEvent.lostPointerCapture(view.canvas, { pointerId: 1 })
+  act(() => view.canvas.blur())
+  await view.setActive(false)
+
+  expect(view.driver.pointer).toHaveBeenCalledTimes(2)
+})
 
 test('pointer coordinates follow a resize', async () => {
   const view = await connect()
@@ -937,6 +1096,75 @@ test('a refused clipboard write shows no error', async () => {
   expect(screen.getByRole('button', { name: 'Disconnect' })).toBeInTheDocument()
 })
 
+test('remote text that could not be written is written on the next focus, not overwritten', async () => {
+  setClipboardSync(true)
+  clipboard.writeText.mockRejectedValueOnce(new Error('not focused'))
+  const view = await connect()
+  await view.emit({ kind: 'clipboard', text: 'remote' })
+  expect(clipboard.writeText.mock.calls).toEqual([['remote']])
+
+  await act(async () => view.canvas.focus())
+  expect(clipboard.writeText.mock.calls).toEqual([['remote'], ['remote']])
+  expect(clipboard.readText).not.toHaveBeenCalled()
+  expect(view.driver.clipboard).not.toHaveBeenCalled()
+
+  clipboard.readText.mockResolvedValue('remote')
+  await act(async () => view.canvas.blur())
+  await act(async () => view.canvas.focus())
+  expect(clipboard.writeText).toHaveBeenCalledTimes(2)
+  expect(clipboard.readText).toHaveBeenCalledTimes(1)
+  expect(view.driver.clipboard).not.toHaveBeenCalled()
+})
+
+test('remote text stays pending while writing it keeps being refused', async () => {
+  setClipboardSync(true)
+  clipboard.writeText.mockRejectedValue(new Error('not focused'))
+  const view = await connect()
+  await view.emit({ kind: 'clipboard', text: 'remote' })
+  await act(async () => view.canvas.focus())
+  await view.setActive(false)
+  await view.setActive(true)
+  expect(clipboard.writeText.mock.calls).toEqual([['remote'], ['remote'], ['remote']])
+
+  await view.emit({ kind: 'clipboard', text: 'newer' })
+  await act(async () => view.canvas.focus())
+  expect(clipboard.writeText.mock.calls.slice(3)).toEqual([['newer'], ['newer']])
+  expect(clipboard.readText).not.toHaveBeenCalled()
+  expect(view.driver.clipboard).not.toHaveBeenCalled()
+})
+
+test('an older write that succeeds late does not clear newer pending text', async () => {
+  setClipboardSync(true)
+  let finish: () => void = () => {}
+  clipboard.writeText
+    .mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        finish = resolve
+      }),
+    )
+    .mockRejectedValueOnce(new Error('not focused'))
+  const view = await connect()
+  await view.emit({ kind: 'clipboard', text: 'older' })
+  await view.emit({ kind: 'clipboard', text: 'newer' })
+  await act(async () => finish())
+
+  await act(async () => view.canvas.focus())
+  expect(clipboard.writeText.mock.calls).toEqual([['older'], ['newer'], ['newer']])
+  expect(clipboard.readText).not.toHaveBeenCalled()
+})
+
+test('pending remote text is not written once clipboard sync is turned off', async () => {
+  setClipboardSync(true)
+  clipboard.writeText.mockRejectedValue(new Error('not focused'))
+  const view = await connect()
+  await view.emit({ kind: 'clipboard', text: 'remote' })
+  setClipboardSync(false)
+  await act(async () => view.canvas.focus())
+
+  expect(clipboard.writeText).toHaveBeenCalledTimes(1)
+  expect(clipboard.readText).not.toHaveBeenCalled()
+})
+
 test('local text read for a session that ended meanwhile is not sent', async () => {
   setClipboardSync(true)
   let finish: (text: string) => void = () => {}
@@ -1037,18 +1265,205 @@ test('Disconnect closes the session and shows Disconnected.', async () => {
   expect(view.driver.close).toHaveBeenCalledTimes(1)
 })
 
-test('Fullscreen puts the whole view in fullscreen and leaves it again', async () => {
+test('Fullscreen puts the whole view in fullscreen and the button follows', async () => {
   const view = await connect()
+  const container = view.container.firstElementChild
   fireEvent.click(screen.getByRole('button', { name: 'Fullscreen' }))
 
   expect(requestFullscreen).toHaveBeenCalledTimes(1)
-  expect(requestFullscreen.mock.contexts[0]).toBe(view.container.firstElementChild)
+  expect(requestFullscreen.mock.contexts[0]).toBe(container)
+  expect(screen.getByRole('button', { name: 'Fullscreen' })).toHaveAttribute(
+    'aria-pressed',
+    'false',
+  )
+
+  setFullscreen(container)
+  expect(screen.queryByRole('button', { name: 'Fullscreen' })).toBeNull()
+  expect(screen.getByRole('button', { name: 'Exit fullscreen' })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  )
   expect(exitFullscreen).not.toHaveBeenCalled()
 
-  fullscreenElement = view.container.firstElementChild
-  fireEvent.click(screen.getByRole('button', { name: 'Fullscreen' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Exit fullscreen' }))
   expect(exitFullscreen).toHaveBeenCalledTimes(1)
   expect(requestFullscreen).toHaveBeenCalledTimes(1)
+
+  setFullscreen(null)
+  expect(screen.getByRole('button', { name: 'Fullscreen' })).toHaveAttribute(
+    'aria-pressed',
+    'false',
+  )
+})
+
+test('a refused fullscreen request or exit changes nothing', async () => {
+  const view = await connect()
+  const container = view.container.firstElementChild
+  // Plain functions: a mock handles the promises it returns, which would hide a missing catch.
+  Element.prototype.requestFullscreen = () => Promise.reject(new TypeError('refused'))
+  document.exitFullscreen = () => Promise.reject(new TypeError('refused'))
+
+  expect(
+    await unhandledRejections(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Fullscreen' }))
+    }),
+  ).toBe(0)
+  expect(screen.getByRole('button', { name: 'Fullscreen' })).toBeInTheDocument()
+
+  setFullscreen(container)
+  expect(
+    await unhandledRejections(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Exit fullscreen' }))
+    }),
+  ).toBe(0)
+  expect(screen.getByRole('button', { name: 'Exit fullscreen' })).toBeInTheDocument()
+
+  expect(await unhandledRejections(() => view.emit({ kind: 'closed', reason: 'bye' }))).toBe(0)
+  expect(screen.getByText('bye')).toBeInTheDocument()
+})
+
+test('fullscreen ends when the session closes', async () => {
+  const view = await connect()
+  setFullscreen(view.container.firstElementChild)
+  expect(exitFullscreen).not.toHaveBeenCalled()
+
+  await view.emit({ kind: 'closed', reason: 'bye' })
+  expect(exitFullscreen).toHaveBeenCalledTimes(1)
+})
+
+test('fullscreen ends when the tab becomes inactive', async () => {
+  const view = await connect()
+  setFullscreen(view.container.firstElementChild)
+  await view.setActive(false)
+
+  expect(exitFullscreen).toHaveBeenCalledTimes(1)
+})
+
+test('fullscreen ends when a reconnect starts', async () => {
+  const view = await connect()
+  setFullscreen(view.container.firstElementChild)
+  fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }))
+
+  expect(exitFullscreen).toHaveBeenCalledTimes(1)
+})
+
+test.each([
+  [
+    'a certificate prompt',
+    { kind: 'hostKeyUnknown', message: { host: 'vnc/h', port: 5900, fingerprint: 'SHA256:ab' } },
+  ],
+  ['a connect error', { kind: 'internal', message: 'vnc: wrong password' }],
+])('fullscreen does not survive %s', async (_, error) => {
+  const view = start()
+  await view.fail(error)
+  setFullscreen(view.container.firstElementChild)
+
+  expect(exitFullscreen).toHaveBeenCalledTimes(1)
+})
+
+test('fullscreen owned by another element is left alone', async () => {
+  const view = await connect()
+  setFullscreen(document.body)
+  expect(screen.getByRole('button', { name: 'Fullscreen' })).toHaveAttribute(
+    'aria-pressed',
+    'false',
+  )
+
+  await view.setActive(false)
+  await view.setActive(true)
+  await view.emit({ kind: 'closed', reason: 'bye' })
+  expect(exitFullscreen).not.toHaveBeenCalled()
+})
+
+test('a closed or failed session moves focus to Reconnect', async () => {
+  const view = await connect()
+  act(() => view.canvas.focus())
+  await view.emit({ kind: 'closed', reason: 'bye' })
+  expect(screen.getByRole('button', { name: 'Reconnect' })).toHaveFocus()
+
+  fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }))
+  expect(document.body).toHaveFocus()
+  await view.fail({ kind: 'internal', message: 'timed out' })
+  expect(screen.getByRole('button', { name: 'Reconnect' })).toHaveFocus()
+
+  fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }))
+  await view.open(session('s2'))
+  act(() => screen.getByRole('button', { name: 'Disconnect' }).focus())
+  fireEvent.click(screen.getByRole('button', { name: 'Disconnect' }))
+  expect(screen.getByRole('button', { name: 'Reconnect' })).toHaveFocus()
+})
+
+test('a rejected certificate moves focus to Reconnect', async () => {
+  const view = start()
+  await view.fail({
+    kind: 'hostKeyUnknown',
+    message: { host: 'vnc/h', port: 5900, fingerprint: 'SHA256:ab' },
+  })
+  fireEvent.click(screen.getByRole('button', { name: 'Reject' }))
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  })
+
+  expect(screen.getByRole('button', { name: 'Reconnect' })).toHaveFocus()
+})
+
+test('trusting a certificate connects with the driver the view has by then', async () => {
+  let trusted: () => void = () => {}
+  vi.mocked(trustHostKey).mockReturnValue(
+    new Promise<void>((resolve) => {
+      trusted = resolve
+    }),
+  )
+  const view = start()
+  await view.fail({
+    kind: 'hostKeyUnknown',
+    message: { host: 'vnc/h', port: 5900, fingerprint: 'SHA256:ab' },
+  })
+  await act(async () => {
+    fireEvent.click(screen.getByRole('button', { name: 'Trust' }))
+  })
+  const next = fakeDriver()
+  await act(async () => {
+    view.rerender(<RemoteDesktopView tabId="t1" driver={next.driver} active />)
+  })
+  expect(next.driver.open).toHaveBeenCalledTimes(1)
+
+  await act(async () => trusted())
+
+  expect(view.driver.open).toHaveBeenCalledTimes(1)
+  expect(next.driver.open).toHaveBeenCalledTimes(2)
+})
+
+test('a failing acknowledgement is not reported as a picture error', async () => {
+  const view = await connect()
+  Object.assign(view.driver, {
+    ack: () => {
+      throw new Error('ack broke')
+    },
+  })
+
+  await expect(view.emit({ kind: 'sync' })).rejects.toThrow('ack broke')
+  expect(screen.queryByText(PICTURE_ERROR)).toBeNull()
+  expect(screen.getByRole('button', { name: 'Disconnect' })).toBeInTheDocument()
+  expect(view.driver.close).not.toHaveBeenCalled()
+})
+
+test('a failing clipboard write is not reported as a picture error', async () => {
+  setClipboardSync(true)
+  Object.defineProperty(navigator, 'clipboard', {
+    configurable: true,
+    value: {
+      writeText: () => {
+        throw new Error('no clipboard')
+      },
+    },
+  })
+  const view = await connect()
+
+  await expect(view.emit({ kind: 'clipboard', text: 'remote' })).rejects.toThrow('no clipboard')
+  expect(screen.queryByText(PICTURE_ERROR)).toBeNull()
+  expect(screen.getByRole('button', { name: 'Disconnect' })).toBeInTheDocument()
+  expect(view.driver.close).not.toHaveBeenCalled()
 })
 
 test('a message that cannot be painted closes the session with a reason', async () => {

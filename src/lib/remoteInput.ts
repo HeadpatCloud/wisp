@@ -87,6 +87,15 @@ export function keysymFor(e: { code: string; key: string }): number | null {
   return LEGACY_KEYSYMS.get(cp) ?? 0x01000000 + cp
 }
 
+// DOM buttons (1 left, 2 right, 4 middle) to the VNC mask (bit 0 left, bit 1 middle, bit 2 right).
+export function pointerButtons(domButtons: number): number {
+  let mask = 0
+  if (domButtons & 1) mask |= 1
+  if (domButtons & 4) mask |= 2
+  if (domButtons & 2) mask |= 4
+  return mask
+}
+
 // VNC wheel buttons: 4 up, 5 down, 6 left, 7 right.
 export function wheelButtons(deltaX: number, deltaY: number): number {
   let mask = 0

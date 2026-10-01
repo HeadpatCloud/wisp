@@ -1,7 +1,7 @@
 use flate2::{Decompress, FlushDecompress};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use super::{bounded, err, MAX_RECT};
+use super::err;
 use crate::error::{AppError, AppResult};
 use crate::remote::FrameOp;
 
@@ -9,6 +9,8 @@ pub const ENCODINGS: [i32; 7] = [16, 5, 1, 0, -239, -223, -308];
 
 const MAX_ZRLE: usize = 64 << 20;
 const MAX_CURSOR: usize = 1024;
+// An 8K screen has 33.2 million pixels.
+const MAX_DESKTOP: usize = 40_000_000;
 
 fn invalid() -> AppError {
     err("the server sent an invalid update")
@@ -249,6 +251,9 @@ async fn cursor<R: AsyncRead + Unpin>(
     if width > MAX_CURSOR || height > MAX_CURSOR {
         return Err(invalid());
     }
+    if width == 0 || height == 0 {
+        return Ok(FrameOp::Cursor { hot_x: 0, hot_y: 0, w: 0, h: 0, rgba: Vec::new() });
+    }
     let mut rgba = vec![0u8; width * height * 4];
     r.read_exact(&mut rgba).await?;
     let row_bytes = width.div_ceil(8);
@@ -260,7 +265,15 @@ async fn cursor<R: AsyncRead + Unpin>(
         px.swap(0, 2);
         px[3] = if opaque { 255 } else { 0 };
     }
-    Ok(FrameOp::Cursor { hot_x, hot_y, w, h, rgba })
+    // TightVNC sends a 1x2 cursor with its hotspot at 0,2.
+    Ok(FrameOp::Cursor { hot_x: hot_x.min(w - 1), hot_y: hot_y.min(h - 1), w, h, rgba })
+}
+
+fn desktop_size(w: u16, h: u16) -> AppResult<()> {
+    if w == 0 || h == 0 || w as usize * h as usize > MAX_DESKTOP {
+        return Err(err("the server reported an invalid desktop size"));
+    }
+    Ok(())
 }
 
 pub struct Decoder {
@@ -270,8 +283,9 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    pub fn new(width: u16, height: u16) -> Self {
-        Self { width, height, zlib: Decompress::new(true) }
+    pub fn new(width: u16, height: u16) -> AppResult<Self> {
+        desktop_size(width, height)?;
+        Ok(Self { width, height, zlib: Decompress::new(true) })
     }
 
     pub fn size(&self) -> (u16, u16) {
@@ -287,12 +301,18 @@ impl Decoder {
         Ok(())
     }
 
+    fn count(&self, drawn: &mut usize, w: u16, h: u16) -> AppResult<()> {
+        *drawn += w as usize * h as usize;
+        if *drawn > 4 * self.width as usize * self.height as usize {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
     // Servers announce the size they already have in answer to a full request (TigerVNC, x11vnc
     // and QEMU do, without any pixels): that is not a resize.
     fn resize(&mut self, w: u16, h: u16) -> AppResult<Option<FrameOp>> {
-        if w == 0 || h == 0 {
-            return Err(invalid());
-        }
+        desktop_size(w, h)?;
         if (w, h) == (self.width, self.height) {
             return Ok(None);
         }
@@ -300,11 +320,18 @@ impl Decoder {
         Ok(Some(FrameOp::Resize { w, h }))
     }
 
-    // Reads one FramebufferUpdate body (after the message-type byte) and returns its operations.
-    pub async fn update<R: AsyncRead + Unpin>(&mut self, r: &mut R) -> AppResult<Vec<FrameOp>> {
+    // Reads one FramebufferUpdate body (after the message-type byte) and hands each operation to
+    // the sink as soon as it is decoded.
+    pub async fn update<R: AsyncRead + Unpin>(
+        &mut self,
+        r: &mut R,
+        sink: &mut impl FnMut(FrameOp),
+    ) -> AppResult<()> {
         let mut head = [0u8; 3];
         r.read_exact(&mut head).await?;
-        let mut ops = Vec::new();
+        // Pixels drawn since the update began or the screen was resized. Rectangles cost a server
+        // next to nothing, so an update may cover the screen four times and no more.
+        let mut drawn = 0;
         for _ in 0..u16::from_be_bytes([head[1], head[2]]) {
             let mut rect = [0u8; 12];
             r.read_exact(&mut rect).await?;
@@ -313,9 +340,9 @@ impl Decoder {
             match encoding {
                 0 | 5 | 16 => {
                     self.on_screen(x, y, w, h)?;
+                    self.count(&mut drawn, w, h)?;
                     let (width, height) = (w as usize, h as usize);
-                    let len = (width * height).checked_mul(4).ok_or_else(invalid)?;
-                    let mut rgba = vec![0u8; bounded(len, MAX_RECT)?];
+                    let mut rgba = vec![0u8; width * height * 4];
                     match encoding {
                         0 => {
                             r.read_exact(&mut rgba).await?;
@@ -326,7 +353,10 @@ impl Decoder {
                         }
                         5 => hextile(r, &mut rgba, width, height).await?,
                         _ => {
-                            let compressed = bounded(r.read_u32().await? as usize, MAX_ZRLE)?;
+                            let compressed = r.read_u32().await? as usize;
+                            if compressed > MAX_ZRLE {
+                                return Err(invalid());
+                            }
                             let mut data = vec![0u8; compressed];
                             r.read_exact(&mut data).await?;
                             zrle(&mut self.zlib, &data, &mut rgba, width, height)?;
@@ -334,33 +364,42 @@ impl Decoder {
                     }
                     // Nothing to draw, and a canvas refuses an image without pixels.
                     if !rgba.is_empty() {
-                        ops.push(FrameOp::Rect { x, y, w, h, rgba });
+                        sink(FrameOp::Rect { x, y, w, h, rgba });
                     }
                 }
                 1 => {
                     let (src_x, src_y) = (r.read_u16().await?, r.read_u16().await?);
                     self.on_screen(x, y, w, h)?;
                     self.on_screen(src_x, src_y, w, h)?;
+                    self.count(&mut drawn, w, h)?;
                     if w != 0 && h != 0 {
-                        ops.push(FrameOp::Copy { x, y, w, h, src_x, src_y });
+                        sink(FrameOp::Copy { x, y, w, h, src_x, src_y });
                     }
                 }
-                -223 => ops.extend(self.resize(w, h)?),
+                -223 => {
+                    if let Some(op) = self.resize(w, h)? {
+                        drawn = 0;
+                        sink(op);
+                    }
+                }
                 -308 => {
                     let screens = r.read_u8().await? as usize;
                     let mut skipped = [0u8; 3 + 255 * 16];
                     r.read_exact(&mut skipped[..3 + screens * 16]).await?;
-                    // x is the reason and y the status: not 0 means the server refused a
-                    // resize this client asked for.
-                    if y == 0 {
-                        ops.extend(self.resize(w, h)?);
+                    // x is the reason. Only for 1, the reply to a request of this client, is y a
+                    // status, and not 0 then means the server refused.
+                    if x != 1 || y == 0 {
+                        if let Some(op) = self.resize(w, h)? {
+                            drawn = 0;
+                            sink(op);
+                        }
                     }
                 }
-                -239 => ops.push(cursor(r, x, y, w, h).await?),
+                -239 => sink(cursor(r, x, y, w, h).await?),
                 other => return Err(err(format!("unsupported encoding {other}"))),
             }
         }
-        Ok(ops)
+        Ok(())
     }
 }
 
@@ -393,28 +432,41 @@ mod tests {
         [n, n + 1, n + 2]
     }
 
-    fn pixel(n: u8) -> [u8; 4] {
+    fn sent(n: u8) -> [u8; 4] {
         [n, n + 1, n + 2, 0xEE]
     }
 
-    fn rgba(n: u8) -> [u8; 4] {
+    fn shown(n: u8) -> [u8; 4] {
         [n + 2, n + 1, n, 255]
     }
 
     fn picture(pixels: impl IntoIterator<Item = u8>) -> Vec<u8> {
-        pixels.into_iter().flat_map(rgba).collect()
+        pixels.into_iter().flat_map(shown).collect()
     }
 
-    async fn decode(decoder: &mut Decoder, bytes: &[u8]) -> AppResult<Vec<FrameOp>> {
+    fn sized(w: u16, h: u16) -> Decoder {
+        Decoder::new(w, h).unwrap()
+    }
+
+    // What the sink was handed, and how the update ended.
+    async fn decode_some(decoder: &mut Decoder, bytes: &[u8]) -> (Vec<FrameOp>, AppResult<()>) {
         let mut reader = bytes;
-        let ops = decoder.update(&mut reader).await?;
-        assert!(reader.is_empty(), "{} bytes left unread", reader.len());
+        let mut ops = Vec::new();
+        let result = decoder.update(&mut reader, &mut |op| ops.push(op)).await;
+        if result.is_ok() {
+            assert!(reader.is_empty(), "{} bytes left unread", reader.len());
+        }
         for op in &ops {
             if let FrameOp::Rect { w, h, rgba, .. } | FrameOp::Cursor { w, h, rgba, .. } = op {
                 assert_eq!(rgba.len(), *w as usize * *h as usize * 4);
             }
         }
-        Ok(ops)
+        (ops, result)
+    }
+
+    async fn decode(decoder: &mut Decoder, bytes: &[u8]) -> AppResult<Vec<FrameOp>> {
+        let (ops, result) = decode_some(decoder, bytes).await;
+        result.map(|()| ops)
     }
 
     async fn assert_invalid(decoder: &mut Decoder, bytes: &[u8]) {
@@ -445,19 +497,19 @@ mod tests {
         rect(x, y, w, h, 16, &body)
     }
 
-    fn zrle(zlib: &mut Compress, x: u16, y: u16, w: u16, h: u16, tiles: &[u8]) -> Vec<u8> {
+    fn zrle_rect(zlib: &mut Compress, x: u16, y: u16, w: u16, h: u16, tiles: &[u8]) -> Vec<u8> {
         zrle_data(x, y, w, h, &deflate(zlib, tiles))
     }
 
     // What a new connection makes of one ZRLE rectangle that covers a w x h screen.
     async fn zrle_screen(w: u16, h: u16, tiles: &[u8]) -> AppResult<Vec<FrameOp>> {
-        let bytes = update(&[zrle(&mut compressor(), 0, 0, w, h, tiles)]);
-        decode(&mut Decoder::new(w, h), &bytes).await
+        let bytes = update(&[zrle_rect(&mut compressor(), 0, 0, w, h, tiles)]);
+        decode(&mut sized(w, h), &bytes).await
     }
 
     async fn assert_zrle_invalid(w: u16, h: u16, tiles: &[u8]) {
-        let bytes = update(&[zrle(&mut compressor(), 0, 0, w, h, tiles)]);
-        assert_invalid(&mut Decoder::new(w, h), &bytes).await;
+        let bytes = update(&[zrle_rect(&mut compressor(), 0, 0, w, h, tiles)]);
+        assert_invalid(&mut sized(w, h), &bytes).await;
     }
 
     fn screen(w: u16, h: u16, pixels: impl IntoIterator<Item = u8>) -> Vec<FrameOp> {
@@ -466,14 +518,14 @@ mod tests {
 
     #[tokio::test]
     async fn an_update_without_rectangles_has_no_operations() {
-        let ops = decode(&mut Decoder::new(4, 4), &update(&[])).await.unwrap();
+        let ops = decode(&mut sized(4, 4), &update(&[])).await.unwrap();
         assert!(ops.is_empty());
     }
 
     #[tokio::test]
     async fn raw_pixels_become_rgba() {
         let data = [10, 20, 30, 99, 40, 50, 60, 0];
-        let ops = decode(&mut Decoder::new(4, 4), &update(&[rect(1, 2, 2, 1, 0, &data)])).await;
+        let ops = decode(&mut sized(4, 4), &update(&[rect(1, 2, 2, 1, 0, &data)])).await;
         let rgba = vec![30, 20, 10, 255, 60, 50, 40, 255];
         assert_eq!(ops.unwrap(), [FrameOp::Rect { x: 1, y: 2, w: 2, h: 1, rgba }]);
     }
@@ -481,18 +533,18 @@ mod tests {
     #[tokio::test]
     async fn copy_rect_becomes_a_copy() {
         let bytes = update(&[rect(5, 6, 3, 2, 1, &[0, 1, 0, 2])]);
-        let ops = decode(&mut Decoder::new(10, 10), &bytes).await.unwrap();
+        let ops = decode(&mut sized(10, 10), &bytes).await.unwrap();
         assert_eq!(ops, [FrameOp::Copy { x: 5, y: 6, w: 3, h: 2, src_x: 1, src_y: 2 }]);
     }
 
     #[tokio::test]
     async fn rectangles_come_out_in_the_order_they_were_sent() {
         let bytes = update(&[
-            rect(0, 0, 1, 1, 0, &pixel(10)),
+            rect(0, 0, 1, 1, 0, &sent(10)),
             rect(1, 0, 1, 1, 1, &[0, 0, 0, 0]),
             rect(2, 0, 1, 1, 5, &[1, 20, 21, 22, 0]),
         ]);
-        let ops = decode(&mut Decoder::new(4, 4), &bytes).await.unwrap();
+        let ops = decode(&mut sized(4, 4), &bytes).await.unwrap();
         assert_eq!(
             ops,
             [
@@ -509,31 +561,31 @@ mod tests {
         let bytes = update(&[
             rect(1, 1, 0, 3, 0, &[]),
             rect(1, 1, 3, 0, 5, &[]),
-            zrle(&mut zlib, 4, 4, 0, 0, &[]),
+            zrle_rect(&mut zlib, 4, 4, 0, 0, &[]),
             rect(1, 1, 0, 3, 1, &[0, 0, 0, 0]),
-            zrle(&mut zlib, 0, 0, 1, 1, &[1, 10, 11, 12]),
+            zrle_rect(&mut zlib, 0, 0, 1, 1, &[1, 10, 11, 12]),
         ]);
-        let ops = decode(&mut Decoder::new(4, 4), &bytes).await.unwrap();
+        let ops = decode(&mut sized(4, 4), &bytes).await.unwrap();
         assert_eq!(ops, screen(1, 1, [10]));
     }
 
     #[tokio::test]
     async fn an_update_that_ends_early_is_an_error() {
-        let bytes = update(&[rect(0, 0, 2, 1, 0, &pixel(10))]);
+        let bytes = update(&[rect(0, 0, 2, 1, 0, &sent(10))]);
         for cut in [0, 2, 3, 10, 15, bytes.len() - 1] {
-            let mut reader = &bytes[..cut];
-            let result = Decoder::new(4, 4).update(&mut reader).await;
+            let (ops, result) = decode_some(&mut sized(4, 4), &bytes[..cut]).await;
             assert!(matches!(result, Err(AppError::Io(_))), "{cut}");
+            assert!(ops.is_empty(), "{cut}");
         }
     }
 
     #[tokio::test]
     async fn hextile_background_with_a_foreground_subrect() {
         let mut data = vec![0x02 | 0x04 | 0x08];
-        data.extend(pixel(10));
-        data.extend(pixel(20));
+        data.extend(sent(10));
+        data.extend(sent(20));
         data.extend([1, 0x10, 0x00]);
-        let ops = decode(&mut Decoder::new(2, 2), &update(&[rect(0, 0, 2, 2, 5, &data)])).await;
+        let ops = decode(&mut sized(2, 2), &update(&[rect(0, 0, 2, 2, 5, &data)])).await;
         assert_eq!(ops.unwrap(), screen(2, 2, [10, 20, 10, 10]));
     }
 
@@ -541,22 +593,22 @@ mod tests {
     async fn hextile_raw_tile() {
         let mut data = vec![0x01];
         for n in [10, 20, 30, 40, 50, 60] {
-            data.extend(pixel(n));
+            data.extend(sent(n));
         }
-        let ops = decode(&mut Decoder::new(3, 2), &update(&[rect(0, 0, 3, 2, 5, &data)])).await;
+        let ops = decode(&mut sized(3, 2), &update(&[rect(0, 0, 3, 2, 5, &data)])).await;
         assert_eq!(ops.unwrap(), screen(3, 2, [10, 20, 30, 40, 50, 60]));
     }
 
     #[tokio::test]
     async fn hextile_coloured_subrects() {
         let mut data = vec![0x02 | 0x08 | 0x10];
-        data.extend(pixel(10));
+        data.extend(sent(10));
         data.push(2);
-        data.extend(pixel(20));
+        data.extend(sent(20));
         data.extend([0x00, 0x10]);
-        data.extend(pixel(30));
+        data.extend(sent(30));
         data.extend([0x21, 0x12]);
-        let ops = decode(&mut Decoder::new(4, 4), &update(&[rect(0, 0, 4, 4, 5, &data)])).await;
+        let ops = decode(&mut sized(4, 4), &update(&[rect(0, 0, 4, 4, 5, &data)])).await;
         let expected = [20, 20, 10, 10, 10, 10, 30, 30, 10, 10, 30, 30, 10, 10, 30, 30];
         assert_eq!(ops.unwrap(), screen(4, 4, expected));
     }
@@ -564,18 +616,18 @@ mod tests {
     #[tokio::test]
     async fn hextile_17x17_has_four_tiles() {
         let mut data = vec![0x02];
-        data.extend(pixel(10));
+        data.extend(sent(10));
         // 1 wide: keeps the background, one subrect in a new foreground at its last row
         data.push(0x04 | 0x08);
-        data.extend(pixel(20));
+        data.extend(sent(20));
         data.extend([1, 0x0F, 0x00]);
         // 1 high: a new background and the foreground of the tile before
         data.push(0x02 | 0x08);
-        data.extend(pixel(30));
+        data.extend(sent(30));
         data.extend([1, 0xF0, 0x00]);
         data.push(0x01);
-        data.extend(pixel(40));
-        let ops = decode(&mut Decoder::new(17, 17), &update(&[rect(0, 0, 17, 17, 5, &data)])).await;
+        data.extend(sent(40));
+        let ops = decode(&mut sized(17, 17), &update(&[rect(0, 0, 17, 17, 5, &data)])).await;
         let expected = (0..17 * 17).map(|i| match (i % 17, i / 17) {
             (16, 16) => 40,
             (16, 15) | (15, 16) => 20,
@@ -589,8 +641,8 @@ mod tests {
     async fn hextile_subrect_leaving_its_tile_is_invalid() {
         let subrect = |place: [u8; 2]| {
             let mut data = vec![0x02 | 0x04 | 0x08];
-            data.extend(pixel(10));
-            data.extend(pixel(20));
+            data.extend(sent(10));
+            data.extend(sent(20));
             data.push(1);
             data.extend(place);
             data
@@ -598,15 +650,15 @@ mod tests {
         // x = 15, w = 2 and y = 15, h = 2 in a full tile
         for place in [[0xF0, 0x10], [0x0F, 0x01]] {
             let bytes = update(&[rect(0, 0, 16, 16, 5, &subrect(place))]);
-            assert_invalid(&mut Decoder::new(32, 32), &bytes).await;
+            assert_invalid(&mut sized(32, 32), &bytes).await;
         }
         // x = 2, w = 2 and y = 2, h = 2 in a tile of 3 x 3
         for place in [[0x20, 0x10], [0x02, 0x01]] {
             let bytes = update(&[rect(0, 0, 3, 3, 5, &subrect(place))]);
-            assert_invalid(&mut Decoder::new(32, 32), &bytes).await;
+            assert_invalid(&mut sized(32, 32), &bytes).await;
         }
         let bytes = update(&[rect(0, 0, 3, 3, 5, &subrect([0x11, 0x11]))]);
-        let ops = decode(&mut Decoder::new(32, 32), &bytes).await.unwrap();
+        let ops = decode(&mut sized(32, 32), &bytes).await.unwrap();
         assert_eq!(ops, [FrameOp::Rect {
             x: 0,
             y: 0,
@@ -766,12 +818,12 @@ mod tests {
     #[tokio::test]
     async fn zrle_rectangles_share_one_zlib_stream() {
         let mut zlib = compressor();
-        let first = update(&[zrle(&mut zlib, 0, 0, 2, 1, &[1, 10, 11, 12])]);
+        let first = update(&[zrle_rect(&mut zlib, 0, 0, 2, 1, &[1, 10, 11, 12])]);
         let second = update(&[
-            zrle(&mut zlib, 1, 1, 2, 1, &[0, 20, 21, 22, 30, 31, 32]),
-            zrle(&mut zlib, 0, 3, 1, 1, &[1, 40, 41, 42]),
+            zrle_rect(&mut zlib, 1, 1, 2, 1, &[0, 20, 21, 22, 30, 31, 32]),
+            zrle_rect(&mut zlib, 0, 3, 1, 1, &[1, 40, 41, 42]),
         ]);
-        let mut decoder = Decoder::new(4, 4);
+        let mut decoder = sized(4, 4);
         let ops = decode(&mut decoder, &first).await.unwrap();
         assert_eq!(ops, [FrameOp::Rect { x: 0, y: 0, w: 2, h: 1, rgba: picture([10, 10]) }]);
         let ops = decode(&mut decoder, &second).await.unwrap();
@@ -783,7 +835,7 @@ mod tests {
             ],
         );
         // the second update only makes sense as the continuation of the first
-        assert_invalid(&mut Decoder::new(4, 4), &second).await;
+        assert_invalid(&mut sized(4, 4), &second).await;
     }
 
     #[tokio::test]
@@ -814,7 +866,7 @@ mod tests {
         assert_zrle_invalid(2, 2, &[128, 10, 11, 12, 255]).await;
         assert_zrle_invalid(2, 2, &[130, 10, 11, 12, 20, 21, 22, 0, 1]).await;
         assert_zrle_invalid(65, 1, &[1, 10, 11, 12]).await;
-        assert_invalid(&mut Decoder::new(2, 2), &update(&[zrle_data(0, 0, 2, 2, &[])])).await;
+        assert_invalid(&mut sized(2, 2), &update(&[zrle_data(0, 0, 2, 2, &[])])).await;
     }
 
     #[tokio::test]
@@ -822,10 +874,10 @@ mod tests {
         let tiles: Vec<u8> = [0].into_iter().chain((0..48).map(|i| i * 5)).collect();
         let data = deflate(&mut compressor(), &tiles);
         let whole = update(&[zrle_data(0, 0, 4, 4, &data)]);
-        assert!(decode(&mut Decoder::new(4, 4), &whole).await.is_ok());
+        assert!(decode(&mut sized(4, 4), &whole).await.is_ok());
         for cut in [1, 2, data.len() / 2] {
             let bytes = update(&[zrle_data(0, 0, 4, 4, &data[..cut])]);
-            assert_invalid(&mut Decoder::new(4, 4), &bytes).await;
+            assert_invalid(&mut sized(4, 4), &bytes).await;
         }
     }
 
@@ -835,25 +887,25 @@ mod tests {
         let flood = [&[1, 10, 11, 12][..], &vec![0; 1 << 20]].concat();
         assert_zrle_invalid(2, 2, &flood).await;
         let mut zlib = compressor();
-        let bytes = update(&[zrle(&mut zlib, 0, 0, 0, 0, &[1, 10, 11, 12])]);
-        assert_invalid(&mut Decoder::new(2, 2), &bytes).await;
+        let bytes = update(&[zrle_rect(&mut zlib, 0, 0, 0, 0, &[1, 10, 11, 12])]);
+        assert_invalid(&mut sized(2, 2), &bytes).await;
     }
 
     #[tokio::test]
     async fn zrle_corrupt_zlib_data_is_invalid() {
         let bytes = update(&[zrle_data(0, 0, 2, 2, &[0xFF; 16])]);
-        assert_invalid(&mut Decoder::new(2, 2), &bytes).await;
+        assert_invalid(&mut sized(2, 2), &bytes).await;
         let mut data = deflate(&mut compressor(), &[1, 10, 11, 12]);
         data.extend([0xFF; 16]);
         let bytes = update(&[zrle_data(0, 0, 2, 2, &data)]);
-        assert_invalid(&mut Decoder::new(2, 2), &bytes).await;
+        assert_invalid(&mut sized(2, 2), &bytes).await;
     }
 
     #[tokio::test]
     async fn zrle_stream_that_was_ended_cannot_go_on() {
         let mut ended = Vec::with_capacity(64);
         compressor().compress_vec(&[1, 10, 11, 12], &mut ended, FlushCompress::Finish).unwrap();
-        let mut decoder = Decoder::new(2, 2);
+        let mut decoder = sized(2, 2);
         let bytes = update(&[zrle_data(0, 0, 2, 2, &ended)]);
         assert_eq!(decode(&mut decoder, &bytes).await.unwrap(), screen(2, 2, [10; 4]));
         let next = deflate(&mut compressor(), &[1, 20, 21, 22]);
@@ -861,22 +913,23 @@ mod tests {
 
         let trailing = [&ended[..], &[0; 4]].concat();
         let bytes = update(&[zrle_data(0, 0, 2, 2, &trailing)]);
-        assert_invalid(&mut Decoder::new(2, 2), &bytes).await;
+        assert_invalid(&mut sized(2, 2), &bytes).await;
     }
 
     #[tokio::test]
-    async fn zrle_declared_length_over_the_cap_is_refused() {
+    async fn zrle_declared_length_over_the_cap_is_invalid() {
         let bytes = update(&[rect(0, 0, 2, 2, 16, &((64 << 20) + 1u32).to_be_bytes())]);
-        let refused = decode(&mut Decoder::new(2, 2), &bytes).await.unwrap_err();
-        assert!(refused.to_string().contains("declared length 67108865 exceeds 67108864"));
+        assert_invalid(&mut sized(2, 2), &bytes).await;
+        let bytes = update(&[rect(0, 0, 2, 2, 16, &u32::MAX.to_be_bytes())]);
+        assert_invalid(&mut sized(2, 2), &bytes).await;
     }
 
     #[tokio::test]
     async fn desktop_size_resizes_and_later_rectangles_use_the_new_size() {
-        let mut decoder = Decoder::new(4, 4);
+        let mut decoder = sized(4, 4);
         let bytes = update(&[
             rect(0, 0, 8, 2, -223, &[]),
-            rect(6, 1, 2, 1, 0, &[pixel(10), pixel(20)].concat()),
+            rect(6, 1, 2, 1, 0, &[sent(10), sent(20)].concat()),
         ]);
         let ops = decode(&mut decoder, &bytes).await.unwrap();
         assert_eq!(
@@ -887,16 +940,16 @@ mod tests {
             ],
         );
         assert_eq!(decoder.size(), (8, 2));
-        assert_invalid(&mut decoder, &update(&[rect(0, 3, 1, 1, 0, &pixel(10))])).await;
+        assert_invalid(&mut decoder, &update(&[rect(0, 3, 1, 1, 0, &sent(10))])).await;
     }
 
     #[tokio::test]
     async fn extended_desktop_size_resizes_when_the_status_is_zero() {
-        let mut decoder = Decoder::new(4, 4);
+        let mut decoder = sized(4, 4);
         let screens = [&[2, 0, 0, 0][..], &[7; 32]].concat();
         let bytes = update(&[
             rect(1, 0, 8, 2, -308, &screens),
-            rect(6, 1, 2, 1, 0, &[pixel(10), pixel(20)].concat()),
+            rect(6, 1, 2, 1, 0, &[sent(10), sent(20)].concat()),
         ]);
         let ops = decode(&mut decoder, &bytes).await.unwrap();
         assert_eq!(
@@ -910,23 +963,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn extended_desktop_size_with_a_refusal_changes_nothing() {
-        let mut decoder = Decoder::new(4, 4);
+    async fn extended_desktop_size_status_only_counts_in_a_reply() {
         let screens = [&[1, 0, 0, 0][..], &[7; 16]].concat();
-        for (reason, status) in [(1, 1), (0, 3)] {
+        // reason 1 is the reply to a request of this client; only there the status is one
+        let table = [
+            (0, 0, true),
+            (0, 3, true),
+            (2, 1, true),
+            (7, 9, true),
+            (1, 0, true),
+            (1, 1, false),
+            (1, 3, false),
+        ];
+        for (reason, status, resized) in table {
+            let mut decoder = sized(4, 4);
             let bytes = update(&[
                 rect(reason, status, 8, 2, -308, &screens),
-                rect(0, 3, 1, 1, 0, &pixel(10)),
+                rect(0, 1, 1, 1, 0, &sent(10)),
             ]);
-            let ops = decode(&mut decoder, &bytes).await.unwrap();
-            assert_eq!(ops, [FrameOp::Rect { x: 0, y: 3, w: 1, h: 1, rgba: picture([10]) }]);
-            assert_eq!(decoder.size(), (4, 4));
+            let mut ops = decode(&mut decoder, &bytes).await.unwrap();
+            let drawn = FrameOp::Rect { x: 0, y: 1, w: 1, h: 1, rgba: picture([10]) };
+            assert_eq!(ops.pop(), Some(drawn), "{reason} {status}");
+            if resized {
+                assert_eq!(ops, [FrameOp::Resize { w: 8, h: 2 }], "{reason} {status}");
+                assert_eq!(decoder.size(), (8, 2));
+            } else {
+                assert!(ops.is_empty(), "{reason} {status}");
+                assert_eq!(decoder.size(), (4, 4));
+            }
         }
     }
 
     #[tokio::test]
     async fn extended_desktop_size_skips_every_screen() {
-        let mut decoder = Decoder::new(4, 4);
+        let mut decoder = sized(4, 4);
         for (count, w) in [(0, 5), (255, 6)] {
             let screens = [&[count, 0, 0, 0][..], &vec![7; count as usize * 16]].concat();
             let bytes = update(&[rect(0, 0, w, 4, -308, &screens)]);
@@ -937,11 +1007,11 @@ mod tests {
 
     #[tokio::test]
     async fn the_size_the_screen_already_has_is_not_a_resize() {
-        let mut decoder = Decoder::new(4, 4);
+        let mut decoder = sized(4, 4);
         let bytes = update(&[
             rect(0, 0, 4, 4, -308, &[1, 0, 0, 0, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7]),
             rect(0, 0, 4, 4, -223, &[]),
-            rect(3, 3, 1, 1, 0, &pixel(10)),
+            rect(3, 3, 1, 1, 0, &sent(10)),
         ]);
         let ops = decode(&mut decoder, &bytes).await.unwrap();
         assert_eq!(ops, [FrameOp::Rect { x: 3, y: 3, w: 1, h: 1, rgba: picture([10]) }]);
@@ -954,24 +1024,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_resize_to_nothing_is_invalid() {
-        for (w, h) in [(0, 0), (0, 5), (5, 0)] {
-            let mut decoder = Decoder::new(4, 4);
-            assert_invalid(&mut decoder, &update(&[rect(0, 0, w, h, -223, &[])])).await;
-            let bytes = update(&[rect(0, 0, w, h, -308, &[0, 0, 0, 0])]);
-            assert_invalid(&mut decoder, &bytes).await;
-            assert_eq!(decoder.size(), (4, 4));
+    async fn a_desktop_without_area_or_beyond_8k_is_refused() {
+        let refused = |result: AppResult<()>| {
+            matches!(result, Err(AppError::Internal(m))
+                if m == "vnc: the server reported an invalid desktop size")
+        };
+        for (w, h) in [(0, 0), (0, 5), (5, 0), (8000, 6000), (8001, 5000)] {
+            assert!(refused(Decoder::new(w, h).map(|_| ())), "{w}x{h}");
+            let mut decoder = sized(4, 4);
+            for resize in [rect(0, 0, w, h, -223, &[]), rect(0, 0, w, h, -308, &[0, 0, 0, 0])] {
+                let (ops, result) = decode_some(&mut decoder, &update(&[resize])).await;
+                assert!(refused(result), "{w}x{h}");
+                assert!(ops.is_empty());
+                assert_eq!(decoder.size(), (4, 4));
+            }
+        }
+        for (w, h) in [(7680, 4320), (8000, 5000), (1, 65535)] {
+            assert!(Decoder::new(w, h).is_ok(), "{w}x{h}");
+            let bytes = update(&[rect(0, 0, w, h, -223, &[])]);
+            let ops = decode(&mut sized(4, 4), &bytes).await.unwrap();
+            assert_eq!(ops, [FrameOp::Resize { w, h }]);
         }
     }
 
     #[tokio::test]
     async fn cursor_takes_its_alpha_from_the_bitmask() {
-        let mut data: Vec<u8> = (0..18).flat_map(|i| pixel(i * 10)).collect();
+        let mut data: Vec<u8> = (0..18).flat_map(|i| sent(i * 10)).collect();
         // pixels 0 and 8 of the first row; the 7 padding bits of the second row are set
         data.extend([0x80, 0x80, 0x00, 0x7F]);
-        let ops = decode(&mut Decoder::new(4, 4), &update(&[rect(3, 1, 9, 2, -239, &data)])).await;
+        let ops = decode(&mut sized(4, 4), &update(&[rect(3, 1, 9, 2, -239, &data)])).await;
         let expected = (0..18).flat_map(|i| {
-            let [r, g, b, _] = rgba(i * 10);
+            let [r, g, b, _] = shown(i * 10);
             [r, g, b, if i == 0 || i == 8 { 255 } else { 0 }]
         });
         let cursor = FrameOp::Cursor { hot_x: 3, hot_y: 1, w: 9, h: 2, rgba: expected.collect() };
@@ -980,65 +1063,150 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_cursor_hides_it() {
-        let ops = decode(&mut Decoder::new(4, 4), &update(&[rect(0, 0, 0, 0, -239, &[])])).await;
+        let ops = decode(&mut sized(4, 4), &update(&[rect(0, 0, 0, 0, -239, &[])])).await;
         let cursor = FrameOp::Cursor { hot_x: 0, hot_y: 0, w: 0, h: 0, rgba: Vec::new() };
         assert_eq!(ops.unwrap(), [cursor]);
+    }
+
+    #[tokio::test]
+    async fn a_cursor_without_area_hides_it() {
+        for (w, h) in [(0, 5), (5, 0)] {
+            let ops = decode(&mut sized(4, 4), &update(&[rect(3, 4, w, h, -239, &[])])).await;
+            let cursor = FrameOp::Cursor { hot_x: 0, hot_y: 0, w: 0, h: 0, rgba: Vec::new() };
+            assert_eq!(ops.unwrap(), [cursor], "{w}x{h}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cursor_hotspot_is_kept_inside_the_cursor() {
+        for (hot, kept) in [((0, 2), (0, 1)), ((9, 0), (0, 0)), ((0, 1), (0, 1))] {
+            let bytes = update(&[rect(hot.0, hot.1, 1, 2, -239, &[0xFF; 8 + 2])]);
+            let ops = decode(&mut sized(4, 4), &bytes).await.unwrap();
+            let cursor =
+                FrameOp::Cursor { hot_x: kept.0, hot_y: kept.1, w: 1, h: 2, rgba: vec![0xFF; 8] };
+            assert_eq!(ops, [cursor], "{hot:?}");
+        }
     }
 
     #[tokio::test]
     async fn cursor_size_is_capped() {
         for (w, h) in [(2000, 2000), (1025, 1), (1, 1025)] {
             let bytes = update(&[rect(0, 0, w, h, -239, &[])]);
-            assert_invalid(&mut Decoder::new(4, 4), &bytes).await;
+            assert_invalid(&mut sized(4, 4), &bytes).await;
         }
         let data = vec![0xFF; 1024 * 4 + 128];
         let bytes = update(&[rect(0, 0, 1024, 1, -239, &data)]);
-        assert!(decode(&mut Decoder::new(4, 4), &bytes).await.is_ok());
+        assert!(decode(&mut sized(4, 4), &bytes).await.is_ok());
     }
 
     #[tokio::test]
     async fn rectangles_outside_the_screen_are_invalid() {
         let mut zlib = compressor();
         let outside = [
-            rect(9, 0, 2, 1, 0, &[pixel(10), pixel(20)].concat()),
-            rect(0, 9, 1, 2, 0, &[pixel(10), pixel(20)].concat()),
-            rect(10, 0, 1, 1, 0, &pixel(10)),
+            rect(9, 0, 2, 1, 0, &[sent(10), sent(20)].concat()),
+            rect(0, 9, 1, 2, 0, &[sent(10), sent(20)].concat()),
+            rect(10, 0, 1, 1, 0, &sent(10)),
             rect(65535, 65535, 65535, 65535, 0, &[]),
             rect(9, 0, 2, 1, 5, &[0x02, 10, 11, 12, 0]),
-            zrle(&mut zlib, 9, 0, 2, 1, &[1, 10, 11, 12]),
-            zrle(&mut zlib, 0, 9, 1, 2, &[1, 10, 11, 12]),
+            zrle_rect(&mut zlib, 9, 0, 2, 1, &[1, 10, 11, 12]),
+            zrle_rect(&mut zlib, 0, 9, 1, 2, &[1, 10, 11, 12]),
         ];
         for bytes in outside {
-            assert_invalid(&mut Decoder::new(10, 10), &update(&[bytes])).await;
+            assert_invalid(&mut sized(10, 10), &update(&[bytes])).await;
         }
-        let bytes = update(&[rect(9, 9, 1, 1, 0, &pixel(10))]);
-        assert!(decode(&mut Decoder::new(10, 10), &bytes).await.is_ok());
+        let bytes = update(&[rect(9, 9, 1, 1, 0, &sent(10))]);
+        assert!(decode(&mut sized(10, 10), &bytes).await.is_ok());
     }
 
     #[tokio::test]
     async fn copy_rect_must_stay_on_the_screen_at_both_ends() {
         for (x, y, src_x, src_y) in [(0, 0, 7, 0), (0, 0, 0, 7), (7, 0, 0, 0), (0, 7, 0, 0)] {
             let bytes = update(&[rect(x, y, 4, 4, 1, &[0, src_x, 0, src_y])]);
-            assert_invalid(&mut Decoder::new(10, 10), &bytes).await;
+            assert_invalid(&mut sized(10, 10), &bytes).await;
         }
         let bytes = update(&[rect(6, 6, 4, 4, 1, &[0, 0, 0, 6])]);
-        assert!(decode(&mut Decoder::new(10, 10), &bytes).await.is_ok());
+        assert!(decode(&mut sized(10, 10), &bytes).await.is_ok());
     }
 
     #[tokio::test]
-    async fn an_oversized_rectangle_is_refused_before_it_is_allocated() {
-        for encoding in [0, 5, 16] {
-            let bytes = update(&[rect(0, 0, 65535, 65535, encoding, &[])]);
-            let refused = decode(&mut Decoder::new(65535, 65535), &bytes).await.unwrap_err();
-            let refused = refused.to_string();
-            assert!(refused.contains("declared length 17179344900 exceeds 268435456"), "{refused}");
+    async fn operations_reach_the_sink_before_a_later_rectangle_fails() {
+        let bytes = update(&[
+            rect(0, 0, 1, 1, 0, &sent(10)),
+            rect(1, 0, 1, 1, 1, &[0, 0, 0, 0]),
+            rect(0, 0, 3, 3, -239, &[0; 36 + 3]),
+            rect(4, 0, 1, 1, 0, &sent(20)),
+            rect(2, 0, 1, 1, 0, &sent(30)),
+        ]);
+        let (ops, result) = decode_some(&mut sized(4, 4), &bytes).await;
+        assert!(matches!(result, Err(AppError::Internal(m)) if m.ends_with("invalid update")));
+        assert_eq!(
+            ops,
+            [
+                FrameOp::Rect { x: 0, y: 0, w: 1, h: 1, rgba: picture([10]) },
+                FrameOp::Copy { x: 1, y: 0, w: 1, h: 1, src_x: 0, src_y: 0 },
+                FrameOp::Cursor { hot_x: 0, hot_y: 0, w: 3, h: 3, rgba: vec![0; 36] },
+            ],
+        );
+    }
+
+    // A 2 x 2 screen redrawn once in each of the four ways that count.
+    fn four_screens(zlib: &mut Compress) -> Vec<Vec<u8>> {
+        vec![
+            rect(0, 0, 2, 2, 0, &[sent(10), sent(10), sent(10), sent(10)].concat()),
+            rect(0, 0, 2, 2, 5, &[0x02, 10, 11, 12, 0]),
+            zrle_rect(zlib, 0, 0, 2, 2, &[1, 10, 11, 12]),
+            rect(0, 0, 2, 2, 1, &[0, 0, 0, 0]),
+        ]
+    }
+
+    #[tokio::test]
+    async fn an_update_may_redraw_the_screen_four_times_and_no_more() {
+        let four = four_screens(&mut compressor());
+        let ops = decode(&mut sized(2, 2), &update(&four)).await.unwrap();
+        assert_eq!(ops.len(), 4);
+
+        for encoding in [0, 5, 16, 1] {
+            let mut zlib = compressor();
+            let mut rects = four_screens(&mut zlib);
+            rects.push(match encoding {
+                0 => rect(1, 1, 1, 1, 0, &sent(20)),
+                5 => rect(1, 1, 1, 1, 5, &[0x02, 20, 21, 22, 0]),
+                16 => zrle_rect(&mut zlib, 1, 1, 1, 1, &[1, 20, 21, 22]),
+                _ => rect(1, 1, 1, 1, 1, &[0, 0, 0, 0]),
+            });
+            let (ops, result) = decode_some(&mut sized(2, 2), &update(&rects)).await;
+            assert!(
+                matches!(result, Err(AppError::Internal(m)) if m.ends_with("invalid update")),
+                "{encoding}"
+            );
+            assert_eq!(ops.len(), 4, "{encoding}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resize_starts_the_count_again_and_cursors_are_not_counted() {
+        for resize in [rect(0, 0, 4, 1, -223, &[]), rect(0, 0, 4, 1, -308, &[0, 0, 0, 0])] {
+            let mut rects = four_screens(&mut compressor());
+            rects.push(rect(0, 0, 2, 2, -239, &[0xFF; 16 + 2]));
+            rects.push(resize.clone());
+            rects.extend(vec![rect(0, 0, 4, 1, 1, &[0, 0, 0, 0]); 4]);
+            rects.push(rect(0, 0, 4, 1, -239, &[0xFF; 16 + 1]));
+            let ops = decode(&mut sized(2, 2), &update(&rects)).await.unwrap();
+            assert_eq!(ops.len(), 4 + 1 + 1 + 4 + 1);
+
+            // the size announced again is no resize, so the count goes on
+            rects.insert(7, resize);
+            rects.push(rect(3, 0, 1, 1, 1, &[0, 0, 0, 0]));
+            let (ops, result) = decode_some(&mut sized(2, 2), &update(&rects)).await;
+            assert!(matches!(result, Err(AppError::Internal(m)) if m.ends_with("invalid update")));
+            assert_eq!(ops.len(), 4 + 1 + 1 + 4 + 1);
         }
     }
 
     #[tokio::test]
     async fn unknown_encoding_is_named() {
         let bytes = update(&[rect(0, 0, 1, 1, 7, &[])]);
-        let refused = decode(&mut Decoder::new(4, 4), &bytes).await.unwrap_err();
+        let refused = decode(&mut sized(4, 4), &bytes).await.unwrap_err();
         assert!(matches!(refused, AppError::Internal(m) if m == "vnc: unsupported encoding 7"));
     }
 
@@ -1055,7 +1223,7 @@ mod tests {
     }
 
     // One ZRLE tile with made-up contents: its bytes, and the colour of each of its pixels.
-    fn tile(state: &mut u64, sub: u8, tw: usize, pixels: usize) -> (Vec<u8>, Vec<u8>) {
+    fn random_tile(state: &mut u64, sub: u8, tw: usize, pixels: usize) -> (Vec<u8>, Vec<u8>) {
         let palette: Vec<u8> = match sub {
             2..=16 => (0..sub).map(|_| noise(state) % 250).collect(),
             130..=255 => (0..sub - 128).map(|_| noise(state) % 250).collect(),
@@ -1121,12 +1289,12 @@ mod tests {
     }
 
     // The tiles of a w x h rectangle, all in one subencoding, and the picture they make.
-    fn tiles(state: &mut u64, sub: u8, w: usize, h: usize) -> (Vec<u8>, Vec<u8>) {
+    fn random_tiles(state: &mut u64, sub: u8, w: usize, h: usize) -> (Vec<u8>, Vec<u8>) {
         let (mut data, mut drawn) = (Vec::new(), vec![0u8; w * h]);
         for ty in (0..h).step_by(64) {
             for tx in (0..w).step_by(64) {
                 let (tw, th) = ((w - tx).min(64), (h - ty).min(64));
-                let (bytes, colours) = tile(state, sub, tw, tw * th);
+                let (bytes, colours) = random_tile(state, sub, tw, tw * th);
                 data.extend(bytes);
                 for (i, colour) in colours.into_iter().enumerate() {
                     drawn[(ty + i / tw) * w + tx + i % tw] = colour;
@@ -1144,7 +1312,7 @@ mod tests {
         for w in 1..=70 {
             for sub in SUBENCODINGS {
                 let h = [1, 2, 3, 64, 65, 70][noise(&mut state) as usize % 6];
-                let (data, drawn) = tiles(&mut state, sub, w, h);
+                let (data, drawn) = random_tiles(&mut state, sub, w, h);
                 let ops = zrle_screen(w as u16, h as u16, &data).await.unwrap();
                 assert!(ops == screen(w as u16, h as u16, drawn), "{w}x{h} in {sub}");
             }
@@ -1165,17 +1333,17 @@ mod tests {
                 1 => {
                     // well-formed tiles with a few bytes changed
                     let sub = SUBENCODINGS[round / 4 % 12];
-                    let (mut data, _) = tiles(&mut state, sub, w as usize, h as usize);
+                    let (mut data, _) = random_tiles(&mut state, sub, w as usize, h as usize);
                     for change in body.chunks_exact(3).take(1 + round % 3) {
                         let at = (change[0] as usize * 256 + change[1] as usize) % data.len();
                         data[at] = change[2];
                     }
-                    update(&[zrle(&mut compressor(), 0, 0, w, h, &data)])
+                    update(&[zrle_rect(&mut compressor(), 0, 0, w, h, &data)])
                 }
                 2 => {
                     // a subencoding that exists, so more than the first byte is looked at
                     body.insert(0, SUBENCODINGS[round / 4 % 12]);
-                    update(&[zrle(&mut compressor(), 0, 0, w, h, &body)])
+                    update(&[zrle_rect(&mut compressor(), 0, 0, w, h, &body)])
                 }
                 _ => {
                     // several small rectangles in the encodings that exist, and one that does not
@@ -1190,10 +1358,14 @@ mod tests {
                     update(&rects)
                 }
             };
-            let mut decoder = Decoder::new(w, h);
-            let mut reader = &bytes[..];
-            let (mut width, mut height) = (w as usize, h as usize);
-            for op in decoder.update(&mut reader).await.unwrap_or_default() {
+            let mut ops = Vec::new();
+            let ended = sized(w, h).update(&mut &bytes[..], &mut |op| ops.push(op)).await;
+            if let Err(refused) = ended {
+                let expected = matches!(refused, AppError::Io(_) | AppError::Internal(_));
+                assert!(expected, "round {round}");
+            }
+            let (mut width, mut height, mut drawn) = (w as usize, h as usize, 0);
+            for op in ops {
                 let fits = |x: u16, y: u16, w: u16, h: u16| {
                     x as usize + w as usize <= width && y as usize + h as usize <= height
                 };
@@ -1201,16 +1373,23 @@ mod tests {
                     FrameOp::Rect { x, y, w, h, rgba } => {
                         assert!(fits(x, y, w, h), "round {round}");
                         assert_eq!(rgba.len(), w as usize * h as usize * 4, "round {round}");
+                        drawn += w as usize * h as usize;
                     }
                     FrameOp::Copy { x, y, w, h, src_x, src_y } => {
                         assert!(fits(x, y, w, h) && fits(src_x, src_y, w, h), "round {round}");
+                        drawn += w as usize * h as usize;
                     }
-                    FrameOp::Resize { w, h } => (width, height) = (w as usize, h as usize),
-                    FrameOp::Cursor { w, h, rgba, .. } => {
+                    FrameOp::Resize { w, h } => {
+                        (width, height, drawn) = (w as usize, h as usize, 0);
+                    }
+                    FrameOp::Cursor { hot_x, hot_y, w, h, rgba } => {
+                        let hidden = (hot_x, hot_y, w, h) == (0, 0, 0, 0);
+                        assert!(hidden || (hot_x < w && hot_y < h), "round {round}");
                         assert_eq!(rgba.len(), w as usize * h as usize * 4, "round {round}");
                     }
                     FrameOp::Clipboard(_) | FrameOp::Closed(_) => panic!("round {round}"),
                 }
+                assert!(drawn <= 4 * width * height, "round {round}");
             }
         }
     }

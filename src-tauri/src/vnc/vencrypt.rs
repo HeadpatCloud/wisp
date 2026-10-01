@@ -3,23 +3,27 @@ use std::sync::Arc;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use rustls::{CertificateError, ClientConfig, DigitallySignedStruct, SignatureScheme};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_rustls::TlsConnector;
 use zeroize::Zeroizing;
 
 use super::err;
-use super::handshake::{Login, Stream, TlsContext};
+use super::handshake::{Login, Stream, TlsContext, NEEDS_PASSWORD};
 use super::proto::vnc_auth_response;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::remote::trust::{self, Scheme};
 
+const NONE: u32 = 1;
+const VNC_PASSWORD: u32 = 2;
 const X509_NONE: u32 = 260;
 const X509_VNC: u32 = 261;
 const X509_PLAIN: u32 = 262;
 
 fn subtype_name(subtype: u32) -> String {
     match subtype {
+        NONE => "None".into(),
+        VNC_PASSWORD => "VNC password".into(),
         256 => "VeNCrypt Plain (unencrypted)".into(),
         257 => "VeNCrypt TLSNone (no certificate)".into(),
         258 => "VeNCrypt TLSVnc (no certificate)".into(),
@@ -33,17 +37,28 @@ fn subtype_name(subtype: u32) -> String {
     }
 }
 
-// Only the X509 subtypes: the others send the login to a server that has shown no certificate.
+// X509 first. Failing that, subtypes 1 and 2: they are the RFB types of the same number, which
+// the client accepts outside VeNCrypt too. Plain, SASL and anonymous TLS are never chosen.
 fn choose_subtype(offered: &[u32], login: &Login<'_>) -> Result<u32, String> {
     let preferred: &[u32] = match (login.password.is_empty(), login.username.is_empty()) {
-        (true, _) => &[X509_NONE],
-        (false, true) => &[X509_VNC, X509_PLAIN],
-        (false, false) => &[X509_PLAIN, X509_VNC],
+        (true, _) => &[X509_NONE, NONE],
+        (false, true) => &[X509_VNC, X509_PLAIN, VNC_PASSWORD],
+        (false, false) => &[X509_PLAIN, X509_VNC, VNC_PASSWORD],
     };
     if let Some(subtype) = preferred.iter().find(|subtype| offered.contains(subtype)) {
         return Ok(*subtype);
     }
-    let names: Vec<String> = offered.iter().map(|subtype| subtype_name(*subtype)).collect();
+    let with_password = [VNC_PASSWORD, X509_VNC, X509_PLAIN];
+    if login.password.is_empty() && offered.iter().any(|subtype| with_password.contains(subtype)) {
+        return Err(NEEDS_PASSWORD.into());
+    }
+    let mut names: Vec<String> = Vec::new();
+    for subtype in offered {
+        let name = subtype_name(*subtype);
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
     Err(format!("the server offers only: {}", names.join(", ")))
 }
 
@@ -86,7 +101,39 @@ impl ServerCertVerifier for PinnedLater {
     }
 }
 
-// Runs VeNCrypt 0.2 up to and including the login inside TLS; SecurityResult is the caller's.
+// rustls has only a Debug dump for a certificate it cannot read.
+fn tls_failure(e: std::io::Error) -> AppError {
+    let unsupported = match e.get_ref().and_then(|inner| inner.downcast_ref::<rustls::Error>()) {
+        Some(rustls::Error::InvalidCertificate(CertificateError::Other(other)))
+            if other.to_string() == "UnsupportedCertVersion" =>
+        {
+            Some("not X.509 version 3")
+        }
+        Some(rustls::Error::InvalidCertificate(
+            CertificateError::UnsupportedSignatureAlgorithmContext { .. }
+            | CertificateError::UnsupportedSignatureAlgorithmForPublicKeyContext { .. },
+        )) => Some("signature algorithm"),
+        _ => None,
+    };
+    match unsupported {
+        Some(reason) => err(format!("the server's certificate is not supported ({reason})")),
+        None => err(format!("TLS handshake failed: {e}")),
+    }
+}
+
+async fn answer_challenge(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    password: &str,
+) -> AppResult<()> {
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge).await?;
+    stream.write_all(&vnc_auth_response(password, &challenge)).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+// Runs VeNCrypt 0.2 up to and including the login, inside TLS for the X509 subtypes;
+// SecurityResult is the caller's.
 pub async fn negotiate(
     mut stream: Box<dyn Stream>,
     login: &Login<'_>,
@@ -111,6 +158,20 @@ pub async fn negotiate(
         offered.push(stream.read_u32().await?);
     }
     let subtype = choose_subtype(&offered, login).map_err(err)?;
+
+    // These two run as the RFB types of the same number do: no ack from the server, no TLS.
+    if matches!(subtype, NONE | VNC_PASSWORD) {
+        trust::check_unencrypted(tls.known, Scheme::Vnc, tls.host, tls.port)?;
+        stream.write_all(&subtype.to_be_bytes()).await?;
+        stream.flush().await?;
+        if subtype == VNC_PASSWORD {
+            answer_challenge(&mut stream, login.password).await?;
+        }
+        return Ok(stream);
+    }
+
+    let name = ServerName::try_from(crate::net::normalize_host(tls.host))
+        .map_err(|_| err(format!("invalid host name: {}", tls.host)))?;
     stream.write_all(&subtype.to_be_bytes()).await?;
     stream.flush().await?;
     if stream.read_u8().await? != 1 {
@@ -125,12 +186,10 @@ pub async fn negotiate(
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(verifier))
         .with_no_client_auth();
-    let name = ServerName::try_from(crate::net::normalize_host(tls.host))
-        .map_err(|_| err(format!("invalid host name: {}", tls.host)))?;
     let mut stream = TlsConnector::from(Arc::new(config))
         .connect(name, stream)
         .await
-        .map_err(|e| err(format!("TLS handshake failed: {e}")))?;
+        .map_err(tls_failure)?;
 
     // Nothing of the login may be written before this check has passed.
     let certificate = stream
@@ -142,11 +201,7 @@ pub async fn negotiate(
     trust::check(tls.known, Scheme::Vnc, tls.host, tls.port, certificate)?;
 
     match subtype {
-        X509_VNC => {
-            let mut challenge = [0u8; 16];
-            stream.read_exact(&mut challenge).await?;
-            stream.write_all(&vnc_auth_response(login.password, &challenge)).await?;
-        }
+        X509_VNC => answer_challenge(&mut stream, login.password).await?,
         X509_PLAIN => {
             // One write, so that the TLS record sizes do not give away each length.
             let len = 8 + login.username.len() + login.password.len();
@@ -156,10 +211,10 @@ pub async fn negotiate(
             plain.extend(login.username.bytes());
             plain.extend(login.password.bytes());
             stream.write_all(&plain).await?;
+            stream.flush().await?;
         }
         _ => {}
     }
-    stream.flush().await?;
 
     Ok(Box::new(stream))
 }
@@ -183,8 +238,8 @@ mod tests {
     use super::*;
     use crate::commands::ssh_cmds::KnownHostsState;
     use crate::error::AppError;
-    use crate::remote::trust::fingerprint;
-    use crate::ssh::known_hosts::KnownHosts;
+    use crate::remote::trust::{fingerprint, UNENCRYPTED};
+    use crate::ssh::known_hosts::{HostKeyVerdict, KnownHosts};
     use crate::vnc::handshake::{handshake, ServerInit};
     use Step::{Read, Write};
 
@@ -207,11 +262,13 @@ mod tests {
         sni: Option<String>,
     }
 
-    // `left` is what the server wrote over TLS after the login.
+    // `left` is what the server wrote after the login, `pin` what is on record for the host
+    // afterwards.
     struct Outcome {
         result: AppResult<Option<ServerInit>>,
         seen: Seen,
         left: Vec<u8>,
+        pin: Option<String>,
     }
 
     fn certificate() -> CertificateDer<'static> {
@@ -314,7 +371,7 @@ mod tests {
         let tls = TlsContext { host, port: 5900, known: &known };
         // Buffered, so a write the login does not flush never reaches the server.
         let client: Box<dyn Stream> = Box::new(tokio::io::BufWriter::new(client));
-        tokio::time::timeout(Duration::from_secs(5), async {
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
             let entered = if rfb {
                 handshake(client, &login, &tls).await.map(|(stream, init)| (stream, Some(init)))
             } else {
@@ -329,10 +386,16 @@ mod tests {
                 }
                 Err(e) => (Err(e), Vec::new()),
             };
-            Outcome { result, seen: peer.await.unwrap(), left }
+            Outcome { result, seen: peer.await.unwrap(), left, pin: None }
         })
         .await
-        .expect("VeNCrypt script hung")
+        .expect("VeNCrypt script hung");
+        let bare = host.trim_matches(['[', ']']);
+        let pin = match known.0.lock().unwrap().verify(&format!("vnc/{bare}"), 5900, "") {
+            HostKeyVerdict::Mismatch { stored, .. } => Some(stored),
+            _ => None,
+        };
+        Outcome { pin, ..outcome }
     }
 
     async fn play(server: Server, login: Login<'_>, pinned: Option<&str>) -> Outcome {
@@ -361,32 +424,148 @@ mod tests {
 
         for username in ["", "user"] {
             let none = Login { username, password: "" };
-            assert_eq!(choose_subtype(&[262, 261, 260], &none), Ok(260));
+            assert_eq!(choose_subtype(&[262, 261, 1, 260], &none), Ok(260));
         }
     }
 
     #[test]
-    fn a_password_is_never_given_up_or_sent_without_a_certificate() {
+    fn base_types_are_chosen_when_no_x509_subtype_fits() {
+        for username in ["", "user"] {
+            let password = Login { username, password: "pw" };
+            assert_eq!(choose_subtype(&[258, 2, 1, 260], &password), Ok(2));
+            assert_eq!(choose_subtype(&[2, 256, 261], &password), Ok(261));
+
+            let none = Login { username, password: "" };
+            assert_eq!(choose_subtype(&[257, 2, 1, 261], &none), Ok(1));
+        }
+    }
+
+    #[test]
+    fn a_password_is_never_given_up_or_sent_under_anonymous_tls() {
         let login = Login { username: "user", password: "pw" };
         assert_eq!(
-            choose_subtype(&[260], &login),
-            Err("the server offers only: VeNCrypt X509None".into()),
+            choose_subtype(&[260, 1], &login),
+            Err("the server offers only: VeNCrypt X509None, None".into()),
         );
         assert_eq!(
-            choose_subtype(&[256, 257, 258, 259, 263, 264, 2], &login),
+            choose_subtype(&[256, 257, 258, 259, 263, 264, 7], &login),
             Err("the server offers only: VeNCrypt Plain (unencrypted), \
                  VeNCrypt TLSNone (no certificate), VeNCrypt TLSVnc (no certificate), \
                  VeNCrypt TLSPlain (no certificate), VeNCrypt X509SASL, \
-                 VeNCrypt TLSSASL (no certificate), VeNCrypt subtype 2"
+                 VeNCrypt TLSSASL (no certificate), VeNCrypt subtype 7"
                 .into()),
         );
-        let none = Login { username: "", password: "" };
         assert_eq!(
-            choose_subtype(&[257, 261, 262], &none),
-            Err("the server offers only: VeNCrypt TLSNone (no certificate), VeNCrypt X509Vnc, \
-                 VeNCrypt X509Plain"
+            choose_subtype(&[258, 256, 258, 258, 256], &login),
+            Err("the server offers only: VeNCrypt TLSVnc (no certificate), \
+                 VeNCrypt Plain (unencrypted)"
                 .into()),
         );
+    }
+
+    #[test]
+    fn without_a_password_the_password_subtypes_ask_for_one() {
+        let none = Login { username: "", password: "" };
+        for needs_password in [2, 261, 262] {
+            assert_eq!(
+                choose_subtype(&[257, needs_password], &none),
+                Err("this server needs a password".into()),
+            );
+        }
+        assert_eq!(
+            choose_subtype(&[257, 259], &none),
+            Err("the server offers only: VeNCrypt TLSNone (no certificate), \
+                 VeNCrypt TLSPlain (no certificate)"
+                .into()),
+        );
+    }
+
+    #[test]
+    fn unsupported_certificates_are_named_in_words() {
+        let failure = |e: rustls::CertificateError| {
+            let e = std::io::Error::new(ErrorKind::InvalidData, rustls::Error::from(e));
+            tls_failure(e).to_string()
+        };
+        let algorithm = rustls::CertificateError::UnsupportedSignatureAlgorithmForPublicKeyContext {
+            signature_algorithm_id: vec![],
+            public_key_algorithm_id: vec![],
+        };
+        assert_eq!(
+            failure(algorithm),
+            "internal error: vnc: the server's certificate is not supported (signature algorithm)",
+        );
+        assert_eq!(
+            failure(rustls::CertificateError::BadSignature),
+            "internal error: vnc: TLS handshake failed: invalid peer certificate: BadSignature",
+        );
+    }
+
+    #[tokio::test]
+    async fn x509_v1_certificate_is_named_as_unsupported() {
+        let v1 = CertificateDer::from_pem_slice(include_bytes!("fixtures/test-cert-v1.pem"));
+        let v1 = v1.unwrap();
+        let pin = fingerprint(&v1);
+        let mut server = x509(&[262], vec![]);
+        server.tls.as_mut().unwrap().0 = acceptor(v1, &[&TLS13, &TLS12]);
+        let login = Login { username: "user", password: "pw" };
+        let outcome = play(server, login, Some(&pin)).await;
+        assert_eq!(
+            refusal(&outcome),
+            "internal error: vnc: the server's certificate is not supported (not X.509 version 3)",
+        );
+        assert!(outcome.seen.secured.is_none());
+    }
+
+    #[tokio::test]
+    async fn vnc_password_subtype_answers_the_challenge_without_tls() {
+        for pinned in [None, Some(UNENCRYPTED)] {
+            let mut plain = offering(&[258, 2]);
+            plain.extend([Read(4), Write(vec![7; 16]), Read(16)]);
+            let login = Login { username: "user", password: "hunter2" };
+            let outcome = play(Server { plain, tls: None }, login, pinned).await;
+            assert!(outcome.result.is_ok(), "{:?}", outcome.result.as_ref().err());
+            let response = vnc_auth_response("hunter2", &[7; 16]);
+            assert_eq!(outcome.seen.plain, [&[0, 2, 0, 0, 0, 2][..], &response].concat());
+            assert!(outcome.seen.secured.is_none());
+            assert_eq!(outcome.pin.as_deref(), pinned);
+        }
+    }
+
+    #[tokio::test]
+    async fn none_subtype_sends_nothing_after_the_choice() {
+        for pinned in [None, Some(UNENCRYPTED)] {
+            let mut plain = offering(&[257, 1]);
+            plain.push(Read(4));
+            let login = Login { username: "", password: "" };
+            let outcome = play(Server { plain, tls: None }, login, pinned).await;
+            assert!(outcome.result.is_ok(), "{:?}", outcome.result.as_ref().err());
+            assert_eq!(outcome.seen.plain, [0, 2, 0, 0, 0, 1]);
+            assert_eq!(outcome.pin.as_deref(), pinned);
+        }
+    }
+
+    // The challenge comes along with the list, so a client that carried on would be seen
+    // answering it.
+    #[tokio::test]
+    async fn base_subtypes_are_refused_for_a_host_with_a_certificate_pin() {
+        for (subtype, password) in [(2, "hunter2"), (1, "")] {
+            let mut plain = offering(&[258, subtype]);
+            let Some(Write(list)) = plain.last_mut() else { unreachable!() };
+            list.extend([7; 16]);
+            let login = Login { username: "", password };
+            let outcome = play(Server { plain, tls: None }, login, Some("SHA256:ab")).await;
+            match &outcome.result {
+                Err(AppError::HostKeyMismatch { host, port, stored, offered }) => {
+                    assert_eq!(host, "vnc/127.0.0.1");
+                    assert_eq!(*port, 5900);
+                    assert_eq!(stored, "SHA256:ab");
+                    assert_eq!(offered, UNENCRYPTED);
+                }
+                other => panic!("expected HostKeyMismatch, got {:?}", other.as_ref().err()),
+            }
+            assert_eq!(outcome.seen.plain, [0, 2], "{subtype}");
+            assert_eq!(outcome.pin.as_deref(), Some("SHA256:ab"));
+        }
     }
 
     #[tokio::test]
@@ -569,35 +748,132 @@ mod tests {
     async fn host_that_is_no_name_or_address_is_an_error() {
         let pin = fingerprint(&certificate());
         let login = Login { username: "user", password: "pw" };
-        let outcome = connect(x509(&[262], vec![]), login, "not a host", Some(&pin), false).await;
+        let server = Server { plain: offering(&[262]), tls: None };
+        let outcome = connect(server, login, "not a host", Some(&pin), false).await;
         assert!(refusal(&outcome).contains("invalid host name: not a host"));
-        assert!(outcome.seen.secured.is_none());
+        assert_eq!(outcome.seen.plain, [0, 2]);
     }
 
-    // An RFB 3.8 server offering VNC password and VeNCrypt, then `secured` over TLS.
-    fn rfb_server(secured: Vec<Step>) -> Server {
-        let mut server = x509(&[261], secured);
-        let banner = [Write(b"RFB 003.008\n".into()), Read(12), Write(vec![2, 2, 19]), Read(1)];
-        server.plain.splice(0..0, banner);
+    #[tokio::test]
+    async fn host_only_has_to_be_nameable_for_tls() {
+        let mut plain = offering(&[2]);
+        plain.extend([Read(4), Write(vec![7; 16]), Read(16)]);
+        let login = Login { username: "", password: "hunter2" };
+        let server = Server { plain, tls: None };
+        let outcome = connect(server, login, "not a host", None, false).await;
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result.as_ref().err());
+    }
+
+    // `server` behind an RFB server that offers `types` and reads the client's choice.
+    fn rfb(banner: &str, types: &[u8], mut server: Server) -> Server {
+        let mut list = vec![types.len() as u8];
+        list.extend(types);
+        server.plain.splice(0..0, [Write(banner.into()), Read(12), Write(list), Read(1)]);
         server
+    }
+
+    // An RFB 3.8 server offering VNC password and VeNCrypt X509Vnc, then `secured` over TLS.
+    fn rfb_server(secured: Vec<Step>) -> Server {
+        rfb("RFB 003.008\n", &[2, 19], x509(&[261], secured))
+    }
+
+    // SecurityResult OK, ClientInit, and the ServerInit of an 800x600 desktop called "desk".
+    fn entering() -> Vec<Step> {
+        let mut init = vec![3, 32, 2, 88];
+        init.extend([9u8; 16]);
+        init.extend(b"\0\0\0\x04desk");
+        vec![Write(vec![0; 4]), Read(1), Write(init)]
+    }
+
+    fn entered(outcome: Outcome) -> Outcome {
+        let init = outcome.result.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!((init.width, init.height, init.name.as_str()), (800, 600, "desk"));
+        outcome
     }
 
     #[tokio::test]
     async fn handshake_logs_in_through_vencrypt() {
-        let mut init = vec![3, 32, 2, 88];
-        init.extend([9u8; 16]);
-        init.extend(b"\0\0\0\x04desk");
-        let mut secured = vec![Write(vec![7; 16]), Read(16), Write(vec![0; 4]), Read(1)];
-        secured.extend([Write(init), Write(b"next".into())]);
+        let mut secured = vec![Write(vec![7; 16]), Read(16)];
+        secured.extend(entering());
+        secured.push(Write(b"next".into()));
         let login = Login { username: "", password: "hunter2" };
         let pin = fingerprint(&certificate());
         let outcome = connect(rfb_server(secured), login, "127.0.0.1", Some(&pin), true).await;
-        let init = outcome.result.unwrap().unwrap();
-        assert_eq!((init.width, init.height, init.name.as_str()), (800, 600, "desk"));
+        let outcome = entered(outcome);
         assert_eq!(outcome.seen.plain, [&b"RFB 003.008\n"[..], &[19], &CHOSE_X509VNC].concat());
         let response = vnc_auth_response("hunter2", &[7; 16]);
         assert_eq!(outcome.seen.secured.unwrap(), [&response[..], &[1]].concat());
         assert_eq!(outcome.left, b"next");
+        assert_eq!(outcome.pin, Some(pin));
+    }
+
+    #[tokio::test]
+    async fn handshake_v37_reads_the_security_result_after_vencrypt() {
+        let mut secured = vec![Write(vec![7; 16]), Read(16)];
+        secured.extend(entering());
+        let server = rfb("RFB 003.007\n", &[19], x509(&[261], secured));
+        let login = Login { username: "", password: "hunter2" };
+        let pin = fingerprint(&certificate());
+        let outcome = entered(connect(server, login, "127.0.0.1", Some(&pin), true).await);
+        assert_eq!(outcome.seen.plain, [&b"RFB 003.007\n"[..], &[19], &CHOSE_X509VNC].concat());
+    }
+
+    #[tokio::test]
+    async fn handshake_logs_in_with_x509none() {
+        let server = rfb("RFB 003.008\n", &[19], x509(&[260], entering()));
+        let login = Login { username: "", password: "" };
+        let pin = fingerprint(&certificate());
+        let outcome = entered(connect(server, login, "127.0.0.1", Some(&pin), true).await);
+        let chose = [&b"RFB 003.008\n"[..], &[19], &[0, 2, 0, 0, 1, 4]].concat();
+        assert_eq!(outcome.seen.plain, chose);
+        assert_eq!(outcome.seen.secured.unwrap(), [1]);
+    }
+
+    #[tokio::test]
+    async fn handshake_x509none_refusal_is_not_a_wrong_password() {
+        let refusing = vec![Write(vec![0, 0, 0, 1, 0, 0, 0, 0])];
+        let server = rfb("RFB 003.008\n", &[19], x509(&[260], refusing));
+        let login = Login { username: "", password: "" };
+        let pin = fingerprint(&certificate());
+        let outcome = connect(server, login, "127.0.0.1", Some(&pin), true).await;
+        assert!(refusal(&outcome).ends_with("vnc: the server refused the connection"));
+    }
+
+    #[tokio::test]
+    async fn handshake_needs_a_password_for_the_vencrypt_password_subtypes() {
+        let server = rfb("RFB 003.008\n", &[19], Server { plain: offering(&[261]), tls: None });
+        let login = Login { username: "", password: "" };
+        let outcome = connect(server, login, "127.0.0.1", None, true).await;
+        assert!(refusal(&outcome).ends_with("vnc: this server needs a password"));
+        assert_eq!(outcome.seen.plain, [&b"RFB 003.008\n"[..], &[19], &[0, 2]].concat());
+    }
+
+    #[tokio::test]
+    async fn handshake_uses_the_vnc_password_inside_vencrypt_without_tls() {
+        let mut plain = offering(&[258, 2]);
+        plain.extend([Read(4), Write(vec![7; 16]), Read(16)]);
+        plain.extend(entering());
+        let server = rfb("RFB 003.008\n", &[19, 2], Server { plain, tls: None });
+        let login = Login { username: "", password: "hunter2" };
+        let outcome = entered(connect(server, login, "127.0.0.1", None, true).await);
+        let response = vnc_auth_response("hunter2", &[7; 16]);
+        let sent = [&b"RFB 003.008\n"[..], &[19], &[0, 2, 0, 0, 0, 2], &response, &[1]].concat();
+        assert_eq!(outcome.seen.plain, sent);
+        assert!(outcome.seen.secured.is_none());
+        assert_eq!(outcome.pin, None);
+    }
+
+    #[tokio::test]
+    async fn handshake_logs_in_with_the_none_subtype() {
+        let mut plain = offering(&[257, 1]);
+        plain.push(Read(4));
+        plain.extend(entering());
+        let server = rfb("RFB 003.008\n", &[19], Server { plain, tls: None });
+        let login = Login { username: "", password: "" };
+        let outcome = entered(connect(server, login, "127.0.0.1", None, true).await);
+        let sent = [&b"RFB 003.008\n"[..], &[19], &[0, 2, 0, 0, 0, 1], &[1]].concat();
+        assert_eq!(outcome.seen.plain, sent);
+        assert!(outcome.seen.secured.is_none());
     }
 
     #[tokio::test]

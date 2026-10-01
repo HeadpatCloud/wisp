@@ -6,6 +6,7 @@ use super::proto::vnc_auth_response;
 use super::{bounded, err, MAX_TEXT};
 use crate::commands::ssh_cmds::KnownHostsState;
 use crate::error::{AppError, AppResult};
+use crate::remote::trust::{self, Scheme};
 
 pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
@@ -33,7 +34,7 @@ pub enum Version {
     V3_8,
 }
 
-const NEEDS_PASSWORD: &str = "this server needs a password";
+pub(super) const NEEDS_PASSWORD: &str = "this server needs a password";
 const REFUSED: &str = "the server refused the connection";
 
 pub fn security_name(t: u8) -> String {
@@ -63,11 +64,11 @@ fn offers_only(offered: &[u8]) -> String {
 // A password is never given up for type 1: a hostile server could advertise it to get us to
 // connect unauthenticated.
 pub fn choose_security(offered: &[u8], has_password: bool) -> Result<u8, String> {
-    let preferred: &[u8] = if has_password { &[19, 30, 2] } else { &[1] };
+    let preferred: &[u8] = if has_password { &[19, 30, 2] } else { &[1, 19] };
     if let Some(t) = preferred.iter().find(|t| offered.contains(t)) {
         return Ok(*t);
     }
-    if !has_password && offered.iter().any(|t| matches!(t, 2 | 19 | 30)) {
+    if !has_password && offered.iter().any(|t| matches!(t, 2 | 30)) {
         return Err(NEEDS_PASSWORD.into());
     }
     Err(offers_only(offered))
@@ -76,7 +77,9 @@ pub fn choose_security(offered: &[u8], has_password: bool) -> Result<u8, String>
 // None when the server gave no reason, or closed the connection before it was through.
 async fn read_reason(stream: &mut Box<dyn Stream>) -> AppResult<Option<String>> {
     let cut_off = |e: std::io::Error| match e.kind() {
-        ErrorKind::UnexpectedEof => Ok(None),
+        ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => {
+            Ok(None)
+        }
         _ => Err(AppError::from(e)),
     };
     let len = match stream.read_u32().await {
@@ -149,6 +152,10 @@ pub async fn handshake(
         Err(reason) if reason == NEEDS_PASSWORD => return Err(err(reason)),
         Err(_) => return Err(err(offers_only(&offered))),
     };
+    // VeNCrypt asks this itself once it knows whether its login runs inside TLS.
+    if security != 19 {
+        trust::check_unencrypted(tls.known, Scheme::Vnc, tls.host, tls.port)?;
+    }
     if !matches!(version, Version::V3_3) {
         stream.write_all(&[security]).await?;
         stream.flush().await?;
@@ -177,11 +184,11 @@ pub async fn handshake(
             Version::V3_8 => read_reason(&mut stream).await?,
             _ => None,
         };
-        return Err(err(match (reason, result, security) {
-            (Some(reason), _, _) => reason,
-            (None, 2, _) => "too many attempts".into(),
-            (None, _, 1) => REFUSED.into(),
-            (None, _, _) => "wrong password".into(),
+        return Err(err(match (reason, result) {
+            (Some(reason), _) => reason,
+            (None, 2) => "too many attempts".into(),
+            (None, _) if has_password => "wrong password".into(),
+            (None, _) => REFUSED.into(),
         }));
     }
 
@@ -201,11 +208,16 @@ pub async fn handshake(
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
     use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
     use std::time::Duration;
 
+    use tokio::io::ReadBuf;
+
     use super::*;
-    use crate::ssh::known_hosts::KnownHosts;
+    use crate::remote::trust::UNENCRYPTED;
+    use crate::ssh::known_hosts::{HostKeyVerdict, KnownHosts};
     use Step::{Read, Write};
 
     // The server's side of a script: bytes it writes, and how many it then reads from the client.
@@ -214,14 +226,21 @@ mod tests {
         Read(usize),
     }
 
-    // `sent` is everything the client wrote, `left` what the server wrote after the handshake.
+    // `sent` is everything the client wrote, `left` what the server wrote after the handshake,
+    // `pin` what is on record for the host afterwards.
     struct Outcome {
         result: AppResult<ServerInit>,
         sent: Vec<u8>,
         left: Vec<u8>,
+        pin: Option<String>,
     }
 
     async fn play(script: Vec<Step>, password: &str) -> Outcome {
+        play_pinned(script, password, None).await
+    }
+
+    // `pinned` is on record for the host before the client connects.
+    async fn play_pinned(script: Vec<Step>, password: &str, pinned: Option<&str>) -> Outcome {
         let (client, mut server) = tokio::io::duplex(4096);
         let peer = tokio::spawn(async move {
             let mut sent = Vec::new();
@@ -240,13 +259,16 @@ mod tests {
             sent
         });
         let dir = tempfile::tempdir().unwrap();
-        let hosts = KnownHosts::load(dir.path().join("known_hosts.json")).unwrap();
+        let mut hosts = KnownHosts::load(dir.path().join("known_hosts.json")).unwrap();
+        if let Some(pinned) = pinned {
+            hosts.record("vnc/127.0.0.1", 5900, pinned).unwrap();
+        }
         let known = KnownHostsState(Arc::new(Mutex::new(hosts)));
         let tls = TlsContext { host: "127.0.0.1", port: 5900, known: &known };
         let login = Login { username: "", password };
         // Buffered, so a write the handshake does not flush never reaches the server.
         let client = tokio::io::BufWriter::new(client);
-        tokio::time::timeout(Duration::from_secs(2), async {
+        let outcome = tokio::time::timeout(Duration::from_secs(2), async {
             let (result, left) = match handshake(Box::new(client), &login, &tls).await {
                 Ok((mut stream, init)) => {
                     let mut left = Vec::new();
@@ -255,10 +277,15 @@ mod tests {
                 }
                 Err(e) => (Err(e), Vec::new()),
             };
-            Outcome { result, sent: peer.await.unwrap(), left }
+            Outcome { result, sent: peer.await.unwrap(), left, pin: None }
         })
         .await
-        .expect("handshake script hung")
+        .expect("handshake script hung");
+        let pin = match known.0.lock().unwrap().verify("vnc/127.0.0.1", 5900, "") {
+            HostKeyVerdict::Mismatch { stored, .. } => Some(stored),
+            _ => None,
+        };
+        Outcome { pin, ..outcome }
     }
 
     fn refusal(outcome: &Outcome) -> String {
@@ -354,10 +381,11 @@ mod tests {
     }
 
     #[test]
-    fn without_a_password_only_none_is_chosen() {
+    fn without_a_password_none_comes_before_vencrypt() {
         assert_eq!(choose_security(&[1, 2], false), Ok(1));
         assert_eq!(choose_security(&[19, 1], false), Ok(1));
-        for needs_password in [2, 19, 30] {
+        assert_eq!(choose_security(&[2, 30, 19], false), Ok(19));
+        for needs_password in [2, 30] {
             assert_eq!(
                 choose_security(&[16, needs_password], false),
                 Err("this server needs a password".into()),
@@ -496,6 +524,130 @@ mod tests {
         let outcome = play(script, "").await;
         assert!(refusal(&outcome).contains("the server refused the connection"));
         assert_eq!(outcome.sent, [&b"RFB 003.008\n"[..], &[1]].concat());
+    }
+
+    // Each server sends what would follow the choice along with its offer, so a client that
+    // carried on would be seen answering it.
+    fn unencrypted_servers() -> Vec<(Vec<Step>, &'static str)> {
+        let offer = |banner: &str, types: &[u8], next: &[u8]| {
+            let mut script = offering(banner, types);
+            let Some(Write(list)) = script.last_mut() else { unreachable!() };
+            list.extend(next);
+            script
+        };
+        let v33 = vec![
+            Write(b"RFB 003.003\n".into()),
+            Read(12),
+            Write([&[0, 0, 0, 2][..], &[7; 16]].concat()),
+        ];
+        vec![
+            (offer("RFB 003.008\n", &[2], &[7; 16]), "hunter2"),
+            (offer("RFB 003.008\n", &[1], &[0; 4]), ""),
+            (offer("RFB 003.007\n", &[1], &server_init(800, 600, "desk")), ""),
+            (offer("RFB 003.889\n", &[30], &APPLE_KEY), "hunter2"),
+            (v33, "hunter2"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn unencrypted_login_to_a_host_with_a_certificate_pin_is_refused() {
+        for (n, (script, password)) in unencrypted_servers().into_iter().enumerate() {
+            let outcome = play_pinned(script, password, Some("SHA256:ab")).await;
+            match &outcome.result {
+                Err(AppError::HostKeyMismatch { host, port, stored, offered }) => {
+                    assert_eq!(host, "vnc/127.0.0.1", "{n}");
+                    assert_eq!(*port, 5900, "{n}");
+                    assert_eq!(stored, "SHA256:ab", "{n}");
+                    assert_eq!(offered, UNENCRYPTED, "{n}");
+                }
+                other => panic!("{n}: expected HostKeyMismatch, got {:?}", other.as_ref().err()),
+            }
+            assert_eq!(outcome.sent.len(), 12, "{n}");
+            assert_eq!(outcome.pin.as_deref(), Some("SHA256:ab"), "{n}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unencrypted_login_goes_ahead_once_accepted_or_without_a_pin() {
+        let password = || {
+            let mut script = challenging("RFB 003.008\n");
+            script.extend([Write(vec![0; 4]), Read(1), Write(server_init(800, 600, "desk"))]);
+            script
+        };
+        let none = || {
+            let mut script = offering("RFB 003.008\n", &[1]);
+            script.extend([Read(1), Write(vec![0; 4]), Read(1)]);
+            script.push(Write(server_init(800, 600, "desk")));
+            script
+        };
+        for pinned in [Some(UNENCRYPTED), None] {
+            let outcome = play_pinned(password(), "hunter2", pinned).await;
+            assert_eq!(outcome.result.unwrap().name, "desk", "{pinned:?}");
+            assert_eq!(outcome.pin.as_deref(), pinned);
+
+            let outcome = play_pinned(none(), "", pinned).await;
+            assert_eq!(outcome.result.unwrap().name, "desk", "{pinned:?}");
+            assert_eq!(outcome.pin.as_deref(), pinned);
+        }
+    }
+
+    // Serves `data`, then fails every read with `then`.
+    struct Failing {
+        data: std::io::Cursor<Vec<u8>>,
+        then: ErrorKind,
+    }
+
+    impl AsyncRead for Failing {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.data.position() == self.data.get_ref().len() as u64 {
+                return Poll::Ready(Err(self.then.into()));
+            }
+            Pin::new(&mut self.data).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for Failing {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_lost_in_the_reason_counts_as_no_reason() {
+        let server = [&b"RFB 003.008\n"[..], &[1, 2], &[7; 16], &[0, 0, 0, 1, 0, 0]].concat();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts = KnownHosts::load(dir.path().join("known_hosts.json")).unwrap();
+        let known = KnownHostsState(Arc::new(Mutex::new(hosts)));
+        let tls = TlsContext { host: "127.0.0.1", port: 5900, known: &known };
+        let login = Login { username: "", password: "hunter2" };
+        let lost = [
+            (ErrorKind::ConnectionReset, "internal error: vnc: wrong password"),
+            (ErrorKind::ConnectionAborted, "internal error: vnc: wrong password"),
+            (ErrorKind::TimedOut, "io error: timed out"),
+        ];
+        for (then, message) in lost {
+            let stream = Failing { data: std::io::Cursor::new(server.clone()), then };
+            let Err(e) = handshake(Box::new(stream), &login, &tls).await else {
+                panic!("{then:?}: handshake should have failed");
+            };
+            assert_eq!(e.to_string(), message, "{then:?}");
+        }
     }
 
     #[tokio::test]

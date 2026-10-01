@@ -11,17 +11,19 @@ pub enum Scheme {
     Rdg,
 }
 
+pub const UNENCRYPTED: &str = "no certificate (unencrypted login)";
+
 pub fn fingerprint(cert_der: &[u8]) -> String {
     format!("SHA256:{:x}", Sha256::digest(cert_der))
 }
 
-pub fn check(
+fn lookup(
     known: &KnownHostsState,
     scheme: Scheme,
     host: &str,
     port: u16,
-    cert_der: &[u8],
-) -> AppResult<()> {
+    fingerprint: &str,
+) -> AppResult<(String, HostKeyVerdict)> {
     let prefix = match scheme {
         Scheme::Vnc => "vnc/",
         Scheme::Rdp => "rdp/",
@@ -33,8 +35,19 @@ pub fn check(
             .0
             .lock()
             .map_err(|_| AppError::Internal("known_hosts lock poisoned".into()))?;
-        kh.verify(&host, port, &fingerprint(cert_der))
+        kh.verify(&host, port, fingerprint)
     };
+    Ok((host, verdict))
+}
+
+pub fn check(
+    known: &KnownHostsState,
+    scheme: Scheme,
+    host: &str,
+    port: u16,
+    cert_der: &[u8],
+) -> AppResult<()> {
+    let (host, verdict) = lookup(known, scheme, host, port, &fingerprint(cert_der))?;
     match verdict {
         HostKeyVerdict::Trusted => Ok(()),
         HostKeyVerdict::Unknown { fingerprint } => {
@@ -43,6 +56,22 @@ pub fn check(
         HostKeyVerdict::Mismatch { stored, offered } => {
             Err(AppError::HostKeyMismatch { host, port, stored, offered })
         }
+    }
+}
+
+// For a login that runs without a certificate. A host that never showed one is let through
+// unasked; one that did must not drop it unnoticed.
+pub fn check_unencrypted(
+    known: &KnownHostsState,
+    scheme: Scheme,
+    host: &str,
+    port: u16,
+) -> AppResult<()> {
+    match lookup(known, scheme, host, port, UNENCRYPTED)? {
+        (host, HostKeyVerdict::Mismatch { stored, offered }) => {
+            Err(AppError::HostKeyMismatch { host, port, stored, offered })
+        }
+        _ => Ok(()),
     }
 }
 
@@ -120,6 +149,50 @@ mod tests {
             check(&known, Scheme::Vnc, "[::1]", 5900, b"cert"),
             Err(AppError::HostKeyUnknown { host, .. }) if host == "vnc/::1"
         ));
+    }
+
+    #[test]
+    fn unencrypted_login_is_fine_without_a_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let known = known(&dir);
+        assert!(check_unencrypted(&known, Scheme::Vnc, "h", 5900).is_ok());
+        assert!(matches!(
+            check(&known, Scheme::Vnc, "h", 5900, b"cert"),
+            Err(AppError::HostKeyUnknown { .. })
+        ));
+    }
+
+    #[test]
+    fn unencrypted_login_after_a_certificate_is_a_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let known = known(&dir);
+        known.0.lock().unwrap().record("vnc/::1", 5900, &fingerprint(b"cert")).unwrap();
+        match check_unencrypted(&known, Scheme::Vnc, "[::1]", 5900) {
+            Err(AppError::HostKeyMismatch { host, port, stored, offered }) => {
+                assert_eq!(host, "vnc/::1");
+                assert_eq!(port, 5900);
+                assert_eq!(stored, fingerprint(b"cert"));
+                assert_eq!(offered, "no certificate (unencrypted login)");
+            }
+            other => panic!("expected HostKeyMismatch, got {other:?}"),
+        }
+        assert!(check_unencrypted(&known, Scheme::Vnc, "::1", 5901).is_ok());
+        assert!(check_unencrypted(&known, Scheme::Rdp, "::1", 5900).is_ok());
+    }
+
+    #[test]
+    fn accepted_unencrypted_login_holds_until_a_certificate_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let known = known(&dir);
+        known.0.lock().unwrap().record("vnc/h", 5900, UNENCRYPTED).unwrap();
+        assert!(check_unencrypted(&known, Scheme::Vnc, "h", 5900).is_ok());
+        match check(&known, Scheme::Vnc, "h", 5900, b"cert") {
+            Err(AppError::HostKeyMismatch { stored, offered, .. }) => {
+                assert_eq!(stored, UNENCRYPTED);
+                assert_eq!(offered, fingerprint(b"cert"));
+            }
+            other => panic!("expected HostKeyMismatch, got {other:?}"),
+        }
     }
 
     #[test]

@@ -29,6 +29,24 @@ impl Env for LocalEnv<'_> {
     }
 
     fn read_file(&self, path: &str) -> Option<Vec<u8>> {
+        // The path can come from an imported bundle: a UNC path would send the user's credentials
+        // to that server, and an unbounded read is a memory risk. Checked before touching disk.
+        let path = Path::new(path);
+        let mut components = path.components();
+        #[cfg(windows)]
+        let on_local_drive = matches!(
+            components.next(),
+            Some(Component::Prefix(p)) if matches!(p.kind(), std::path::Prefix::Disk(_))
+        ) && components.next() == Some(Component::RootDir);
+        #[cfg(not(windows))]
+        let on_local_drive = components.next() == Some(Component::RootDir);
+        if !on_local_drive {
+            return None;
+        }
+        let meta = std::fs::metadata(path).ok()?;
+        if !meta.is_file() || meta.len() > 1_048_576 {
+            return None;
+        }
         std::fs::read(path).ok()
     }
 
@@ -217,6 +235,39 @@ mod tests {
             for path in [rooted.to_string(), rooted.replace('\\', "/"), forward] {
                 assert!(dir.path().join(&path).is_file());
                 assert!(!env.icon_exists(&path));
+            }
+        }
+    }
+
+    #[test]
+    fn read_file_only_reads_small_files_on_a_local_drive() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault =
+            Vault::open_with_key(dir.path().join("vault.enc"), Zeroizing::new([1u8; 32])).unwrap();
+        let env = LocalEnv { vault: &vault, config_dir: dir.path() };
+        let key = dir.path().join("id");
+        std::fs::write(&key, b"KEY").unwrap();
+        assert_eq!(env.read_file(key.to_str().unwrap()), Some(b"KEY".to_vec()));
+
+        assert!(Path::new("Cargo.toml").is_file());
+        assert!(env.read_file("Cargo.toml").is_none());
+
+        let big = dir.path().join("big");
+        std::fs::write(&big, vec![0u8; 1_048_576]).unwrap();
+        assert_eq!(env.read_file(big.to_str().unwrap()).map(|b| b.len()), Some(1_048_576));
+        std::fs::write(&big, vec![0u8; 1_048_577]).unwrap();
+        assert!(env.read_file(big.to_str().unwrap()).is_none());
+
+        assert!(env.read_file(dir.path().to_str().unwrap()).is_none());
+
+        #[cfg(windows)]
+        {
+            let verbatim = format!("\\\\?\\{}", key.to_str().unwrap());
+            assert!(Path::new(&verbatim).is_file());
+            for path in
+                ["\\\\localhost\\nonexistent-share\\x", "\\\\?\\C:\\Windows\\win.ini", &verbatim]
+            {
+                assert!(env.read_file(path).is_none());
             }
         }
     }

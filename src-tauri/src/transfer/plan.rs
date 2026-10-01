@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
@@ -43,32 +43,48 @@ pub fn same_tunnel(a: &Tunnel, b: &Tunnel) -> bool {
         && a.auto_start == b.auto_start
 }
 
-fn find_match<'a, T>(
-    locals: &'a [T],
-    claimed: &mut HashSet<String>,
-    id_of: impl Fn(&T) -> &str,
-    name_of: impl Fn(&T) -> &str,
-    same_server: impl Fn(&T) -> bool,
-    incoming_id: &str,
-    incoming_name: &str,
-) -> Option<&'a T> {
-    let free = |l: &&T| !claimed.contains(id_of(l));
-    let found = locals.iter().filter(free).find(|l| id_of(l) == incoming_id).or_else(|| {
-        let candidates: Vec<&T> = locals.iter().filter(free).filter(|l| same_server(l)).collect();
-        match candidates.len() {
-            0 => None,
-            1 => Some(candidates[0]),
-            _ => {
-                let named: Vec<&T> =
-                    candidates.into_iter().filter(|l| name_of(l) == incoming_name).collect();
-                if named.len() == 1 { Some(named[0]) } else { None }
+// Matches in passes so an earlier look-alike can't take the local item a later one matches
+// outright: first by id, then the only free local on the same server with the same name, then
+// the only free local on the same server. The keys are (id, name); `same_server` also gets the
+// incoming id -> local id pairs matched so far.
+fn match_items<'a, L, I>(
+    locals: &'a [L],
+    incoming: &[I],
+    local_key: impl Fn(&L) -> (&str, &str),
+    incoming_key: impl Fn(&I) -> (&str, &str),
+    same_server: impl Fn(&L, &I, &HashMap<String, String>) -> bool,
+) -> (Vec<Option<&'a L>>, HashMap<String, String>) {
+    let mut found = vec![None; incoming.len()];
+    let mut taken = vec![false; locals.len()];
+    let mut map = HashMap::new();
+    for (slot, inc) in found.iter_mut().zip(incoming) {
+        let (id, _) = incoming_key(inc);
+        let at = (0..locals.len()).find(|&at| !taken[at] && local_key(&locals[at]).0 == id);
+        if let Some(at) = at {
+            taken[at] = true;
+            map.insert(id.to_string(), id.to_string());
+            *slot = Some(&locals[at]);
+        }
+    }
+    for by_name in [true, false] {
+        for (slot, inc) in found.iter_mut().zip(incoming) {
+            if slot.is_some() {
+                continue;
+            }
+            let (id, name) = incoming_key(inc);
+            let mut candidates = (0..locals.len()).filter(|&at| {
+                !taken[at]
+                    && same_server(&locals[at], inc, &map)
+                    && (!by_name || local_key(&locals[at]).1 == name)
+            });
+            if let (Some(at), None) = (candidates.next(), candidates.next()) {
+                taken[at] = true;
+                map.insert(id.to_string(), local_key(&locals[at]).0.to_string());
+                *slot = Some(&locals[at]);
             }
         }
-    });
-    if let Some(l) = found {
-        claimed.insert(id_of(l).to_string());
     }
-    found
+    (found, map)
 }
 
 fn push(fields: &mut Vec<FieldDiff>, field: &str, label: &str, local: String, incoming: String) {
@@ -310,7 +326,7 @@ impl Collector<'_> {
         });
     }
 
-    fn new(&mut self, key: String, kind: ItemKind, name: &str, notes: Vec<String>) {
+    fn added(&mut self, key: String, kind: ItemKind, name: &str, notes: Vec<String>) {
         self.items.push(ReviewItem {
             key,
             kind,
@@ -368,24 +384,22 @@ pub fn plan(local: &ProfileStore, payload: &Payload, env: &dyn Env) -> Plan {
 
     let mut groups: Vec<&Group> = payload.groups.iter().collect();
     groups.sort_by_key(|g| group_depth(g, &payload.groups));
-    let mut group_map: HashMap<String, String> = HashMap::new();
-    let mut claimed = HashSet::new();
-    for g in groups {
+    let (found, group_map) = match_items(
+        &local.groups,
+        &groups,
+        |l| (l.id.as_str(), l.name.as_str()),
+        |g| (g.id.as_str(), g.name.as_str()),
+        |l, g, map| {
+            let parent = g.parent_id.as_ref().map(|p| map.get(p).unwrap_or(p));
+            l.name == g.name && l.parent_id.as_ref() == parent
+        },
+    );
+    for (g, found) in groups.into_iter().zip(found) {
         let parent =
             g.parent_id.as_ref().map(|p| group_map.get(p).cloned().unwrap_or_else(|| p.clone()));
-        let found = find_match(
-            &local.groups,
-            &mut claimed,
-            |l| l.id.as_str(),
-            |l| l.name.as_str(),
-            |l| l.name == g.name && l.parent_id == parent,
-            &g.id,
-            &g.name,
-        );
         let key = ItemKind::Group.key(&g.id);
         match found {
             Some(l) => {
-                group_map.insert(g.id.clone(), l.id.clone());
                 let (mut fields, mut notes) = (vec![], vec![]);
                 push(&mut fields, "name", "Name", l.name.clone(), g.name.clone());
                 if l.parent_id != parent {
@@ -406,40 +420,38 @@ pub fn plan(local: &ProfileStore, payload: &Payload, env: &dyn Env) -> Plan {
                 icon_field(&l.icon, &g.icon, env, &mut fields, &mut notes);
                 c.matched(key, ItemKind::Group, &g.name, (&l.id, &l.name), fields, notes);
             }
-            None => c.new(key, ItemKind::Group, &g.name, vec![]),
+            None => c.added(key, ItemKind::Group, &g.name, vec![]),
         }
     }
 
-    let mut claimed = HashSet::new();
     let ssh: Vec<_> = payload
         .profiles
         .iter()
         .map(|p| {
             let mut p = p.clone();
             normalize_keys(&mut p);
-            let found = find_match(
-                &local.profiles,
-                &mut claimed,
-                |l| l.id.as_str(),
-                |l| l.name.as_str(),
-                |l| {
-                    l.host.eq_ignore_ascii_case(&p.host)
-                        && l.port == p.port
-                        && l.username == p.username
-                },
-                &p.id,
-                &p.name,
-            );
-            (p, found)
+            p
         })
         .collect();
-    let profile_map: HashMap<String, String> =
-        ssh.iter().filter_map(|(p, l)| l.map(|l| (p.id.clone(), l.id.clone()))).collect();
-    for (inc, found) in &ssh {
+    let (found, profile_map) = match_items(
+        &local.profiles,
+        &ssh,
+        |l| (l.id.as_str(), l.name.as_str()),
+        |p| (p.id.as_str(), p.name.as_str()),
+        |l, p, _| {
+            l.host.eq_ignore_ascii_case(&p.host) && l.port == p.port && l.username == p.username
+        },
+    );
+    for (inc, found) in ssh.iter().zip(found) {
         let key = ItemKind::Ssh.key(&inc.id);
         let (mut fields, mut notes) = (vec![], vec![]);
         let group = group_ref(inc.group_id.as_deref(), &group_map, payload, local, &mut notes);
+        // A jump host the import leaves alone is not a change, even if it points nowhere.
+        let same_jump = found.is_some_and(|l| l.jump_host_id == inc.jump_host_id);
         let jump = inc.jump_host_id.as_deref().and_then(|j| {
+            if same_jump {
+                return Some(j.to_string());
+            }
             if let Some(mapped) = profile_map.get(j) {
                 return Some(mapped.clone());
             }
@@ -532,27 +544,22 @@ pub fn plan(local: &ProfileStore, payload: &Payload, env: &dyn Env) -> Plan {
                         "The custom icon isn't on this machine; using the default icon".into(),
                     );
                 }
-                c.new(key, ItemKind::Ssh, &inc.name, notes);
+                c.added(key, ItemKind::Ssh, &inc.name, notes);
             }
         }
     }
 
-    let mut claimed = HashSet::new();
-    for inc in &payload.sftp_profiles {
+    let (found, _) = match_items(
+        &local.sftp_profiles,
+        &payload.sftp_profiles,
+        |l| (l.id.as_str(), l.name.as_str()),
+        |p| (p.id.as_str(), p.name.as_str()),
+        |l, p, _| {
+            l.host.eq_ignore_ascii_case(&p.host) && l.port == p.port && l.username == p.username
+        },
+    );
+    for (inc, found) in payload.sftp_profiles.iter().zip(found) {
         let key = ItemKind::Sftp.key(&inc.id);
-        let found = find_match(
-            &local.sftp_profiles,
-            &mut claimed,
-            |l| l.id.as_str(),
-            |l| l.name.as_str(),
-            |l| {
-                l.host.eq_ignore_ascii_case(&inc.host)
-                    && l.port == inc.port
-                    && l.username == inc.username
-            },
-            &inc.id,
-            &inc.name,
-        );
         let (mut fields, mut notes) = (vec![], vec![]);
         match found {
             Some(l) => {
@@ -588,28 +595,25 @@ pub fn plan(local: &ProfileStore, payload: &Payload, env: &dyn Env) -> Plan {
             }
             None => {
                 keys_field(None, &inc.keys, payload, env, &mut fields, &mut notes);
-                c.new(key, ItemKind::Sftp, &inc.name, notes);
+                c.added(key, ItemKind::Sftp, &inc.name, notes);
             }
         }
     }
 
-    let mut claimed = HashSet::new();
-    for inc in &payload.s3_profiles {
+    let (found, _) = match_items(
+        &local.s3_profiles,
+        &payload.s3_profiles,
+        |l| (l.id.as_str(), l.name.as_str()),
+        |p| (p.id.as_str(), p.name.as_str()),
+        |l, p, _| {
+            l.endpoint.eq_ignore_ascii_case(&p.endpoint)
+                && l.port == p.port
+                && l.bucket == p.bucket
+                && l.access_key_id == p.access_key_id
+        },
+    );
+    for (inc, found) in payload.s3_profiles.iter().zip(found) {
         let key = ItemKind::S3.key(&inc.id);
-        let found = find_match(
-            &local.s3_profiles,
-            &mut claimed,
-            |l| l.id.as_str(),
-            |l| l.name.as_str(),
-            |l| {
-                l.endpoint.eq_ignore_ascii_case(&inc.endpoint)
-                    && l.port == inc.port
-                    && l.bucket == inc.bucket
-                    && l.access_key_id == inc.access_key_id
-            },
-            &inc.id,
-            &inc.name,
-        );
         let (mut fields, mut notes) = (vec![], vec![]);
         match found {
             Some(l) => {
@@ -662,7 +666,7 @@ pub fn plan(local: &ProfileStore, payload: &Payload, env: &dyn Env) -> Plan {
                 );
                 c.matched(key, ItemKind::S3, &inc.name, (&l.id, &l.name), fields, notes);
             }
-            None => c.new(key, ItemKind::S3, &inc.name, notes),
+            None => c.added(key, ItemKind::S3, &inc.name, notes),
         }
     }
 
@@ -867,5 +871,67 @@ mod tests {
         mac.id = "mac".into();
         mac.tunnels = vec![t("t2")];
         assert!(plan(&local(vec![pc]), &incoming(vec![mac]), &MapEnv::default()).items.is_empty());
+    }
+
+    #[test]
+    fn id_match_is_not_lost_to_an_earlier_same_server_item() {
+        let l = local(vec![profile("x", "web", "h1")]);
+        let bundle = incoming(vec![profile("a", "web", "h1"), profile("x", "web", "h1")]);
+        let p = plan(&l, &bundle, &MapEnv::default());
+        assert_eq!(p.matches.get("ssh:x").map(String::as_str), Some("x"));
+        assert_eq!(p.items.len(), 1);
+        assert_eq!(p.items[0].key, "ssh:a");
+        assert_eq!(p.items[0].status, ItemStatus::New);
+        for item in p.items.iter().filter(|i| i.status == ItemStatus::New) {
+            assert!(l.profiles.iter().all(|lp| ItemKind::Ssh.key(&lp.id) != item.key));
+        }
+    }
+
+    #[test]
+    fn same_name_match_is_not_lost_to_an_earlier_same_server_item() {
+        let l = local(vec![profile("pc", "web", "h1")]);
+        let bundle = incoming(vec![profile("m1", "foo", "h1"), profile("m2", "web", "h1")]);
+        let p = plan(&l, &bundle, &MapEnv::default());
+        assert_eq!(p.matches.get("ssh:m2").map(String::as_str), Some("pc"));
+        assert_eq!(p.items.len(), 1);
+        assert_eq!(p.items[0].key, "ssh:m1");
+        assert_eq!(p.items[0].status, ItemStatus::New);
+    }
+
+    #[test]
+    fn nested_groups_match_through_the_mapped_parent() {
+        let group = |id: &str, name: &str, parent: Option<&str>| Group {
+            id: id.into(),
+            name: name.into(),
+            parent_id: parent.map(Into::into),
+            icon: IconRef::default(),
+            order: 0,
+        };
+        let mut l = local(vec![]);
+        l.groups = vec![group("pc-prod", "Prod", None), group("pc-web", "Web", Some("pc-prod"))];
+        let mut payload = incoming(vec![]);
+        payload.groups =
+            vec![group("mac-web", "Web", Some("mac-prod")), group("mac-prod", "Prod", None)];
+        let p = plan(&l, &payload, &MapEnv::default());
+        assert!(p.items.is_empty());
+        assert_eq!(p.unchanged, 2);
+        assert_eq!(p.matches.get("group:mac-prod").map(String::as_str), Some("pc-prod"));
+        assert_eq!(p.matches.get("group:mac-web").map(String::as_str), Some("pc-web"));
+    }
+
+    #[test]
+    fn untouched_dangling_jump_host_is_not_a_change() {
+        let mut pc = profile("pc", "web", "h1");
+        pc.jump_host_id = Some("gone".into());
+        let l = local(vec![pc.clone()]);
+        let p = plan(&l, &incoming(vec![pc.clone()]), &MapEnv::default());
+        assert!(p.items.is_empty());
+        assert_eq!(p.unchanged, 1);
+
+        pc.name = "web 2".into();
+        let p = plan(&l, &incoming(vec![pc]), &MapEnv::default());
+        let fields: Vec<_> = p.items[0].fields.iter().map(|f| f.field.as_str()).collect();
+        assert_eq!(fields, ["name"]);
+        assert!(p.items[0].notes.is_empty());
     }
 }

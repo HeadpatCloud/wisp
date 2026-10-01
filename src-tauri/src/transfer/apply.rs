@@ -730,8 +730,13 @@ pub fn remove_unreferenced_keys(keys_dir: &Path, data: &ProfileStore) {
         .collect();
     for entry in entries.flatten() {
         let name = entry.file_name();
+        // Only the `<uuid>-<name>` files `execute` writes are the app's to delete.
+        let app_made = name.to_str().is_some_and(|n| {
+            n.get(..36).is_some_and(|id| Uuid::parse_str(id).is_ok()) && n[36..].starts_with('-')
+        });
         // Case is ignored: on Windows and macOS a differently cased path is the same file.
-        if entry.file_type().is_ok_and(|t| t.is_file())
+        if app_made
+            && entry.file_type().is_ok_and(|t| t.is_file())
             && !used.iter().any(|u| u.eq_ignore_ascii_case(&name))
         {
             // Best-effort: a leftover key file must never fail the save or delete that got here.
@@ -1459,20 +1464,25 @@ mod tests {
     }
 
     #[test]
-    fn only_unreferenced_files_directly_in_the_keys_folder_are_removed() {
+    fn only_unreferenced_app_made_files_in_the_keys_folder_are_removed() {
         let dir = tempfile::tempdir().unwrap();
         let keys = dir.path().join("keys");
         remove_unreferenced_keys(&keys, &store_of(vec![]));
         assert!(!keys.exists());
 
         std::fs::create_dir_all(keys.join("sub")).unwrap();
-        let used = keys.join("1-id");
-        let used_by_sftp = keys.join("2-id");
-        let other_case = keys.join("3-id");
-        let unused = keys.join("4-id");
-        let nested = keys.join("sub").join("5-id");
-        let outside = dir.path().join("6-id");
-        for path in [&used, &used_by_sftp, &other_case, &unused, &nested, &outside] {
+        let name = |n: u8| format!("6f1c2a9e-8d0b-4c57-9a3e-2b7d5e41f0c{n}-id");
+        let used = keys.join(name(1));
+        let used_by_sftp = keys.join(name(2));
+        let other_case = keys.join(name(3));
+        let unused = keys.join(name(4));
+        let nested = keys.join("sub").join(name(5));
+        let outside = dir.path().join(name(6));
+        let own = keys.join("id_ed25519");
+        let not_a_uuid = keys.join("notauuid-id");
+        for path in
+            [&used, &used_by_sftp, &other_case, &unused, &nested, &outside, &own, &not_a_uuid]
+        {
             std::fs::write(path, b"K").unwrap();
         }
         let key = |path: &Path| ProfileKey {
@@ -1480,7 +1490,7 @@ mod tests {
             secret_id: None,
         };
         let mut web = profile("p", "web", "h1");
-        web.keys = vec![key(&used), key(&keys.join("3-ID"))];
+        web.keys = vec![key(&used), key(&keys.join(name(3).to_uppercase()))];
         let mut files = sftp("f", "files", "h1");
         files.keys = vec![key(&used_by_sftp)];
         let data = ProfileStore { sftp_profiles: vec![files], ..store_of(vec![web]) };
@@ -1489,6 +1499,7 @@ mod tests {
         assert!(used.is_file() && used_by_sftp.is_file() && other_case.is_file());
         assert!(!unused.exists());
         assert!(nested.is_file() && outside.is_file());
+        assert!(own.is_file() && not_a_uuid.is_file());
     }
 
     #[test]

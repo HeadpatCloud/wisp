@@ -10,14 +10,14 @@ use crate::store::model::{Group, Profile, S3Profile, SftpProfile};
 use crate::vault::crypto;
 use crate::vault::model::KdfParams;
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeyFile {
     pub file_name: String,
     pub data: Zeroizing<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Payload {
     #[serde(default)]
@@ -100,7 +100,9 @@ fn decode(field: Option<String>) -> AppResult<Vec<u8>> {
 pub fn read(bytes: &[u8], password: Option<&str>) -> AppResult<Opened> {
     let value: serde_json::Value = serde_json::from_slice(bytes)?;
     match value.get("version").and_then(|v| v.as_u64()) {
-        Some(1) => Ok(Opened::Payload(serde_json::from_value(value)?)),
+        Some(1) if value.get("groups").is_some() && value.get("profiles").is_some() => {
+            Ok(Opened::Payload(serde_json::from_value(value)?))
+        }
         Some(2) => {
             let envelope: Envelope = serde_json::from_value(value)?;
             if !envelope.encrypted {
@@ -111,13 +113,20 @@ pub fn read(bytes: &[u8], password: Option<&str>) -> AppResult<Opened> {
             let nonce: [u8; 24] = decode(envelope.nonce)?.try_into().map_err(|_| corrupt())?;
             let ciphertext = decode(envelope.ciphertext)?;
             let params = envelope.kdf.ok_or_else(corrupt)?;
+            // The file is untrusted and these are spent before the password can be checked.
+            if !(1..=16).contains(&params.t_cost)
+                || !(1..=16).contains(&params.p_cost)
+                || !(8 * params.p_cost..=1_048_576).contains(&params.m_cost)
+            {
+                return Err(corrupt());
+            }
             let key = crypto::derive_key(password.as_bytes(), &salt, Some(params.tuple()))?;
             let plain =
                 crypto::open(&key, &nonce, &ciphertext).map_err(|_| AppError::WrongPassphrase)?;
             Ok(Opened::Payload(serde_json::from_slice(&plain)?))
         }
+        Some(1) | None => Err(AppError::Import("this isn't a wisp export file".into())),
         Some(v) => Err(AppError::Import(format!("unsupported export version {v}"))),
-        None => Err(AppError::Import("this isn't a wisp export file".into())),
     }
 }
 
@@ -214,6 +223,18 @@ mod tests {
     fn unknown_version_and_foreign_json_are_import_errors() {
         assert!(matches!(read(br#"{"version":3}"#, None), Err(AppError::Import(_))));
         assert!(matches!(read(br#"{"hello":1}"#, None), Err(AppError::Import(_))));
+        assert!(matches!(read(br#"{"version":1,"hello":1}"#, None), Err(AppError::Import(_))));
         assert!(matches!(read(b"not json", None), Err(AppError::Serde(_))));
+    }
+
+    #[test]
+    fn out_of_range_kdf_params_are_import_errors() {
+        let bytes = write(&payload(), Some("pw")).unwrap();
+        for (field, cost) in [("mCost", u32::MAX), ("tCost", 0)] {
+            let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            value["kdf"][field] = cost.into();
+            let bytes = serde_json::to_vec(&value).unwrap();
+            assert!(matches!(read(&bytes, Some("pw")), Err(AppError::Import(_))));
+        }
     }
 }

@@ -81,11 +81,36 @@ export function wheelButtons(deltaX: number, deltaY: number): number {
   return mask
 }
 
+export class WheelSteps {
+  private x = 0
+  private y = 0
+
+  // One step is 50 pixels; a line counts as 19 pixels and a page as 800, as in noVNC.
+  push(deltaX: number, deltaY: number, deltaMode: number): number[] {
+    const scale = deltaMode === 1 ? 19 : deltaMode === 2 ? 800 : 1
+    const stepsY = this.take('y', deltaY * scale)
+    const stepsX = this.take('x', deltaX * scale)
+    return [
+      ...Array<number>(Math.min(Math.abs(stepsY), 10)).fill(wheelButtons(0, stepsY)),
+      ...Array<number>(Math.min(Math.abs(stepsX), 10)).fill(wheelButtons(stepsX, 0)),
+    ]
+  }
+
+  private take(axis: 'x' | 'y', delta: number): number {
+    const total = (this[axis] * delta < 0 ? 0 : this[axis]) + delta
+    this[axis] = total % 50
+    return Math.trunc(total / 50)
+  }
+}
+
 export class HeldKeys {
   private held = new Map<string, number>()
 
-  press(code: string, keysym: number): void {
-    if (!this.held.has(code)) this.held.set(code, keysym)
+  press(code: string, keysym: number): number {
+    const held = this.held.get(code)
+    if (held !== undefined) return held
+    this.held.set(code, keysym)
+    return keysym
   }
 
   release(code: string): number | null {
@@ -99,5 +124,73 @@ export class HeldKeys {
     const keysyms = [...this.held.values()]
     this.held.clear()
     return keysyms
+  }
+}
+
+export type Platform = 'windows' | 'mac' | 'other'
+
+export function detectPlatform(userAgent: string): Platform {
+  if (userAgent.includes('Windows')) return 'windows'
+  if (userAgent.includes('Mac')) return 'mac'
+  return 'other'
+}
+
+export class RemoteKeyboard {
+  private held = new HeldKeys()
+  private pendingControl: { keysym: number; timer: ReturnType<typeof setTimeout> } | null = null
+
+  constructor(
+    private send: (down: boolean, keysym: number) => void,
+    private platform: Platform,
+  ) {}
+
+  keydown(e: { code: string; key: string }): boolean {
+    if (this.pendingControl) {
+      if (e.code === 'ControlLeft') return true
+      if (e.code === 'AltRight' && e.key === 'AltGraph') this.cancelControl()
+      else this.flushControl()
+    }
+    const keysym = keysymFor(e)
+    if (keysym === null) return false
+    if (e.code === '' || e.code === 'Unidentified') {
+      this.send(true, keysym)
+      this.send(false, keysym)
+    } else if (this.platform === 'windows' && e.code === 'ControlLeft') {
+      // Windows reports AltGr as ControlLeft then AltRight, so Control waits for the next event.
+      const timer = setTimeout(() => this.flushControl(), 100)
+      this.pendingControl = { keysym, timer }
+    } else {
+      this.send(true, this.held.press(e.code, keysym))
+    }
+    return true
+  }
+
+  keyup(e: { code: string; key: string }): boolean {
+    this.flushControl()
+    const keysym = this.held.release(e.code)
+    // macOS delivers no keyup for the other keys while Meta is held.
+    if (this.platform === 'mac' && (e.code === 'MetaLeft' || e.code === 'MetaRight')) {
+      this.releaseAll()
+    }
+    if (keysym === null) return keysymFor(e) !== null
+    this.send(false, keysym)
+    return true
+  }
+
+  releaseAll(): void {
+    this.cancelControl()
+    for (const keysym of this.held.releaseAll()) this.send(false, keysym)
+  }
+
+  private cancelControl(): void {
+    clearTimeout(this.pendingControl?.timer)
+    this.pendingControl = null
+  }
+
+  private flushControl(): void {
+    const pending = this.pendingControl
+    if (!pending) return
+    this.cancelControl()
+    this.send(true, this.held.press('ControlLeft', pending.keysym))
   }
 }

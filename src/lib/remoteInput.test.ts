@@ -1,5 +1,13 @@
-import { describe, expect, it } from 'vitest'
-import { HeldKeys, keysymFor, wheelButtons } from './remoteInput'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import {
+  detectPlatform,
+  HeldKeys,
+  keysymFor,
+  type Platform,
+  RemoteKeyboard,
+  WheelSteps,
+  wheelButtons,
+} from './remoteInput'
 
 describe('keysymFor', () => {
   it.each([
@@ -167,9 +175,10 @@ describe('HeldKeys', () => {
 
   it('keeps the first keysym on auto-repeat', () => {
     const held = new HeldKeys()
-    held.press('KeyA', 0x41)
-    held.press('KeyA', 0x61)
+    expect(held.press('KeyA', 0x41)).toBe(0x41)
+    expect(held.press('KeyA', 0x61)).toBe(0x41)
     expect(held.release('KeyA')).toBe(0x41)
+    expect(held.press('KeyA', 0x61)).toBe(0x61)
   })
 
   it('returns null for a code that is not held', () => {
@@ -212,5 +221,336 @@ describe('wheelButtons', () => {
     [100, 0, 64],
   ])('maps deltaX %d, deltaY %d to %d', (deltaX, deltaY, mask) => {
     expect(wheelButtons(deltaX, deltaY)).toBe(mask)
+  })
+})
+
+describe('detectPlatform', () => {
+  it.each([
+    [
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0',
+      'windows',
+    ],
+    [
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)',
+      'mac',
+    ],
+    [
+      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+      'other',
+    ],
+  ])('reads %s as %s', (userAgent, platform) => {
+    expect(detectPlatform(userAgent)).toBe(platform)
+  })
+})
+
+describe('RemoteKeyboard', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  function keyboard(platform: Platform) {
+    const sent: [boolean, number][] = []
+    const kb = new RemoteKeyboard((down, keysym) => {
+      sent.push([down, keysym])
+    }, platform)
+    return { kb, sent }
+  }
+
+  it('resends the first keysym on auto-repeat', () => {
+    const { kb, sent } = keyboard('other')
+    expect(kb.keydown({ code: 'KeyE', key: 'e' })).toBe(true)
+    expect(kb.keydown({ code: 'KeyE', key: '€' })).toBe(true)
+    expect(kb.keyup({ code: 'KeyE', key: '€' })).toBe(true)
+    expect(sent).toEqual([
+      [true, 0x65],
+      [true, 0x65],
+      [false, 0x65],
+    ])
+    kb.releaseAll()
+    expect(sent).toHaveLength(3)
+  })
+
+  it('leaves a key without a keysym to the caller', () => {
+    const { kb, sent } = keyboard('other')
+    expect(kb.keydown({ code: 'BracketLeft', key: 'Dead' })).toBe(false)
+    expect(kb.keyup({ code: 'BracketLeft', key: 'Dead' })).toBe(false)
+    expect(sent).toEqual([])
+  })
+
+  it('consumes the keyup of a key that is not held without sending', () => {
+    const { kb, sent } = keyboard('other')
+    expect(kb.keyup({ code: 'KeyA', key: 'a' })).toBe(true)
+    expect(sent).toEqual([])
+  })
+
+  it('releases a held key whose keyup no longer maps', () => {
+    const { kb, sent } = keyboard('other')
+    kb.keydown({ code: 'KeyE', key: 'e' })
+    expect(kb.keyup({ code: 'KeyE', key: 'Dead' })).toBe(true)
+    expect(sent).toEqual([
+      [true, 0x65],
+      [false, 0x65],
+    ])
+  })
+
+  it.each(['', 'Unidentified'])('clicks keys with code %j at once and never holds them', (code) => {
+    const { kb, sent } = keyboard('other')
+    expect(kb.keydown({ code, key: 'a' })).toBe(true)
+    expect(kb.keydown({ code, key: 'b' })).toBe(true)
+    expect(sent).toEqual([
+      [true, 0x61],
+      [false, 0x61],
+      [true, 0x62],
+      [false, 0x62],
+    ])
+    expect(kb.keyup({ code, key: 'a' })).toBe(true)
+    expect(kb.keyup({ code, key: 'b' })).toBe(true)
+    kb.releaseAll()
+    expect(sent).toHaveLength(4)
+  })
+
+  it('sends AltGr on Windows without the Control that announces it', () => {
+    const { kb, sent } = keyboard('windows')
+    expect(kb.keydown({ code: 'ControlLeft', key: 'Control' })).toBe(true)
+    expect(kb.keydown({ code: 'AltRight', key: 'AltGraph' })).toBe(true)
+    kb.keydown({ code: 'KeyQ', key: '@' })
+    kb.keyup({ code: 'KeyQ', key: '@' })
+    expect(kb.keyup({ code: 'AltRight', key: 'AltGraph' })).toBe(true)
+    expect(kb.keyup({ code: 'ControlLeft', key: 'Control' })).toBe(true)
+    vi.advanceTimersByTime(100)
+    expect(sent).toEqual([
+      [true, 0xfe03],
+      [true, 0x40],
+      [false, 0x40],
+      [false, 0xfe03],
+    ])
+  })
+
+  it('keeps Control out of a repeating AltGr on Windows', () => {
+    const { kb, sent } = keyboard('windows')
+    kb.keydown({ code: 'ControlLeft', key: 'Control' })
+    kb.keydown({ code: 'AltRight', key: 'AltGraph' })
+    kb.keydown({ code: 'ControlLeft', key: 'Control' })
+    kb.keydown({ code: 'AltRight', key: 'AltGraph' })
+    kb.keyup({ code: 'ControlLeft', key: 'Control' })
+    kb.keyup({ code: 'AltRight', key: 'AltGraph' })
+    vi.advanceTimersByTime(100)
+    expect(sent).toEqual([
+      [true, 0xfe03],
+      [true, 0xfe03],
+      [false, 0xfe03],
+    ])
+  })
+
+  it('sends a pending Control before the next key on Windows', () => {
+    const { kb, sent } = keyboard('windows')
+    kb.keydown({ code: 'ControlLeft', key: 'Control' })
+    expect(sent).toEqual([])
+    kb.keydown({ code: 'KeyC', key: 'c' })
+    expect(sent).toEqual([
+      [true, 0xffe3],
+      [true, 0x63],
+    ])
+    kb.keyup({ code: 'KeyC', key: 'c' })
+    kb.keyup({ code: 'ControlLeft', key: 'Control' })
+    vi.advanceTimersByTime(100)
+    expect(sent).toEqual([
+      [true, 0xffe3],
+      [true, 0x63],
+      [false, 0x63],
+      [false, 0xffe3],
+    ])
+  })
+
+  it('sends a lone Control on Windows after 100 ms', () => {
+    const { kb, sent } = keyboard('windows')
+    kb.keydown({ code: 'ControlLeft', key: 'Control' })
+    vi.advanceTimersByTime(99)
+    expect(sent).toEqual([])
+    vi.advanceTimersByTime(1)
+    expect(sent).toEqual([[true, 0xffe3]])
+    kb.keyup({ code: 'ControlLeft', key: 'Control' })
+    expect(sent).toEqual([
+      [true, 0xffe3],
+      [false, 0xffe3],
+    ])
+  })
+
+  it('sends Control down and up when it is released before the timer', () => {
+    const { kb, sent } = keyboard('windows')
+    kb.keydown({ code: 'ControlLeft', key: 'Control' })
+    kb.keyup({ code: 'ControlLeft', key: 'Control' })
+    vi.advanceTimersByTime(100)
+    expect(sent).toEqual([
+      [true, 0xffe3],
+      [false, 0xffe3],
+    ])
+  })
+
+  it('keeps a repeating Control pending until the first timer fires', () => {
+    const { kb, sent } = keyboard('windows')
+    kb.keydown({ code: 'ControlLeft', key: 'Control' })
+    vi.advanceTimersByTime(60)
+    expect(kb.keydown({ code: 'ControlLeft', key: 'Control' })).toBe(true)
+    expect(sent).toEqual([])
+    vi.advanceTimersByTime(40)
+    expect(sent).toEqual([[true, 0xffe3]])
+  })
+
+  it('sends a pending Control before a key without a keysym', () => {
+    const { kb, sent } = keyboard('windows')
+    kb.keydown({ code: 'ControlLeft', key: 'Control' })
+    expect(kb.keydown({ code: 'BracketLeft', key: 'Dead' })).toBe(false)
+    expect(sent).toEqual([[true, 0xffe3]])
+  })
+
+  it('sends a pending Control before the keyup of another key', () => {
+    const { kb, sent } = keyboard('windows')
+    kb.keydown({ code: 'KeyA', key: 'a' })
+    kb.keydown({ code: 'ControlLeft', key: 'Control' })
+    kb.keyup({ code: 'KeyA', key: 'a' })
+    expect(sent).toEqual([
+      [true, 0x61],
+      [true, 0xffe3],
+      [false, 0x61],
+    ])
+  })
+
+  it.each([
+    ['windows', 'ControlRight', 0xffe4],
+    ['other', 'ControlLeft', 0xffe3],
+    ['mac', 'ControlLeft', 0xffe3],
+  ] as const)('sends %s %s at once', (platform, code, keysym) => {
+    const { kb, sent } = keyboard(platform)
+    kb.keydown({ code, key: 'Control' })
+    expect(sent).toEqual([[true, keysym]])
+  })
+
+  it('releaseAll drops a pending Control without sending it', () => {
+    const { kb, sent } = keyboard('windows')
+    kb.keydown({ code: 'KeyA', key: 'a' })
+    kb.keydown({ code: 'ControlLeft', key: 'Control' })
+    kb.releaseAll()
+    vi.advanceTimersByTime(100)
+    kb.keyup({ code: 'ControlLeft', key: 'Control' })
+    expect(sent).toEqual([
+      [true, 0x61],
+      [false, 0x61],
+    ])
+  })
+
+  it('releaseAll sends an up for every held key and leaves nothing held', () => {
+    const { kb, sent } = keyboard('other')
+    kb.keydown({ code: 'ShiftLeft', key: 'Shift' })
+    kb.keydown({ code: 'KeyA', key: 'A' })
+    kb.keydown({ code: 'KeyA', key: 'A' })
+    kb.releaseAll()
+    expect(sent.slice(3)).toEqual([
+      [false, 0xffe1],
+      [false, 0x41],
+    ])
+    kb.releaseAll()
+    kb.keyup({ code: 'KeyA', key: 'A' })
+    kb.keyup({ code: 'ShiftLeft', key: 'Shift' })
+    expect(sent).toHaveLength(5)
+  })
+
+  it.each([
+    ['MetaLeft', 0xffeb],
+    ['MetaRight', 0xffec],
+  ])('releases every other key before %s on macOS', (code, meta) => {
+    const { kb, sent } = keyboard('mac')
+    kb.keydown({ code, key: 'Meta' })
+    kb.keydown({ code: 'KeyC', key: 'c' })
+    expect(kb.keyup({ code, key: 'Meta' })).toBe(true)
+    expect(sent).toEqual([
+      [true, meta],
+      [true, 0x63],
+      [false, 0x63],
+      [false, meta],
+    ])
+    kb.keydown({ code: 'KeyC', key: 'C' })
+    expect(sent.slice(4)).toEqual([[true, 0x43]])
+  })
+
+  it.each(['windows', 'other'] as const)(
+    'keeps other keys held when Meta is released on %s',
+    (platform) => {
+      const { kb, sent } = keyboard(platform)
+      kb.keydown({ code: 'MetaLeft', key: 'Meta' })
+      kb.keydown({ code: 'KeyC', key: 'c' })
+      kb.keyup({ code: 'MetaLeft', key: 'Meta' })
+      kb.keyup({ code: 'KeyC', key: 'c' })
+      expect(sent).toEqual([
+        [true, 0xffeb],
+        [true, 0x63],
+        [false, 0xffeb],
+        [false, 0x63],
+      ])
+    },
+  )
+})
+
+describe('WheelSteps', () => {
+  it('turns a mouse notch into two clicks', () => {
+    expect(new WheelSteps().push(0, 100, 0)).toEqual([16, 16])
+    expect(new WheelSteps().push(0, -100, 0)).toEqual([8, 8])
+    expect(new WheelSteps().push(120, 0, 0)).toEqual([64, 64])
+    expect(new WheelSteps().push(-120, 0, 0)).toEqual([32, 32])
+  })
+
+  it('clicks once per 50 pixels of small deltas', () => {
+    const wheel = new WheelSteps()
+    for (let i = 0; i < 9; i++) expect(wheel.push(0, 5, 0)).toEqual([])
+    expect(wheel.push(0, 5, 0)).toEqual([16])
+    for (let i = 0; i < 9; i++) expect(wheel.push(0, 5, 0)).toEqual([])
+    expect(wheel.push(0, 5, 0)).toEqual([16])
+  })
+
+  it('ignores a stray sub-step delta', () => {
+    expect(new WheelSteps().push(0.25, 3, 0)).toEqual([])
+  })
+
+  it('keeps the remainder of a step', () => {
+    const wheel = new WheelSteps()
+    expect(wheel.push(0, 70, 0)).toEqual([16])
+    expect(wheel.push(0, 29, 0)).toEqual([])
+    expect(wheel.push(0, 1, 0)).toEqual([16])
+  })
+
+  it('counts lines as 19 pixels and pages as 800', () => {
+    const lines = new WheelSteps()
+    expect(lines.push(0, 3, 1)).toEqual([16])
+    expect(lines.push(0, 2, 1)).toEqual([])
+    expect(lines.push(0, 5, 0)).toEqual([16])
+    const pages = new WheelSteps()
+    expect(pages.push(0, 0.0625, 2)).toEqual([16])
+    expect(pages.push(0, 49.95, 0)).toEqual([])
+    expect(new WheelSteps().push(0, -0.125, 2)).toEqual([8, 8])
+  })
+
+  it('discards the remainder when the direction changes', () => {
+    const wheel = new WheelSteps()
+    expect(wheel.push(0, 40, 0)).toEqual([])
+    expect(wheel.push(0, -40, 0)).toEqual([])
+    expect(wheel.push(0, -10, 0)).toEqual([8])
+  })
+
+  it('accumulates each axis on its own', () => {
+    const wheel = new WheelSteps()
+    expect(wheel.push(30, 0, 0)).toEqual([])
+    expect(wheel.push(0, 30, 0)).toEqual([])
+    expect(wheel.push(30, 30, 0)).toEqual([16, 64])
+  })
+
+  it('yields at most 10 steps per axis and drops the rest', () => {
+    const wheel = new WheelSteps()
+    expect(wheel.push(-5020, 5020, 0)).toEqual([...Array(10).fill(16), ...Array(10).fill(32)])
+    expect(wheel.push(0, 29, 0)).toEqual([])
+    expect(wheel.push(0, 1, 0)).toEqual([16])
   })
 })

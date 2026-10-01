@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
@@ -97,16 +97,30 @@ fn decode(field: Option<String>) -> AppResult<Vec<u8>> {
     STANDARD.decode(field.ok_or_else(corrupt)?).map_err(|_| corrupt())
 }
 
+// A repeated id within a kind would be imported as two items sharing that id.
+fn checked(payload: Payload) -> AppResult<Opened> {
+    let unique = |ids: Vec<&String>| ids.iter().collect::<HashSet<_>>().len() == ids.len();
+    if unique(payload.groups.iter().map(|g| &g.id).collect())
+        && unique(payload.profiles.iter().map(|p| &p.id).collect())
+        && unique(payload.sftp_profiles.iter().map(|p| &p.id).collect())
+        && unique(payload.s3_profiles.iter().map(|p| &p.id).collect())
+    {
+        Ok(Opened::Payload(payload))
+    } else {
+        Err(corrupt())
+    }
+}
+
 pub fn read(bytes: &[u8], password: Option<&str>) -> AppResult<Opened> {
     let value: serde_json::Value = serde_json::from_slice(bytes)?;
     match value.get("version").and_then(|v| v.as_u64()) {
         Some(1) if value.get("groups").is_some() && value.get("profiles").is_some() => {
-            Ok(Opened::Payload(serde_json::from_value(value)?))
+            checked(serde_json::from_value(value)?)
         }
         Some(2) => {
             let envelope: Envelope = serde_json::from_value(value)?;
             if !envelope.encrypted {
-                return envelope.payload.map(Opened::Payload).ok_or_else(corrupt);
+                return checked(envelope.payload.ok_or_else(corrupt)?);
             }
             let Some(password) = password else { return Ok(Opened::NeedsPassword) };
             let salt: [u8; 16] = decode(envelope.salt)?.try_into().map_err(|_| corrupt())?;
@@ -123,7 +137,7 @@ pub fn read(bytes: &[u8], password: Option<&str>) -> AppResult<Opened> {
             let key = crypto::derive_key(password.as_bytes(), &salt, Some(params.tuple()))?;
             let plain =
                 crypto::open(&key, &nonce, &ciphertext).map_err(|_| AppError::WrongPassphrase)?;
-            Ok(Opened::Payload(serde_json::from_slice(&plain)?))
+            checked(serde_json::from_slice(&plain)?)
         }
         Some(1) | None => Err(AppError::Import("this isn't a wisp export file".into())),
         Some(v) => Err(AppError::Import(format!("unsupported export version {v}"))),
@@ -235,6 +249,41 @@ mod tests {
             value["kdf"][field] = cost.into();
             let bytes = serde_json::to_vec(&value).unwrap();
             assert!(matches!(read(&bytes, Some("pw")), Err(AppError::Import(_))));
+        }
+    }
+
+    #[test]
+    fn repeated_ids_within_a_kind_are_import_errors() {
+        let group = Group {
+            id: "g1".into(),
+            name: "lab".into(),
+            parent_id: None,
+            icon: IconRef::default(),
+            order: 0,
+        };
+        let groups = Payload { groups: vec![group.clone(), group], ..Default::default() };
+        let profiles =
+            Payload { profiles: vec![profile("p1"), profile("p1")], ..Default::default() };
+        for (payload, password) in [(&groups, None), (&profiles, None), (&profiles, Some("pw"))] {
+            let bytes = write(payload, password).unwrap();
+            assert!(matches!(read(&bytes, password), Err(AppError::Import(_))));
+        }
+
+        let sftp = serde_json::json!({
+            "id": "f1", "name": "files", "host": "h", "port": 22, "username": "u",
+            "authMethod": "agent", "secretId": null, "order": 0
+        });
+        let s3 = serde_json::json!({
+            "id": "s1", "name": "backups", "endpoint": "s3.example.com", "port": null,
+            "region": "us-east-1", "useTls": true, "pathStyle": false, "accessKeyId": "AK",
+            "secretId": null, "bucket": null, "order": 0
+        });
+        for (kind, item) in [("sftpProfiles", sftp), ("s3Profiles", s3)] {
+            let mut v1 = serde_json::json!({ "version": 1, "groups": [], "profiles": [] });
+            v1[kind] = serde_json::json!([item]);
+            assert!(matches!(read(v1.to_string().as_bytes(), None), Ok(Opened::Payload(_))));
+            v1[kind] = serde_json::json!([item.clone(), item]);
+            assert!(matches!(read(v1.to_string().as_bytes(), None), Err(AppError::Import(_))));
         }
     }
 }

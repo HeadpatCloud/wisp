@@ -158,7 +158,11 @@ impl Vault {
             id.clone(),
             SealedSecret { nonce: STANDARD.encode(nonce), ciphertext: STANDARD.encode(ciphertext) },
         );
-        self.persist()?;
+        // Otherwise a later successful write would flush a secret the caller has no id for.
+        if let Err(e) = self.persist() {
+            self.file.secrets.remove(&id);
+            return Err(e);
+        }
         Ok(id)
     }
 
@@ -249,6 +253,16 @@ mod tests {
         assert_eq!(v.get_secret(&id).unwrap().as_slice(), b"s3cr3t");
         v.delete_secret(&id).unwrap();
         assert!(!v.has_secret(&id));
+    }
+
+    #[test]
+    fn set_secret_that_cannot_persist_leaves_nothing_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = test_vault(dir.path());
+        // A directory where the vault file should be makes the final rename fail.
+        std::fs::create_dir(dir.path().join("vault.enc")).unwrap();
+        assert!(v.set_secret(b"s3cr3t").is_err());
+        assert!(v.file.secrets.is_empty());
     }
 
     #[test]

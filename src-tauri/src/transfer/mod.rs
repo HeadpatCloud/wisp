@@ -58,12 +58,14 @@ impl Env for LocalEnv<'_> {
     }
 }
 
-// True for Windows paths that leave the local drives: UNC shares, verbatim and device paths.
+// True for Windows paths that leave the local drives: UNC shares, verbatim and device paths, and
+// the NT `\??\` form, which parses as a plain rooted path but the OS still resolves.
 pub(crate) fn is_network_path(path: &str) -> bool {
-    matches!(
-        Path::new(path).components().next(),
-        Some(Component::Prefix(p)) if !matches!(p.kind(), Prefix::Disk(_))
-    )
+    path.starts_with(r"\??\")
+        || matches!(
+            Path::new(path).components().next(),
+            Some(Component::Prefix(p)) if !matches!(p.kind(), Prefix::Disk(_))
+        )
 }
 
 #[cfg(test)]

@@ -67,7 +67,7 @@ impl<'a> Stager<'a> {
             ItemKind::S3 => self.data.s3_profiles.iter().any(|p| p.id == id),
         };
         match self.plan.matches.get(&key) {
-            Some(local) if !as_new => Some(local.clone()),
+            Some(local) if !(accept && as_new) => Some(local.clone()),
             _ if accept => {
                 Some(if as_new || taken { Uuid::new_v4().to_string() } else { id.to_string() })
             }
@@ -136,8 +136,11 @@ impl<'a> Stager<'a> {
         for k in incoming {
             let embedded = self.payload.key_files.get(&k.path).cloned();
             // A key path on a network share is never stored: opening it at connect time would
-            // send the user's credentials to whatever server the bundle named.
-            if embedded.is_none() && super::is_network_path(&k.path) {
+            // send the user's credentials to whatever server the bundle named. Nor is a path
+            // spelled like a placeholder, which would alias another item's embedded key file.
+            if embedded.is_none()
+                && (super::is_network_path(&k.path) || k.path.starts_with(KEY_PREFIX))
+            {
                 continue;
             }
             let content = match &embedded {
@@ -649,8 +652,9 @@ pub fn execute(
                     .map_err(|_| AppError::Import("a key file in the export is corrupt".into()))?,
             );
             let path = keys_dir.join(format!("{}-{}", Uuid::new_v4(), safe_name(&f.file_name)));
-            write_private(&path, &bytes)?;
+            // Recorded first so a write that fails midway is still removed by the rollback.
             written.push(path.clone());
+            write_private(&path, &bytes)?;
             key_paths.push(path.to_string_lossy().into_owned());
         }
         for value in &secrets {
@@ -711,6 +715,16 @@ mod tests {
             profiles,
             sftp_profiles: vec![],
             s3_profiles: vec![],
+        }
+    }
+
+    fn group(id: &str, name: &str, parent: Option<&str>) -> Group {
+        Group {
+            id: id.into(),
+            name: name.into(),
+            parent_id: parent.map(Into::into),
+            icon: IconRef::default(),
+            order: 0,
         }
     }
 
@@ -811,7 +825,13 @@ mod tests {
     #[test]
     fn network_key_paths_are_never_stored() {
         let mut inc = profile("n", "new", "h9");
-        inc.keys = vec![ProfileKey { path: "\\\\evil\\share\\id".into(), secret_id: None }];
+        inc.keys = [
+            "\\\\evil\\share\\id",
+            "\\??\\UNC\\evil\\share\\id",
+            "\\??\\GLOBALROOT\\Device\\Mup\\evil\\share\\id",
+        ]
+        .map(|path| ProfileKey { path: path.into(), secret_id: None })
+        .into();
         let payload = Payload { profiles: vec![inc.clone()], ..Default::default() };
         let staged = run(&store_of(vec![]), &payload, &[accept("ssh:n", &[])]).unwrap();
         assert!(staged.data.profiles[0].keys.is_empty());
@@ -820,6 +840,16 @@ mod tests {
         let payload = Payload { profiles: vec![inc], ..Default::default() };
         let problems = run(&store_of(vec![]), &payload, &[accept("ssh:n", &[])]).err().unwrap();
         assert!(problems[0].message.contains("private key"));
+    }
+
+    #[test]
+    fn placeholder_key_paths_are_never_stored() {
+        let mut inc = profile("n", "new", "h9");
+        inc.keys = vec![ProfileKey { path: format!("{KEY_PREFIX}0"), secret_id: None }];
+        let payload = Payload { profiles: vec![inc], ..Default::default() };
+        let staged = run(&store_of(vec![]), &payload, &[accept("ssh:n", &[])]).unwrap();
+        assert!(staged.data.profiles[0].keys.is_empty());
+        assert!(staged.key_files.is_empty());
     }
 
     #[test]
@@ -872,6 +902,22 @@ mod tests {
     }
 
     #[test]
+    fn matched_group_declined_as_new_keeps_its_local_id() {
+        let local = ProfileStore { groups: vec![group("g-pc", "Lab", None)], ..store_of(vec![]) };
+        let mut inc = profile("n", "new", "h9");
+        inc.group_id = Some("g-mac".into());
+        let payload = Payload {
+            groups: vec![group("g-mac", "Lab", None)],
+            profiles: vec![inc],
+            ..Default::default()
+        };
+        let declined =
+            ItemDecision { key: "group:g-mac".into(), accept: false, as_new: true, fields: vec![] };
+        let staged = run(&local, &payload, &[declined, accept("ssh:n", &[])]).unwrap();
+        assert_eq!(staged.data.profiles[0].group_id.as_deref(), Some("g-pc"));
+    }
+
+    #[test]
     fn declined_new_jump_host_blocks_its_user() {
         let mut web = profile("w", "web", "h1");
         web.jump_host_id = Some("b".into());
@@ -888,6 +934,32 @@ mod tests {
         let payload = Payload { profiles: vec![inc], ..Default::default() };
         let staged = run(&store_of(vec![]), &payload, &[accept("ssh:n", &[])]).unwrap();
         assert_eq!(staged.data.profiles[0].group_id, None);
+    }
+
+    #[test]
+    fn jump_host_loop_is_a_problem() {
+        let a = profile("a", "a", "ha");
+        let mut b = profile("b", "b", "hb");
+        b.jump_host_id = Some("a".into());
+        let mut inc = a.clone();
+        inc.jump_host_id = Some("b".into());
+        let payload = Payload { profiles: vec![inc], ..Default::default() };
+        let problems = run(&store_of(vec![a, b]), &payload, &[accept("ssh:a", &["jumpHostId"])])
+            .err()
+            .unwrap();
+        assert!(problems[0].message.contains("jump hosts would form a loop"));
+    }
+
+    #[test]
+    fn parent_group_loop_is_a_problem() {
+        let local = ProfileStore {
+            groups: vec![group("g1", "one", None), group("g2", "two", Some("g1"))],
+            ..store_of(vec![])
+        };
+        let payload =
+            Payload { groups: vec![group("g1", "one", Some("g2"))], ..Default::default() };
+        let problems = run(&local, &payload, &[accept("group:g1", &["parentId"])]).err().unwrap();
+        assert!(problems[0].message.contains("parent groups would form a loop"));
     }
 
     fn vault(dir: &std::path::Path) -> Vault {
@@ -945,5 +1017,79 @@ mod tests {
             .and_then(|v| v["secrets"].as_object().map(|o| o.len()))
             .unwrap_or(0);
         assert_eq!(secrets, 0);
+    }
+
+    #[test]
+    fn corrupt_key_file_rolls_back_the_one_already_written() {
+        let mut inc = profile("n", "new", "h9");
+        inc.keys = vec![
+            ProfileKey { path: "/a".into(), secret_id: None },
+            ProfileKey { path: "/b".into(), secret_id: None },
+        ];
+        let mut payload = Payload { profiles: vec![inc], ..Default::default() };
+        let good = KeyFile { file_name: "a".into(), data: Zeroizing::new(STANDARD.encode(b"K")) };
+        let bad = KeyFile { file_name: "b".into(), data: Zeroizing::new("not base64!".into()) };
+        payload.key_files.insert("/a".into(), good);
+        payload.key_files.insert("/b".into(), bad);
+        let staged = run(&store_of(vec![]), &payload, &[accept("ssh:n", &[])]).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        let mut v = vault(dir.path());
+        let keys_dir = dir.path().join("keys");
+        let result = execute(&mut store, &mut v, &keys_dir, staged);
+        assert!(matches!(result, Err(AppError::Import(_))));
+        assert_eq!(std::fs::read_dir(&keys_dir).unwrap().count(), 0);
+        assert!(store.profiles().is_empty());
+    }
+
+    #[test]
+    fn locked_vault_rolls_back_key_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        let mut v = Vault::open_locked(dir.path().join("vault.enc")).unwrap();
+        let keys_dir = dir.path().join("keys");
+        let result = execute(&mut store, &mut v, &keys_dir, staged_with_secret_and_key());
+        assert!(matches!(result, Err(AppError::Vault(_))));
+        assert_eq!(std::fs::read_dir(&keys_dir).unwrap().count(), 0);
+        assert!(store.profiles().is_empty());
+    }
+
+    // A stored profile whose password is in the vault, and an import that replaces that password.
+    fn password_replacement(dir: &std::path::Path) -> (Store, Vault, String, Staged) {
+        let mut store = Store::load(dir.to_path_buf()).unwrap();
+        let mut v = vault(dir);
+        let old = v.set_secret(b"old").unwrap();
+        let mut pc = profile("pc", "web", "h1");
+        pc.secret_id = Some(old.clone());
+        store.commit(store_of(vec![pc.clone()])).unwrap();
+        let mut mac = pc;
+        mac.id = "mac".into();
+        mac.secret_id = Some("mac-pw".into());
+        let mut payload = Payload { profiles: vec![mac], ..Default::default() };
+        payload.secrets.insert("mac-pw".into(), Zeroizing::new("new".into()));
+        let staged = run(&store.snapshot(), &payload, &[accept("ssh:mac", &["password"])]).unwrap();
+        (store, v, old, staged)
+    }
+
+    #[test]
+    fn replaced_password_is_deleted_after_the_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, mut v, old, staged) = password_replacement(dir.path());
+        execute(&mut store, &mut v, &dir.path().join("keys"), staged).unwrap();
+        let p = &store.profiles()[0];
+        assert_eq!(v.get_secret(p.secret_id.as_deref().unwrap()).unwrap().as_slice(), b"new");
+        assert!(!v.has_secret(&old));
+    }
+
+    #[test]
+    fn failed_commit_keeps_the_replaced_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, mut v, old, staged) = password_replacement(dir.path());
+        // A directory where the temp file should be makes the store write fail.
+        std::fs::create_dir(dir.path().join("profiles.json.tmp")).unwrap();
+        assert!(execute(&mut store, &mut v, &dir.path().join("keys"), staged).is_err());
+        assert_eq!(store.profiles()[0].secret_id.as_deref(), Some(old.as_str()));
+        assert_eq!(v.get_secret(&old).unwrap().as_slice(), b"old");
     }
 }

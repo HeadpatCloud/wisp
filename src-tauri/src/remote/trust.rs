@@ -4,6 +4,7 @@ use crate::commands::ssh_cmds::KnownHostsState;
 use crate::error::{AppError, AppResult};
 use crate::ssh::known_hosts::HostKeyVerdict;
 
+#[derive(Clone, Copy)]
 pub enum Scheme {
     Vnc,
     Rdp,
@@ -26,7 +27,7 @@ pub fn check(
         Scheme::Rdp => "rdp/",
         Scheme::Rdg => "rdg/",
     };
-    let host = format!("{prefix}{host}");
+    let host = format!("{prefix}{}", crate::net::normalize_host(host));
     let verdict = {
         let kh = known
             .0
@@ -101,6 +102,24 @@ mod tests {
             }
             other => panic!("expected HostKeyMismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn bracketed_ipv6_shares_the_bare_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let known = known(&dir);
+        known.0.lock().unwrap().record("vnc/::1", 5900, &fingerprint(b"cert")).unwrap();
+        assert!(check(&known, Scheme::Vnc, "[::1]", 5900, b"cert").is_ok());
+    }
+
+    #[test]
+    fn unknown_bracketed_ipv6_reports_bare_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let known = known(&dir);
+        assert!(matches!(
+            check(&known, Scheme::Vnc, "[::1]", 5900, b"cert"),
+            Err(AppError::HostKeyUnknown { host, .. }) if host == "vnc/::1"
+        ));
     }
 
     #[test]

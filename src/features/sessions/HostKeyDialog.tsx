@@ -44,7 +44,7 @@ export function HostKeyDialog({
         {prompt && (
           <div className="space-y-2 text-sm">
             <p className="text-muted-foreground">
-              {prompt.certificate ? prompt.host.replace(/^[a-z]+\//, '') : prompt.host}:
+              {prompt.certificate ? prompt.host.replace(/^(vnc|rdp|rdg)\//, '') : prompt.host}:
               {prompt.port}
             </p>
             {prompt.kind === 'unknown' ? (
@@ -74,7 +74,11 @@ export function HostKeyDialog({
             Reject
           </Button>
           <Button type="button" onClick={onAccept}>
-            {prompt?.kind === 'mismatch' ? 'Accept changed key' : 'Trust'}
+            {prompt?.kind === 'mismatch'
+              ? prompt.certificate
+                ? 'Accept changed certificate'
+                : 'Accept changed key'
+              : 'Trust'}
           </Button>
         </DialogFooter>
       </DialogContent>

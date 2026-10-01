@@ -340,9 +340,7 @@ export function ImportReviewPage({ tabId, path }: { tabId: string; path: string 
                       Add as new instead
                     </label>
                     {decisions[selected.key].asNew ? (
-                      <p className="text-muted-foreground">
-                        It will be added as a separate profile.
-                      </p>
+                      <p className="text-muted-foreground">It will be added separately.</p>
                     ) : (
                       <>
                         <div className="flex gap-2">

@@ -136,9 +136,14 @@ fn tunnels_label(ts: &[Tunnel]) -> String {
                 TunnelKind::Remote => "R",
                 TunnelKind::Dynamic => "D",
             };
-            match (&t.target_host, t.target_port) {
+            let route = match (&t.target_host, t.target_port) {
                 (Some(h), Some(p)) => format!("{kind} {}:{} -> {h}:{p}", t.bind_host, t.bind_port),
                 _ => format!("{kind} {}:{}", t.bind_host, t.bind_port),
+            };
+            if t.auto_start {
+                format!("{route} (auto-start)")
+            } else {
+                route
             }
         })
         .collect::<Vec<_>>()
@@ -288,7 +293,7 @@ fn password_field(
         field: "password".into(),
         label: label.into(),
         local: if current.is_some() { "••••".into() } else { "(none)".into() },
-        incoming: "•••• (different)".into(),
+        incoming: if current.is_some() { "•••• (different)".into() } else { "••••".into() },
     });
 }
 
@@ -882,10 +887,15 @@ mod tests {
         assert!(plan(&local(vec![pc.clone()]), &payload, &env).items.is_empty());
 
         payload.secrets.insert("mac-sec".into(), Zeroizing::new("other".into()));
-        let p = plan(&local(vec![pc]), &payload, &env);
+        let p = plan(&local(vec![pc.clone()]), &payload, &env);
         let row = &p.items[0].fields[0];
         assert_eq!(row.field, "password");
-        assert!(!row.incoming.contains("other"));
+        assert_eq!((row.local.as_str(), row.incoming.as_str()), ("••••", "•••• (different)"));
+
+        pc.secret_id = None;
+        let p = plan(&local(vec![pc]), &payload, &env);
+        let row = &p.items[0].fields[0];
+        assert_eq!((row.local.as_str(), row.incoming.as_str()), ("(none)", "••••"));
     }
 
     #[test]
@@ -942,6 +952,30 @@ mod tests {
         mac.id = "mac".into();
         mac.tunnels = vec![t("t2")];
         assert!(plan(&local(vec![pc]), &incoming(vec![mac]), &MapEnv::default()).items.is_empty());
+    }
+
+    #[test]
+    fn tunnels_that_differ_only_in_auto_start_read_differently() {
+        use crate::store::model::{Tunnel, TunnelKind};
+        let t = |auto_start: bool| Tunnel {
+            id: "t".into(),
+            kind: TunnelKind::Local,
+            bind_host: "127.0.0.1".into(),
+            bind_port: 8080,
+            target_host: Some("db".into()),
+            target_port: Some(5432),
+            auto_start,
+        };
+        let mut pc = profile("pc", "web", "h1");
+        pc.tunnels = vec![t(false)];
+        let mut mac = pc.clone();
+        mac.id = "mac".into();
+        mac.tunnels = vec![t(true)];
+        let p = plan(&local(vec![pc]), &incoming(vec![mac]), &MapEnv::default());
+        let row = &p.items[0].fields[0];
+        assert_eq!(row.field, "tunnels");
+        assert_eq!(row.local, "L 127.0.0.1:8080 -> db:5432");
+        assert_eq!(row.incoming, "L 127.0.0.1:8080 -> db:5432 (auto-start)");
     }
 
     #[test]

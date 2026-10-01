@@ -153,7 +153,7 @@ test('add as new instead is sent with the apply', async () => {
   const user = userEvent.setup()
   render(<ImportReviewPage tabId="t" path="C:/in.json" />)
   await user.click(await screen.findByLabelText('Add as new instead'))
-  expect(screen.getByText('It will be added as a separate profile.')).toBeInTheDocument()
+  expect(screen.getByText('It will be added separately.')).toBeInTheDocument()
   await user.click(screen.getByRole('button', { name: 'Apply' }))
   expect(applyImport).toHaveBeenCalledWith('r1', [
     { key: 'ssh:a', accept: true, asNew: true, fields: [] },

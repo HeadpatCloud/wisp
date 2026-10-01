@@ -7304,6 +7304,7 @@ dependencies = [
  "russh",
  "russh-sftp",
  "rust-s3",
+ "rustls",
  "same-file",
  "serde",
  "serde_json",
@@ -7322,6 +7323,7 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tokio",
+ "tokio-rustls",
  "uuid",
  "zeroize",
 ]

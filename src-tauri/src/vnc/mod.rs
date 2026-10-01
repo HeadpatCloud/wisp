@@ -1,5 +1,6 @@
 pub mod handshake;
 pub mod proto;
+pub mod vencrypt;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};

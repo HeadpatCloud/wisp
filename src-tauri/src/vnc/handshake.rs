@@ -95,7 +95,7 @@ async fn read_reason(stream: &mut Box<dyn Stream>) -> AppResult<Option<String>> 
 pub async fn handshake(
     mut stream: Box<dyn Stream>,
     login: &Login<'_>,
-    _tls: &TlsContext<'_>,
+    tls: &TlsContext<'_>,
 ) -> AppResult<(Box<dyn Stream>, ServerInit)> {
     let mut banner = [0u8; 12];
     stream.read_exact(&mut banner).await?;
@@ -142,7 +142,7 @@ pub async fn handshake(
         types
     };
     let has_password = !login.password.is_empty();
-    let usable: Vec<u8> = offered.iter().copied().filter(|t| matches!(t, 1 | 2)).collect();
+    let usable: Vec<u8> = offered.iter().copied().filter(|t| matches!(t, 1 | 2 | 19)).collect();
     let security = match choose_security(&usable, has_password) {
         Ok(security) => security,
         Err(reason) if reason == NEEDS_PASSWORD => return Err(err(reason)),
@@ -158,6 +158,9 @@ pub async fn handshake(
         stream.read_exact(&mut challenge).await?;
         stream.write_all(&vnc_auth_response(login.password, &challenge)).await?;
         stream.flush().await?;
+    }
+    if security == 19 {
+        stream = super::vencrypt::negotiate(stream, login, tls).await?;
     }
 
     // Before 3.8 a server sends no SecurityResult for type 1.
@@ -626,14 +629,13 @@ mod tests {
 
     #[tokio::test]
     async fn only_types_with_a_login_are_chosen() {
-        let mut script = offering("RFB 003.008\n", &[30, 19, 2]);
+        let mut script = offering("RFB 003.008\n", &[30, 16, 2]);
         script.extend([Read(1), Write(vec![7; 16]), Read(16), Write(vec![0, 0, 0, 1, 0, 0, 0, 0])]);
         let outcome = play(script, "hunter2").await;
         assert_eq!(outcome.sent[12], 2);
 
-        let outcome = play(offering("RFB 003.008\n", &[19, 30]), "hunter2").await;
-        assert!(refusal(&outcome)
-            .contains("the server offers only: VeNCrypt, Apple Remote Desktop"));
+        let outcome = play(offering("RFB 003.008\n", &[16, 30]), "hunter2").await;
+        assert!(refusal(&outcome).contains("the server offers only: Tight, Apple Remote Desktop"));
         assert_eq!(outcome.sent, b"RFB 003.008\n");
     }
 

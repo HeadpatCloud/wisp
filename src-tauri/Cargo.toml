@@ -50,6 +50,8 @@ hmac = "0.12"
 time = "0.3"
 futures-util = "0.3"
 same-file = "1"
+tokio-rustls = { version = "0.26", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [dev-dependencies]
 tempfile = "3"

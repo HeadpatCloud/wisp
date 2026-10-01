@@ -85,8 +85,7 @@ pub fn transfer_read(
     password: Option<String>,
 ) -> AppResult<ReadOutcome> {
     let password = password.map(Zeroizing::new);
-    let bytes =
-        Zeroizing::new(std::fs::read(&path).map_err(|e| AppError::Io(format!("{path}: {e}")))?);
+    let bytes = bundle::load(&path)?;
     let payload = match bundle::read(&bytes, password.as_deref().map(String::as_str))? {
         Opened::NeedsPassword => return Ok(ReadOutcome::NeedsPassword),
         Opened::Payload(p) => p,

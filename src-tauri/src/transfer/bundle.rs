@@ -10,6 +10,8 @@ use crate::store::model::{Group, Profile, S3Profile, SftpProfile};
 use crate::vault::crypto;
 use crate::vault::model::KdfParams;
 
+pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeyFile {
@@ -60,6 +62,11 @@ pub enum Opened {
 
 pub fn write(payload: &Payload, password: Option<&str>) -> AppResult<Vec<u8>> {
     let envelope = match password {
+        None if !payload.secrets.is_empty() || !payload.key_files.is_empty() => {
+            return Err(AppError::Import(
+                "an export with passwords or key files must be encrypted".into(),
+            ));
+        }
         None => Envelope {
             version: 2,
             encrypted: false,
@@ -111,6 +118,14 @@ fn checked(payload: Payload) -> AppResult<Opened> {
     }
 }
 
+pub fn load(path: &str) -> AppResult<Zeroizing<Vec<u8>>> {
+    let io = |e: std::io::Error| AppError::Io(format!("{path}: {e}"));
+    if std::fs::metadata(path).map_err(io)?.len() > MAX_FILE_BYTES {
+        return Err(AppError::Import("the export file is too large".into()));
+    }
+    Ok(Zeroizing::new(std::fs::read(path).map_err(io)?))
+}
+
 pub fn read(bytes: &[u8], password: Option<&str>) -> AppResult<Opened> {
     let value: serde_json::Value = serde_json::from_slice(bytes)?;
     match value.get("version").and_then(|v| v.as_u64()) {
@@ -128,9 +143,9 @@ pub fn read(bytes: &[u8], password: Option<&str>) -> AppResult<Opened> {
             let ciphertext = decode(envelope.ciphertext)?;
             let params = envelope.kdf.ok_or_else(corrupt)?;
             // The file is untrusted and these are spent before the password can be checked.
-            if !(1..=16).contains(&params.t_cost)
+            if !(1..=8).contains(&params.t_cost)
                 || !(1..=16).contains(&params.p_cost)
-                || !(8 * params.p_cost..=1_048_576).contains(&params.m_cost)
+                || !(8 * params.p_cost..=262_144).contains(&params.m_cost)
             {
                 return Err(corrupt());
             }
@@ -180,6 +195,68 @@ mod tests {
             },
         );
         p
+    }
+
+    fn sealed_with(kdf: KdfParams) -> Vec<u8> {
+        let salt = crypto::random_bytes::<16>().unwrap();
+        let key = crypto::derive_key(b"pw", &salt, Some(kdf.tuple())).unwrap();
+        let (nonce, ciphertext) =
+            crypto::seal(&key, &serde_json::to_vec(&payload()).unwrap()).unwrap();
+        let envelope = Envelope {
+            version: 2,
+            encrypted: true,
+            payload: None,
+            kdf: Some(kdf),
+            salt: Some(STANDARD.encode(salt)),
+            nonce: Some(STANDARD.encode(nonce)),
+            ciphertext: Some(STANDARD.encode(ciphertext)),
+        };
+        serde_json::to_vec(&envelope).unwrap()
+    }
+
+    #[test]
+    fn plain_write_with_secrets_or_key_files_is_refused() {
+        let mut with_secret = Payload { profiles: vec![profile("p1")], ..Default::default() };
+        with_secret.secrets.insert("sec-1".into(), Zeroizing::new("hunter2".into()));
+        let with_key = Payload { key_files: payload().key_files, ..Default::default() };
+        for payload in [&with_secret, &with_key] {
+            assert!(matches!(write(payload, None), Err(AppError::Import(_))));
+        }
+    }
+
+    #[test]
+    fn encrypted_write_uses_the_strong_kdf_parameters() {
+        let bytes = write(&payload(), Some("pw")).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let kdf: KdfParams = serde_json::from_value(value["kdf"].clone()).unwrap();
+        assert_eq!(kdf, KdfParams::STRONG);
+    }
+
+    #[test]
+    fn smallest_kdf_params_are_accepted() {
+        let bytes = sealed_with(KdfParams { m_cost: 8, t_cost: 1, p_cost: 1 });
+        assert!(matches!(
+            read(&bytes, Some("pw")).unwrap(),
+            Opened::Payload(back) if back == payload()
+        ));
+    }
+
+    #[test]
+    fn files_over_the_size_limit_are_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("export.json");
+        let name = path.to_str().unwrap();
+        std::fs::write(&path, b"{}").unwrap();
+        assert_eq!(load(name).unwrap().as_slice(), b"{}");
+
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(MAX_FILE_BYTES).unwrap();
+        assert_eq!(load(name).unwrap().len() as u64, MAX_FILE_BYTES);
+        file.set_len(MAX_FILE_BYTES + 1).unwrap();
+        assert!(matches!(load(name), Err(AppError::Import(_))));
+
+        let missing = dir.path().join("missing.json");
+        assert!(matches!(load(missing.to_str().unwrap()), Err(AppError::Io(_))));
     }
 
     #[test]
@@ -244,7 +321,9 @@ mod tests {
     #[test]
     fn out_of_range_kdf_params_are_import_errors() {
         let bytes = write(&payload(), Some("pw")).unwrap();
-        for (field, cost) in [("mCost", u32::MAX), ("tCost", 0)] {
+        for (field, cost) in
+            [("mCost", u32::MAX), ("mCost", 262_145), ("tCost", 0), ("tCost", 9), ("pCost", 17)]
+        {
             let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             value["kdf"][field] = cost.into();
             let bytes = serde_json::to_vec(&value).unwrap();

@@ -12,18 +12,22 @@ import { useSftpProfileStore } from '@/stores/sftpProfileStore'
 import type { Tri } from './review'
 import { TriCheckbox } from './TriCheckbox'
 
-function descendants(groupId: string, groups: Group[], profiles: Profile[]): string[] {
-  const keys = [`group:${groupId}`]
-  for (const p of profiles) if (p.groupId === groupId) keys.push(`ssh:${p.id}`)
+function leaves(groupId: string, groups: Group[], profiles: Profile[]): string[] {
+  const keys = profiles.filter((p) => p.groupId === groupId).map((p) => `ssh:${p.id}`)
   for (const g of groups)
-    if (g.parentId === groupId) keys.push(...descendants(g.id, groups, profiles))
-  return keys
+    if (g.parentId === groupId)
+      keys.push(...leaves(g.id, groups, profiles).filter((k) => k.startsWith('ssh:')))
+  return keys.length > 0 ? keys : [`group:${groupId}`]
 }
 
 function stateOf(keys: string[], selected: Set<string>): Tri {
   const on = keys.filter((k) => selected.has(k)).length
   if (on === keys.length) return 'all'
   return on === 0 ? 'none' : 'some'
+}
+
+function plural(n: number, noun: string): string {
+  return `${n} ${noun}${n === 1 ? '' : 's'}`
 }
 
 export function ExportPage({ tabId }: { tabId: string }) {
@@ -57,15 +61,17 @@ export function ExportPage({ tabId }: { tabId: string }) {
     [...selected].filter((k) => k.startsWith(prefix)).map((k) => k.slice(prefix.length))
 
   async function doExport() {
-    const path = await pickExportPath()
-    if (!path) return
     setBusy(true)
     setError(null)
     try {
+      const path = await pickExportPath()
+      if (!path) return
       setSummary(
         await exportBundle(
           {
-            groupIds: ids('group:'),
+            groupIds: groups
+              .filter((g) => stateOf(leaves(g.id, groups, profiles), selected) === 'all')
+              .map((g) => g.id),
             profileIds: ids('ssh:'),
             sftpIds: ids('sftp:'),
             s3Ids: ids('s3:'),
@@ -75,15 +81,17 @@ export function ExportPage({ tabId }: { tabId: string }) {
           path,
         ),
       )
+      setPassword('')
+      setConfirm('')
     } catch (e) {
-      setError(String(e))
+      setError(e instanceof Error ? e.message : String(e))
     } finally {
       setBusy(false)
     }
   }
 
   const renderGroup = (g: Group) => {
-    const keys = descendants(g.id, groups, profiles)
+    const keys = leaves(g.id, groups, profiles)
     return (
       <li key={g.id}>
         <label htmlFor={`export-group-${g.id}`} className="flex items-center gap-2">
@@ -133,7 +141,7 @@ export function ExportPage({ tabId }: { tabId: string }) {
     ))
 
   const everything = [
-    ...groups.map((g) => `group:${g.id}`),
+    ...groups.flatMap((g) => leaves(g.id, groups, profiles)),
     ...profiles.map((p) => `ssh:${p.id}`),
     ...sftp.map((p) => `sftp:${p.id}`),
     ...s3.map((p) => `s3:${p.id}`),
@@ -150,11 +158,11 @@ export function ExportPage({ tabId }: { tabId: string }) {
         }
       >
         <p className="text-sm">
-          Exported {summary.profiles} profiles ({summary.secrets} passwords, {summary.keyFiles} key
-          files).
+          Exported {plural(summary.profiles, 'profile')} ({plural(summary.secrets, 'password')},{' '}
+          {plural(summary.keyFiles, 'key file')}).
         </p>
         <ul className="mt-2 space-y-1 text-muted-foreground text-sm">
-          {summary.warnings.map((w) => (
+          {[...new Set(summary.warnings)].map((w) => (
             <li key={w}>{w}</li>
           ))}
         </ul>
@@ -192,7 +200,7 @@ export function ExportPage({ tabId }: { tabId: string }) {
         <section>
           <h3 className="mb-1 font-semibold">SSH</h3>
           <ul className="space-y-1">
-            {groups.filter((g) => !g.parentId).map(renderGroup)}
+            {groups.filter((g) => !groups.some((p) => p.id === g.parentId)).map(renderGroup)}
             {profiles.filter((p) => !p.groupId).map(renderProfile)}
           </ul>
         </section>
@@ -249,6 +257,9 @@ export function ExportPage({ tabId }: { tabId: string }) {
                   value={confirm}
                   onChange={(e) => setConfirm(e.target.value)}
                 />
+                {confirm.length > 0 && confirm !== password && (
+                  <p className="text-destructive">Passwords don't match.</p>
+                )}
               </div>
             </div>
           )}

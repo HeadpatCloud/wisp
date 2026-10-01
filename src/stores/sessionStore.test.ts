@@ -129,6 +129,27 @@ test('openView dedupes editors by target id', () => {
   expect(useSessionStore.getState().tabs).toHaveLength(2)
 })
 
+test('openView opens one import review tab per file', () => {
+  const s = useSessionStore.getState()
+  s.openView({ kind: 'transfer-import', path: 'C:/a.json' }, 'Import profiles')
+  const firstId = useSessionStore.getState().tabs[0].id
+  s.openView({ kind: 'transfer-import', path: 'C:/b.json' }, 'Import profiles')
+  expect(useSessionStore.getState().tabs).toHaveLength(2)
+  s.openView({ kind: 'transfer-import', path: 'C:/a.json' }, 'Import profiles')
+  expect(useSessionStore.getState().tabs).toHaveLength(2)
+  expect(useSessionStore.getState().activeTabId).toBe(firstId)
+})
+
+test('openView opens the export page once', () => {
+  const s = useSessionStore.getState()
+  s.openView({ kind: 'transfer-export' }, 'Export profiles')
+  const firstId = useSessionStore.getState().tabs[0].id
+  s.openView({ kind: 'settings' }, 'Settings')
+  s.openView({ kind: 'transfer-export' }, 'Export profiles')
+  expect(useSessionStore.getState().tabs).toHaveLength(2)
+  expect(useSessionStore.getState().activeTabId).toBe(firstId)
+})
+
 test('removeTab on a view tab drops only the tab, never a session', () => {
   const s = useSessionStore.getState()
   s.openTab({ id: 'sess1', profileId: 'p', title: 'web', status: 'connecting', reconnectNonce: 0 })

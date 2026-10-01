@@ -2,6 +2,8 @@ import { GroupPage } from '@/features/profiles/GroupPage'
 import { ImportPage } from '@/features/profiles/ImportPage'
 import { ProfilePage } from '@/features/profiles/ProfilePage'
 import { SettingsPage } from '@/features/settings/SettingsPage'
+import { ExportPage } from '@/features/transfer/ExportPage'
+import { ImportReviewPage } from '@/features/transfer/ImportReviewPage'
 import { WelcomePage } from '@/features/welcome/WelcomePage'
 import type { ViewTab } from '@/stores/sessionStore'
 
@@ -17,6 +19,10 @@ export function ViewHost({ tab }: { tab: ViewTab }) {
       return <SettingsPage tabId={tab.id} />
     case 'import':
       return <ImportPage tabId={tab.id} />
+    case 'transfer-export':
+      return <ExportPage tabId={tab.id} />
+    case 'transfer-import':
+      return <ImportReviewPage tabId={tab.id} path={tab.view.path} />
     default:
       return null
   }

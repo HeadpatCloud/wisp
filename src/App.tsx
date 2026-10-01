@@ -31,6 +31,7 @@ import { useHotkeys } from '@/lib/hotkeys'
 import { clearEditTemp, listShells } from '@/lib/local'
 import { clearSnapshot, loadSnapshot, saveSnapshot } from '@/lib/sessionPersist'
 import { watchSystemTheme } from '@/lib/theme'
+import { pickImportPath } from '@/lib/transfer'
 import { cn } from '@/lib/utils'
 import { setSecret } from '@/lib/vault'
 import { useProfileStore } from '@/stores/profileStore'
@@ -208,8 +209,11 @@ export default function App() {
     }
   }, [])
 
-  const importFromFile = async () => {}
-  const exportToFile = async () => {}
+  const importFromFile = async () => {
+    const path = await pickImportPath()
+    if (path) openView({ kind: 'transfer-import', path }, 'Import profiles')
+  }
+  const exportToFile = () => openView({ kind: 'transfer-export' }, 'Export profiles')
 
   const activeTab = tabs.find((t) => t.id === activeTabId)
   const sessionTabs = tabs.filter((t): t is SessionTab => t.kind === 'session')

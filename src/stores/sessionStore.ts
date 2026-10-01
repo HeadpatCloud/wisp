@@ -20,6 +20,8 @@ export type TabView =
   | { kind: 'welcome' }
   | { kind: 'settings' }
   | { kind: 'import' }
+  | { kind: 'transfer-export' }
+  | { kind: 'transfer-import'; path: string }
   | { kind: 'profile-editor'; profileId: string | null }
   | { kind: 'group-editor'; groupId: string | null }
 
@@ -104,6 +106,7 @@ export function tabSecretIds(t: Tab): string[] {
 function viewKey(v: TabView): string {
   if (v.kind === 'profile-editor') return `profile-editor:${v.profileId ?? 'new'}`
   if (v.kind === 'group-editor') return `group-editor:${v.groupId ?? 'new'}`
+  if (v.kind === 'transfer-import') return `transfer-import:${v.path}`
   return v.kind
 }
 

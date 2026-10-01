@@ -47,12 +47,28 @@ pub fn key_event(down: bool, keysym: u32) -> [u8; 8] {
     b
 }
 
-pub fn client_cut_text(text: &str) -> Vec<u8> {
-    let bytes = text.as_bytes();
+pub fn client_cut_text(text: &[u8]) -> Vec<u8> {
     let mut msg = vec![6, 0, 0, 0]; // type + 3 padding
-    msg.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-    msg.extend_from_slice(bytes);
+    msg.extend_from_slice(&(text.len() as u32).to_be_bytes());
+    msg.extend_from_slice(text);
     msg
+}
+
+pub fn set_encodings(encodings: &[i32]) -> Vec<u8> {
+    let mut msg = vec![2, 0]; // type + 1 padding
+    msg.extend_from_slice(&(encodings.len() as u16).to_be_bytes());
+    for encoding in encodings {
+        msg.extend_from_slice(&encoding.to_be_bytes());
+    }
+    msg
+}
+
+pub fn latin1_encode(text: &str) -> Vec<u8> {
+    text.chars().map(|c| u8::try_from(c).unwrap_or(b'?')).collect()
+}
+
+pub fn latin1_decode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| char::from(*b)).collect()
 }
 
 #[cfg(test)]
@@ -113,6 +129,28 @@ mod tests {
         assert_eq!(pointer_event(0b10, 0x0102, 0x0304), [5, 2, 1, 2, 3, 4]);
         assert_eq!(key_event(true, 0x0041), [4, 1, 0, 0, 0, 0, 0, 0x41]);
         assert_eq!(fb_update_request(true, 0, 0, 0x0102, 0x0304), [3, 1, 0, 0, 0, 0, 1, 2, 3, 4]);
-        assert_eq!(client_cut_text("hi"), [6, 0, 0, 0, 0, 0, 0, 2, b'h', b'i']);
+        assert_eq!(client_cut_text(b"hi"), [6, 0, 0, 0, 0, 0, 0, 2, b'h', b'i']);
+    }
+
+    #[test]
+    fn set_encodings_lists_each_as_a_signed_number() {
+        assert_eq!(
+            set_encodings(&[16, 0, -239]),
+            [2, 0, 0, 3, 0, 0, 0, 16, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0x11],
+        );
+        assert_eq!(set_encodings(&[]), [2, 0, 0, 0]);
+    }
+
+    #[test]
+    fn latin1_replaces_what_it_cannot_hold() {
+        assert_eq!(latin1_encode("héllo ✓"), [b'h', 0xE9, b'l', b'l', b'o', b' ', b'?']);
+        assert_eq!(latin1_encode("ÿĀ"), [0xFF, b'?']);
+        assert_eq!(latin1_encode(""), [0u8; 0]);
+    }
+
+    #[test]
+    fn latin1_bytes_become_the_same_code_points() {
+        assert_eq!(latin1_decode(&[b'h', 0xE9, 0x00, 0xFF]), "hé\0ÿ");
+        assert_eq!(latin1_decode(&latin1_encode("café")), "café");
     }
 }

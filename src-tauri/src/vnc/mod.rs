@@ -2,6 +2,9 @@ pub mod ard;
 pub mod decode;
 pub mod handshake;
 pub mod proto;
+pub mod session;
+#[cfg(test)]
+mod testserver;
 pub mod vencrypt;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};

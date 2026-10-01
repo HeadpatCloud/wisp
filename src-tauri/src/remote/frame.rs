@@ -9,6 +9,7 @@ pub enum FrameOp {
     Cursor { hot_x: u16, hot_y: u16, w: u16, h: u16, rgba: Vec<u8> },
     Clipboard(String),
     Closed(String),
+    Sync,
 }
 
 impl FrameOp {
@@ -22,6 +23,7 @@ impl FrameOp {
             Self::Cursor { hot_x, hot_y, w, h, rgba } => (4, vec![hot_x, hot_y, w, h], rgba),
             Self::Clipboard(text) => (5, Vec::new(), text.into_bytes()),
             Self::Closed(reason) => (6, Vec::new(), reason.into_bytes()),
+            Self::Sync => (7, Vec::new(), Vec::new()),
         };
         let mut out = Vec::with_capacity(1 + fields.len() * 2 + tail.len());
         out.push(kind);
@@ -81,5 +83,10 @@ mod tests {
     fn encodes_closed() {
         let op = FrameOp::Closed("bye".to_string());
         assert_eq!(op.encode().0, [6, b'b', b'y', b'e']);
+    }
+
+    #[test]
+    fn encodes_sync() {
+        assert_eq!(FrameOp::Sync.encode().0, [7]);
     }
 }

@@ -1387,7 +1387,9 @@ mod tests {
                         assert!(hidden || (hot_x < w && hot_y < h), "round {round}");
                         assert_eq!(rgba.len(), w as usize * h as usize * 4, "round {round}");
                     }
-                    FrameOp::Clipboard(_) | FrameOp::Closed(_) => panic!("round {round}"),
+                    FrameOp::Clipboard(_) | FrameOp::Closed(_) | FrameOp::Sync => {
+                        panic!("round {round}")
+                    }
                 }
                 assert!(drawn <= 4 * width * height, "round {round}");
             }

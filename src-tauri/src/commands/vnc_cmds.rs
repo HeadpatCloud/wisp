@@ -148,7 +148,7 @@ pub async fn vnc_key(
 #[specta::specta]
 pub async fn vnc_cut_text(vncs: State<'_, VncSessions>, id: String, text: String) -> AppResult<()> {
     let w = writer_for(&vncs, &id).await?;
-    let r = w.lock().await.write_all(&client_cut_text(&text)).await;
+    let r = w.lock().await.write_all(&client_cut_text(text.as_bytes())).await;
     r.map_err(io)
 }
 

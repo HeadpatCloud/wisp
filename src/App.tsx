@@ -1,5 +1,4 @@
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import { message } from '@tauri-apps/plugin-dialog'
 import { Settings } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { events, type S3Profile, type SftpProfile, type ShellInfo } from '@/bindings'
@@ -30,7 +29,6 @@ import { VaultGate } from '@/features/vault/VaultGate'
 import { WelcomePage } from '@/features/welcome/WelcomePage'
 import { useHotkeys } from '@/lib/hotkeys'
 import { clearEditTemp, listShells } from '@/lib/local'
-import { exportProfilesToFile, importProfilesFromFile } from '@/lib/profiles'
 import { clearSnapshot, loadSnapshot, saveSnapshot } from '@/lib/sessionPersist'
 import { watchSystemTheme } from '@/lib/theme'
 import { cn } from '@/lib/utils'
@@ -210,17 +208,8 @@ export default function App() {
     }
   }, [])
 
-  const importFromFile = async () => {
-    const n = await importProfilesFromFile()
-    if (n === null) return
-    await load()
-    await loadS3()
-    await loadSftpProfiles()
-    await message(`Imported ${n} profile${n === 1 ? '' : 's'}.`)
-  }
-  const exportToFile = async () => {
-    if (await exportProfilesToFile()) await message('Profiles exported.')
-  }
+  const importFromFile = async () => {}
+  const exportToFile = async () => {}
 
   const activeTab = tabs.find((t) => t.id === activeTabId)
   const sessionTabs = tabs.filter((t): t is SessionTab => t.kind === 'session')

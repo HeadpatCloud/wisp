@@ -1,27 +1,8 @@
-import { open, save } from '@tauri-apps/plugin-dialog'
 import { commands, type Group, type ImportCandidate, type Profile } from '@/bindings'
 import { unwrap } from '@/lib/ipc'
 
 export const importSshConfig = async (path?: string): Promise<ImportCandidate[]> =>
   unwrap(await commands.importSshConfig(path ?? null))
-
-// Returns false if the user cancelled the save dialog.
-export async function exportProfilesToFile(): Promise<boolean> {
-  const path = await save({
-    defaultPath: 'wisp-profiles.json',
-    filters: [{ name: 'JSON', extensions: ['json'] }],
-  })
-  if (!path) return false
-  unwrap(await commands.exportProfiles(path))
-  return true
-}
-
-// Returns the number of profiles imported, or null if the user cancelled.
-export async function importProfilesFromFile(): Promise<number | null> {
-  const path = await open({ filters: [{ name: 'JSON', extensions: ['json'] }] })
-  if (typeof path !== 'string') return null
-  return unwrap(await commands.importProfiles(path))
-}
 
 // Every vault entry a profile owns: the password plus one passphrase per key.
 export function profileSecretIds(p: {

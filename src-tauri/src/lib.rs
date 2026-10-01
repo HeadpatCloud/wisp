@@ -21,6 +21,7 @@ use commands::s3_cmds;
 use commands::sftp_cmds;
 use commands::ssh_cmds;
 use commands::store_cmds;
+use commands::transfer_cmds;
 use commands::tunnel_cmds;
 use commands::vault_cmds;
 use commands::vnc_cmds;
@@ -52,14 +53,17 @@ fn specta_builder() -> Builder<tauri::Wry> {
             store_cmds::upsert_profile,
             store_cmds::delete_profile,
             store_cmds::set_settings,
-            store_cmds::export_profiles,
-            store_cmds::import_profiles,
             store_cmds::list_sftp_profiles,
             store_cmds::upsert_sftp_profile,
             store_cmds::delete_sftp_profile,
             store_cmds::list_s3_profiles,
             store_cmds::upsert_s3_profile,
             store_cmds::delete_s3_profile,
+            transfer_cmds::transfer_export,
+            transfer_cmds::transfer_read,
+            transfer_cmds::transfer_validate,
+            transfer_cmds::transfer_apply,
+            transfer_cmds::transfer_discard,
             vault_cmds::vault_status,
             vault_cmds::set_secret,
             vault_cmds::delete_secret,
@@ -217,6 +221,7 @@ pub fn run() {
             app.manage(sftp_cmds::SftpSessions::default());
             app.manage(sftp_cmds::SftpConns::default());
             app.manage(sftp_cmds::Transfers::default());
+            app.manage(transfer_cmds::PendingImports::default());
             app.manage(local_cmds::LocalSessions::default());
             app.manage(ftp_cmds::FtpSessions::default());
             app.manage(ftp_cmds::FtpTransfers::default());

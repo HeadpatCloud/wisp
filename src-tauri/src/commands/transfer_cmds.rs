@@ -6,6 +6,7 @@ use tauri::{AppHandle, Manager, State};
 use zeroize::Zeroizing;
 
 use crate::error::{AppError, AppResult};
+use crate::store::model::ProfileKey;
 use crate::store::Store;
 use crate::transfer::bundle::{self, Opened, Payload};
 use crate::transfer::{
@@ -152,7 +153,13 @@ pub fn transfer_apply(
     };
     let keys_dir = dir.join("keys");
     let summary = apply::execute(&mut s, &mut v, &keys_dir, staged)?;
-    apply::remove_unreferenced_keys(&keys_dir, &s.snapshot());
+    let previous: Vec<ProfileKey> = snapshot
+        .profiles
+        .into_iter()
+        .flat_map(|p| p.keys)
+        .chain(snapshot.sftp_profiles.into_iter().flat_map(|p| p.keys))
+        .collect();
+    apply::remove_unreferenced_keys(&keys_dir, &previous, &s.snapshot());
     pending.remove(&review_id);
     Ok(summary)
 }

@@ -719,8 +719,13 @@ pub fn execute(
     Ok(summary)
 }
 
-pub fn remove_unreferenced_keys(keys_dir: &Path, data: &ProfileStore) {
-    let Ok(entries) = std::fs::read_dir(keys_dir) else { return };
+// Removes the app-made key files that a changed profile used before (`previous`) and nothing
+// uses now. Never a sweep: a store that loaded empty must not cost the user every imported key.
+pub fn remove_unreferenced_keys(keys_dir: &Path, previous: &[ProfileKey], data: &ProfileStore) {
+    // Through a linked folder the app would be deleting files somewhere else.
+    if !std::fs::symlink_metadata(keys_dir).is_ok_and(|m| m.is_dir()) {
+        return;
+    }
     let used: Vec<&OsStr> = data
         .profiles
         .iter()
@@ -728,19 +733,27 @@ pub fn remove_unreferenced_keys(keys_dir: &Path, data: &ProfileStore) {
         .chain(data.sftp_profiles.iter().flat_map(|p| &p.keys))
         .filter_map(|k| Path::new(&k.path).file_name())
         .collect();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        // Only the `<uuid>-<name>` files `execute` writes are the app's to delete.
+    for key in previous {
+        let path = Path::new(&key.path);
+        let Some(name) = path.file_name().filter(|_| path.parent() == Some(keys_dir)) else {
+            continue;
+        };
+        // Only the `<uuid>-<name>` files `execute` writes are the app's to delete. The name must
+        // be exactly one it writes: with a trailing dot, space or stream suffix Windows would
+        // open a key that is still in use under its plain name.
         let app_made = name.to_str().is_some_and(|n| {
-            n.get(..36).is_some_and(|id| Uuid::parse_str(id).is_ok()) && n[36..].starts_with('-')
+            n.get(..36).is_some_and(|id| Uuid::parse_str(id).is_ok())
+                && n[36..]
+                    .strip_prefix('-')
+                    .is_some_and(|rest| safe_name(rest) == rest && !rest.ends_with('.'))
         });
         // Case is ignored: on Windows and macOS a differently cased path is the same file.
         if app_made
-            && entry.file_type().is_ok_and(|t| t.is_file())
-            && !used.iter().any(|u| u.eq_ignore_ascii_case(&name))
+            && !used.iter().any(|u| u.eq_ignore_ascii_case(name))
+            && std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
         {
             // Best-effort: a leftover key file must never fail the save or delete that got here.
-            let _ = std::fs::remove_file(entry.path());
+            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -1463,43 +1476,139 @@ mod tests {
         assert!(!v.has_secret(&old));
     }
 
+    // A file named the way `execute` names an imported key.
+    fn app_key(folder: &Path, n: u8) -> ProfileKey {
+        let path = folder.join(format!("6f1c2a9e-8d0b-4c57-9a3e-2b7d5e41f0c{n}-id"));
+        std::fs::write(&path, b"K").unwrap();
+        ProfileKey { path: path.to_string_lossy().into_owned(), secret_id: None }
+    }
+
+    fn on_disk(key: &ProfileKey) -> bool {
+        Path::new(&key.path).is_file()
+    }
+
     #[test]
-    fn only_unreferenced_app_made_files_in_the_keys_folder_are_removed() {
+    fn empty_store_without_candidates_removes_no_key_files() {
         let dir = tempfile::tempdir().unwrap();
         let keys = dir.path().join("keys");
-        remove_unreferenced_keys(&keys, &store_of(vec![]));
+        remove_unreferenced_keys(&keys, &[], &store_of(vec![]));
         assert!(!keys.exists());
 
+        std::fs::create_dir(&keys).unwrap();
+        let imported = app_key(&keys, 1);
+        remove_unreferenced_keys(&keys, &[], &store_of(vec![]));
+        assert!(on_disk(&imported));
+    }
+
+    #[test]
+    fn deleting_a_profile_removes_only_its_own_app_made_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = dir.path().join("keys");
         std::fs::create_dir_all(keys.join("sub")).unwrap();
-        let name = |n: u8| format!("6f1c2a9e-8d0b-4c57-9a3e-2b7d5e41f0c{n}-id");
-        let used = keys.join(name(1));
-        let used_by_sftp = keys.join(name(2));
-        let other_case = keys.join(name(3));
-        let unused = keys.join(name(4));
-        let nested = keys.join("sub").join(name(5));
-        let outside = dir.path().join(name(6));
-        let own = keys.join("id_ed25519");
-        let not_a_uuid = keys.join("notauuid-id");
-        for path in
-            [&used, &used_by_sftp, &other_case, &unused, &nested, &outside, &own, &not_a_uuid]
-        {
-            std::fs::write(path, b"K").unwrap();
-        }
-        let key = |path: &Path| ProfileKey {
-            path: path.to_string_lossy().into_owned(),
+        let own = app_key(&keys, 1);
+        let shared = app_key(&keys, 2);
+        let shared_with_sftp = app_key(&keys, 3);
+        let other = app_key(&keys, 4);
+        let never_a_candidate = app_key(&keys, 5);
+        let nested = app_key(&keys.join("sub"), 6);
+        let outside = app_key(dir.path(), 7);
+        let hand_made = ProfileKey {
+            path: keys.join("id_ed25519").to_string_lossy().into_owned(),
             secret_id: None,
         };
-        let mut web = profile("p", "web", "h1");
-        web.keys = vec![key(&used), key(&keys.join(name(3).to_uppercase()))];
-        let mut files = sftp("f", "files", "h1");
-        files.keys = vec![key(&used_by_sftp)];
-        let data = ProfileStore { sftp_profiles: vec![files], ..store_of(vec![web]) };
+        std::fs::write(&hand_made.path, b"K").unwrap();
 
-        remove_unreferenced_keys(&keys, &data);
-        assert!(used.is_file() && used_by_sftp.is_file() && other_case.is_file());
-        assert!(!unused.exists());
-        assert!(nested.is_file() && outside.is_file());
-        assert!(own.is_file() && not_a_uuid.is_file());
+        let mut web = profile("w", "web", "h1");
+        web.keys = vec![
+            own.clone(),
+            shared.clone(),
+            shared_with_sftp.clone(),
+            nested.clone(),
+            outside.clone(),
+            hand_made.clone(),
+        ];
+        let mut db = profile("d", "db", "h2");
+        db.keys = vec![shared.clone(), other.clone()];
+        let mut files = sftp("f", "files", "h1");
+        files.keys =
+            vec![ProfileKey { path: shared_with_sftp.path.to_uppercase(), secret_id: None }];
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        let data = ProfileStore { sftp_profiles: vec![files], ..store_of(vec![web, db]) };
+        store.commit(data).unwrap();
+
+        let deleted = store.profiles().into_iter().find(|p| p.id == "w").unwrap();
+        store.delete_profile("w").unwrap();
+        remove_unreferenced_keys(&keys, &deleted.keys, &store.snapshot());
+        assert!(!on_disk(&own));
+        assert!(on_disk(&shared) && on_disk(&shared_with_sftp) && on_disk(&other));
+        assert!(on_disk(&never_a_candidate));
+        assert!(on_disk(&nested) && on_disk(&outside) && on_disk(&hand_made));
+    }
+
+    #[test]
+    fn dropping_one_of_two_keys_removes_only_that_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = dir.path().join("keys");
+        std::fs::create_dir(&keys).unwrap();
+        let (kept, dropped) = (app_key(&keys, 1), app_key(&keys, 2));
+        let mut web = profile("w", "web", "h1");
+        web.keys = vec![kept.clone(), dropped.clone()];
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        store.commit(store_of(vec![web.clone()])).unwrap();
+
+        let previous = store.profiles().into_iter().find(|p| p.id == "w").unwrap();
+        web.keys.truncate(1);
+        store.upsert_profile(web).unwrap();
+        remove_unreferenced_keys(&keys, &previous.keys, &store.snapshot());
+        assert!(on_disk(&kept) && !on_disk(&dropped));
+    }
+
+    #[test]
+    fn another_spelling_of_a_key_still_in_use_is_not_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = dir.path().join("keys");
+        std::fs::create_dir(&keys).unwrap();
+        let used = app_key(&keys, 1);
+        let mut web = profile("w", "web", "h1");
+        web.keys = vec![used.clone()];
+        let spellings: Vec<ProfileKey> = [".", " ", "::$DATA"]
+            .iter()
+            .map(|tail| ProfileKey { path: format!("{}{tail}", used.path), secret_id: None })
+            .collect();
+        remove_unreferenced_keys(&keys, &spellings, &store_of(vec![web]));
+        assert!(on_disk(&used));
+    }
+
+    #[cfg(unix)]
+    fn link_dir(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    // A junction, because a directory symlink needs a privilege on Windows.
+    #[cfg(windows)]
+    fn link_dir(target: &Path, link: &Path) {
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .args([link, target])
+            .output()
+            .unwrap();
+        assert!(made.status.success());
+    }
+
+    #[test]
+    fn linked_keys_folder_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let keys = dir.path().join("keys");
+        link_dir(&elsewhere, &keys);
+        let through_link = app_key(&keys, 1);
+        remove_unreferenced_keys(&keys, &[through_link.clone()], &store_of(vec![]));
+        assert!(on_disk(&through_link));
+
+        let direct = app_key(&elsewhere, 1);
+        remove_unreferenced_keys(&elsewhere, &[direct.clone()], &store_of(vec![]));
+        assert!(!on_disk(&direct) && !on_disk(&through_link));
     }
 
     #[test]

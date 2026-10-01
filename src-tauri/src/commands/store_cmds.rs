@@ -3,7 +3,9 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Manager, State};
 
 use crate::error::{AppError, AppResult};
-use crate::store::model::{Group, IconRef, Profile, ProfileStore, S3Profile, Settings, SftpProfile};
+use crate::store::model::{
+    Group, IconRef, Profile, ProfileKey, ProfileStore, S3Profile, Settings, SftpProfile,
+};
 use crate::store::{is_icon_path, Store};
 use crate::transfer::apply::remove_unreferenced_keys;
 
@@ -31,9 +33,9 @@ fn remove_custom_icon(app: &AppHandle, icon: &IconRef, data: &ProfileStore) {
     }
 }
 
-fn remove_unused_keys(app: &AppHandle, store: &Store) {
+fn remove_unused_keys(app: &AppHandle, previous: &[ProfileKey], store: &Store) {
     if let Ok(dir) = app.path().app_config_dir() {
-        remove_unreferenced_keys(&dir.join("keys"), &store.snapshot());
+        remove_unreferenced_keys(&dir.join("keys"), previous, &store.snapshot());
     }
 }
 
@@ -81,8 +83,11 @@ pub fn upsert_profile(
     profile: Profile,
 ) -> AppResult<()> {
     let mut s = store.lock().map_err(|_| poisoned())?;
+    let previous = s.profiles().into_iter().find(|p| p.id == profile.id);
     s.upsert_profile(profile)?;
-    remove_unused_keys(&app, &s);
+    if let Some(previous) = previous {
+        remove_unused_keys(&app, &previous.keys, &s);
+    }
     Ok(())
 }
 
@@ -90,12 +95,12 @@ pub fn upsert_profile(
 #[specta::specta]
 pub fn delete_profile(app: AppHandle, store: State<'_, Mutex<Store>>, id: String) -> AppResult<()> {
     let mut s = store.lock().map_err(|_| poisoned())?;
-    let icon = s.profiles().into_iter().find(|p| p.id == id).map(|p| p.icon);
+    let deleted = s.profiles().into_iter().find(|p| p.id == id);
     s.delete_profile(&id)?;
-    if let Some(icon) = icon {
-        remove_custom_icon(&app, &icon, &s.snapshot());
+    if let Some(deleted) = deleted {
+        remove_custom_icon(&app, &deleted.icon, &s.snapshot());
+        remove_unused_keys(&app, &deleted.keys, &s);
     }
-    remove_unused_keys(&app, &s);
     Ok(())
 }
 
@@ -147,8 +152,11 @@ pub fn upsert_sftp_profile(
     profile: SftpProfile,
 ) -> AppResult<()> {
     let mut s = store.lock().map_err(|_| poisoned())?;
+    let previous = s.sftp_profiles().into_iter().find(|p| p.id == profile.id);
     s.upsert_sftp_profile(profile)?;
-    remove_unused_keys(&app, &s);
+    if let Some(previous) = previous {
+        remove_unused_keys(&app, &previous.keys, &s);
+    }
     Ok(())
 }
 
@@ -160,12 +168,12 @@ pub fn delete_sftp_profile(
     id: String,
 ) -> AppResult<()> {
     let mut s = store.lock().map_err(|_| poisoned())?;
-    let icon = s.sftp_profiles().into_iter().find(|p| p.id == id).map(|p| p.icon);
+    let deleted = s.sftp_profiles().into_iter().find(|p| p.id == id);
     s.delete_sftp_profile(&id)?;
-    if let Some(icon) = icon {
-        remove_custom_icon(&app, &icon, &s.snapshot());
+    if let Some(deleted) = deleted {
+        remove_custom_icon(&app, &deleted.icon, &s.snapshot());
+        remove_unused_keys(&app, &deleted.keys, &s);
     }
-    remove_unused_keys(&app, &s);
     Ok(())
 }
 

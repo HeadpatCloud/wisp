@@ -114,3 +114,43 @@ test('switching active tab keeps both panes mounted and flips hidden class', () 
   expect(screen.getByTestId('tabpane-tab-1').className).toContain('hidden')
   expect(screen.getByTestId('tabpane-tab-2').className).not.toContain('hidden')
 })
+
+const importTab = {
+  id: 'tab-import',
+  kind: 'view' as const,
+  view: { kind: 'transfer-import' as const, path: 'C:/a.json' },
+  title: 'Import profiles',
+}
+const settingsTab = {
+  id: 'tab-settings',
+  kind: 'view' as const,
+  view: { kind: 'settings' as const },
+  title: 'Settings',
+}
+
+test('an import review tab stays mounted while another tab is active', () => {
+  useSessionStore.setState({ tabs: [tab1, importTab], activeTabId: 'tab-1' })
+  render(<App />)
+  expect(screen.getByTestId('tabpane-tab-import').className).toContain('hidden')
+  act(() => {
+    useSessionStore.getState().setActiveTab('tab-import')
+  })
+  expect(screen.getByTestId('tabpane-tab-import').className).not.toContain('hidden')
+})
+
+test('other view tabs are only mounted while active', () => {
+  useSessionStore.setState({ tabs: [tab1, settingsTab], activeTabId: 'tab-1' })
+  render(<App />)
+  expect(screen.queryByTestId('view-host')).not.toBeInTheDocument()
+  act(() => {
+    useSessionStore.getState().setActiveTab('tab-settings')
+  })
+  expect(screen.getByTestId('view-host')).toBeInTheDocument()
+})
+
+test('an active import review tab renders a single view host', () => {
+  useSessionStore.setState({ tabs: [tab1, importTab], activeTabId: 'tab-import' })
+  render(<App />)
+  expect(screen.getAllByTestId('view-host')).toHaveLength(1)
+  expect(screen.getByTestId('tabpane-tab-import')).toContainElement(screen.getByTestId('view-host'))
+})

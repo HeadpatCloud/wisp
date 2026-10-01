@@ -43,6 +43,7 @@ import {
   type SessionTab,
   type SftpTab,
   useSessionStore,
+  type ViewTab,
   type VncTab,
 } from '@/stores/sessionStore'
 import { useSettingsStore } from '@/stores/settingsStore'
@@ -222,7 +223,13 @@ export default function App() {
   const sftpTabs = tabs.filter((t): t is SftpTab => t.kind === 'sftp')
   const ftpTabs = tabs.filter((t): t is FtpTab => t.kind === 'ftp')
   const s3Tabs = tabs.filter((t): t is S3Tab => t.kind === 's3')
-  const activeViewTab = activeTab && activeTab.kind === 'view' ? activeTab : null
+  // Kept mounted while inactive so a tab switch doesn't throw away a review in progress.
+  const transferTabs = tabs.filter(
+    (t): t is ViewTab =>
+      t.kind === 'view' && (t.view.kind === 'transfer-export' || t.view.kind === 'transfer-import'),
+  )
+  const activeViewTab =
+    activeTab && activeTab.kind === 'view' && !transferTabs.includes(activeTab) ? activeTab : null
 
   return (
     <>
@@ -440,6 +447,15 @@ export default function App() {
                     bucket={t.bucket}
                     active={t.id === activeTabId}
                   />
+                </div>
+              ))}
+              {transferTabs.map((t) => (
+                <div
+                  key={t.id}
+                  data-testid={`tabpane-${t.id}`}
+                  className={cn('absolute inset-0 bg-background', t.id !== activeTabId && 'hidden')}
+                >
+                  <ViewHost tab={t} />
                 </div>
               ))}
               {activeViewTab && (

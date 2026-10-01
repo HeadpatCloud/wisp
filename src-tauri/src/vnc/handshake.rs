@@ -1,9 +1,11 @@
+use std::io::ErrorKind;
+
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::proto::vnc_auth_response;
 use super::{bounded, err, MAX_TEXT};
 use crate::commands::ssh_cmds::KnownHostsState;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 
 pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
@@ -32,6 +34,7 @@ pub enum Version {
 }
 
 const NEEDS_PASSWORD: &str = "this server needs a password";
+const REFUSED: &str = "the server refused the connection";
 
 pub fn security_name(t: u8) -> String {
     match t {
@@ -70,10 +73,22 @@ pub fn choose_security(offered: &[u8], has_password: bool) -> Result<u8, String>
     Err(offers_only(offered))
 }
 
-async fn read_reason(stream: &mut Box<dyn Stream>) -> AppResult<String> {
-    let mut reason = vec![0u8; bounded(stream.read_u32().await? as usize, MAX_TEXT)?];
-    stream.read_exact(&mut reason).await?;
-    Ok(String::from_utf8_lossy(&reason).into_owned())
+// None when the server gave no reason, or closed the connection before it was through.
+async fn read_reason(stream: &mut Box<dyn Stream>) -> AppResult<Option<String>> {
+    let cut_off = |e: std::io::Error| match e.kind() {
+        ErrorKind::UnexpectedEof => Ok(None),
+        _ => Err(AppError::from(e)),
+    };
+    let len = match stream.read_u32().await {
+        Ok(len) => bounded(len as usize, MAX_TEXT)?,
+        Err(e) => return cut_off(e),
+    };
+    let mut reason = vec![0u8; len];
+    if let Err(e) = stream.read_exact(&mut reason).await {
+        return cut_off(e);
+    }
+    let reason = String::from_utf8_lossy(&reason).into_owned();
+    Ok((!reason.is_empty()).then_some(reason))
 }
 
 // Runs version + security + ClientInit/ServerInit and returns the stream to keep using.
@@ -92,7 +107,8 @@ pub async fn handshake(
         text.parse::<u16>().ok()
     };
     let (major, minor) = (number(&banner[4..7]), number(&banner[8..11]));
-    let version = match (banner.starts_with(b"RFB "), major, minor) {
+    let framed = banner.starts_with(b"RFB ") && banner[7] == b'.' && banner[11] == b'\n';
+    let version = match (framed, major, minor) {
         (true, Some(3), Some(0..=6)) => Version::V3_3,
         (true, Some(3), Some(7)) => Version::V3_7,
         (true, Some(3..), Some(_)) => Version::V3_8,
@@ -113,13 +129,13 @@ pub async fn handshake(
     let offered = if matches!(version, Version::V3_3) {
         let kind = stream.read_u32().await?;
         if kind == 0 {
-            return Err(err(read_reason(&mut stream).await?));
+            return Err(err(read_reason(&mut stream).await?.unwrap_or(REFUSED.into())));
         }
         vec![u8::try_from(kind).map_err(|_| err(format!("the server offers only: type {kind}")))?]
     } else {
         let count = stream.read_u8().await?;
         if count == 0 {
-            return Err(err(read_reason(&mut stream).await?));
+            return Err(err(read_reason(&mut stream).await?.unwrap_or(REFUSED.into())));
         }
         let mut types = vec![0u8; count as usize];
         stream.read_exact(&mut types).await?;
@@ -145,15 +161,20 @@ pub async fn handshake(
     }
 
     // Before 3.8 a server sends no SecurityResult for type 1.
-    if (security != 1 || matches!(version, Version::V3_8)) && stream.read_u32().await? != 0 {
+    let result = match (security, &version) {
+        (1, Version::V3_3 | Version::V3_7) => 0,
+        _ => stream.read_u32().await?,
+    };
+    if result != 0 {
         let reason = match version {
             Version::V3_8 => read_reason(&mut stream).await?,
-            _ => String::new(),
+            _ => None,
         };
-        return Err(err(match (reason.is_empty(), security) {
-            (false, _) => reason,
-            (true, 1) => "the server refused the connection".into(),
-            (true, _) => "wrong password".into(),
+        return Err(err(match (reason, result, security) {
+            (Some(reason), _, _) => reason,
+            (None, 2, _) => "too many attempts".into(),
+            (None, _, 1) => REFUSED.into(),
+            (None, _, _) => "wrong password".into(),
         }));
     }
 
@@ -269,6 +290,11 @@ mod tests {
         script
     }
 
+    // Everything a client has sent once it has answered that challenge with "hunter2".
+    fn answered(reply: &str) -> Vec<u8> {
+        [reply.as_bytes(), &[2], &vnc_auth_response("hunter2", &[7; 16])].concat()
+    }
+
     #[tokio::test]
     async fn replies_with_the_highest_version_both_sides_speak() {
         for (banner, reply) in [
@@ -287,6 +313,15 @@ mod tests {
     #[tokio::test]
     async fn refuses_a_peer_that_is_not_a_vnc_server() {
         for banner in ["HTTP/1.1 400", "RFB abc.def\n", "RFB 003.+08\n", "RFB 002.000\n"] {
+            let outcome = play(vec![Write(banner.into())], "").await;
+            assert!(refusal(&outcome).contains("not a VNC server"), "{banner:?}");
+            assert!(outcome.sent.is_empty(), "{banner:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn banner_needs_its_dot_and_newline() {
+        for banner in ["RFB 003x008\n", "RFB 003.008X"] {
             let outcome = play(vec![Write(banner.into())], "").await;
             assert!(refusal(&outcome).contains("not a VNC server"), "{banner:?}");
             assert!(outcome.sent.is_empty(), "{banner:?}");
@@ -364,6 +399,7 @@ mod tests {
         script.push(Write([&[0, 0, 0, 1][..], &reason("Too many attempts")].concat()));
         let outcome = play(script, "hunter2").await;
         assert!(refusal(&outcome).contains("Too many attempts"));
+        assert_eq!(outcome.sent, answered("RFB 003.008\n"));
     }
 
     #[tokio::test]
@@ -372,6 +408,42 @@ mod tests {
         script.push(Write([&[0, 0, 0, 1][..], &reason("")].concat()));
         let outcome = play(script, "hunter2").await;
         assert!(refusal(&outcome).contains("wrong password"));
+        assert_eq!(outcome.sent, answered("RFB 003.008\n"));
+    }
+
+    #[tokio::test]
+    async fn v38_failure_cut_off_in_the_reason_is_a_wrong_password() {
+        for cut in [&[0, 0, 0, 1][..], &[0, 0, 0, 1, 0, 0], &[0, 0, 0, 1, 0, 0, 0, 9, b'T']] {
+            let mut script = challenging("RFB 003.008\n");
+            script.push(Write(cut.to_vec()));
+            let outcome = play(script, "hunter2").await;
+            assert!(refusal(&outcome).contains("wrong password"), "{cut:?}");
+            assert_eq!(outcome.sent, answered("RFB 003.008\n"), "{cut:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn v38_result_other_than_one_still_carries_a_reason() {
+        let mut script = challenging("RFB 003.008\n");
+        script.push(Write([&[0, 0, 0, 5][..], &reason("Locked out")].concat()));
+        let outcome = play(script, "hunter2").await;
+        assert!(refusal(&outcome).contains("Locked out"));
+        assert_eq!(outcome.sent, answered("RFB 003.008\n"));
+
+        let mut script = challenging("RFB 003.008\n");
+        script.push(Write([&[0, 0, 0, 5][..], &reason("")].concat()));
+        let outcome = play(script, "hunter2").await;
+        assert!(refusal(&outcome).contains("wrong password"));
+        assert_eq!(outcome.sent, answered("RFB 003.008\n"));
+    }
+
+    #[tokio::test]
+    async fn v38_result_two_without_a_reason_is_too_many_attempts() {
+        let mut script = challenging("RFB 003.008\n");
+        script.push(Write([&[0, 0, 0, 2][..], &reason("")].concat()));
+        let outcome = play(script, "hunter2").await;
+        assert!(refusal(&outcome).contains("too many attempts"));
+        assert_eq!(outcome.sent, answered("RFB 003.008\n"));
     }
 
     #[tokio::test]
@@ -380,6 +452,16 @@ mod tests {
         script.push(Write(vec![0, 0, 0, 1]));
         let outcome = play(script, "hunter2").await;
         assert!(refusal(&outcome).contains("wrong password"));
+        assert_eq!(outcome.sent, answered("RFB 003.007\n"));
+    }
+
+    #[tokio::test]
+    async fn v37_result_two_is_too_many_attempts() {
+        let mut script = challenging("RFB 003.007\n");
+        script.push(Write(vec![0, 0, 0, 2]));
+        let outcome = play(script, "hunter2").await;
+        assert!(refusal(&outcome).contains("too many attempts"));
+        assert_eq!(outcome.sent, answered("RFB 003.007\n"));
     }
 
     #[tokio::test]
@@ -398,6 +480,15 @@ mod tests {
         script.extend([Read(1), Write([&[0, 0, 0, 1][..], &reason("")].concat())]);
         let outcome = play(script, "").await;
         assert!(refusal(&outcome).contains("the server refused the connection"));
+    }
+
+    #[tokio::test]
+    async fn v38_none_refusal_cut_off_in_the_reason() {
+        let mut script = offering("RFB 003.008\n", &[1]);
+        script.extend([Read(1), Write(vec![0, 0, 0, 1])]);
+        let outcome = play(script, "").await;
+        assert!(refusal(&outcome).contains("the server refused the connection"));
+        assert_eq!(outcome.sent, [&b"RFB 003.008\n"[..], &[1]].concat());
     }
 
     #[tokio::test]
@@ -439,6 +530,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v33_type_zero_without_a_reason_is_a_refusal() {
+        let script = vec![
+            Write(b"RFB 003.003\n".into()),
+            Read(12),
+            Write([&[0, 0, 0, 0][..], &reason("")].concat()),
+        ];
+        let outcome = play(script, "hunter2").await;
+        assert!(refusal(&outcome).ends_with("vnc: the server refused the connection"));
+    }
+
+    #[tokio::test]
+    async fn v33_failures_are_named_by_the_result() {
+        let named = [(1, "wrong password"), (2, "too many attempts"), (9, "wrong password")];
+        for (result, message) in named {
+            let script = vec![
+                Write(b"RFB 003.003\n".into()),
+                Read(12),
+                Write(vec![0, 0, 0, 2]),
+                Write(vec![7; 16]),
+                Read(16),
+                Write(vec![0, 0, 0, result]),
+            ];
+            let outcome = play(script, "hunter2").await;
+            assert!(refusal(&outcome).contains(message), "{result}");
+            let response = vnc_auth_response("hunter2", &[7; 16]);
+            assert_eq!(outcome.sent, [&b"RFB 003.003\n"[..], &response].concat(), "{result}");
+        }
+    }
+
+    #[tokio::test]
     async fn v33_none_goes_straight_to_client_init() {
         let script = vec![
             Write(b"RFB 003.003\n".into()),
@@ -475,6 +596,18 @@ mod tests {
         let outcome = play(script, "").await;
         assert!(refusal(&outcome).contains("Too many security failures"));
         assert_eq!(outcome.sent, b"RFB 003.008\n");
+    }
+
+    #[tokio::test]
+    async fn no_security_types_without_a_reason_is_a_refusal() {
+        for banner in ["RFB 003.007\n", "RFB 003.008\n"] {
+            let mut script = offering(banner, &[]);
+            script.push(Write(reason("")));
+            let outcome = play(script, "hunter2").await;
+            let refused = refusal(&outcome);
+            assert!(refused.ends_with("vnc: the server refused the connection"), "{banner:?}");
+            assert_eq!(outcome.sent, banner.as_bytes());
+        }
     }
 
     #[tokio::test]

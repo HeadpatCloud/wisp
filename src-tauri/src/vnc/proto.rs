@@ -83,6 +83,31 @@ mod tests {
         );
     }
 
+    // Expected bytes from PyCryptodome DES-ECB over the bit-reversed key bytes.
+    #[test]
+    fn auth_response_uses_the_first_eight_password_bytes() {
+        let challenge: [u8; 16] = std::array::from_fn(|i| i as u8);
+        assert_eq!(
+            vnc_auth_response("password123", &challenge),
+            [
+                0xb8, 0x66, 0x92, 0x41, 0x25, 0xc8, 0xee, 0xbb, 0x9d, 0xeb, 0xc1, 0xdb, 0x61, 0xc5,
+                0x38, 0xe2,
+            ],
+        );
+    }
+
+    #[test]
+    fn auth_response_pads_a_short_password_with_zeros() {
+        let challenge: [u8; 16] = std::array::from_fn(|i| i as u8);
+        assert_eq!(
+            vnc_auth_response("pw", &challenge),
+            [
+                0x85, 0x86, 0x00, 0xd9, 0xaf, 0x14, 0x3c, 0x9e, 0x65, 0x41, 0xd3, 0xdd, 0x92, 0xa8,
+                0x35, 0xd0,
+            ],
+        );
+    }
+
     #[test]
     fn input_events_have_correct_layout() {
         assert_eq!(pointer_event(0b10, 0x0102, 0x0304), [5, 2, 1, 2, 3, 4]);

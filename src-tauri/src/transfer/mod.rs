@@ -1,10 +1,11 @@
+pub mod apply;
 pub mod bundle;
 pub mod export;
 pub mod plan;
 
 #[cfg(test)]
 use std::collections::{HashMap, HashSet};
-use std::path::{Component, Path};
+use std::path::{Component, Path, Prefix};
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -55,6 +56,14 @@ impl Env for LocalEnv<'_> {
         Path::new(rel).components().all(|c| matches!(c, Component::Normal(_)))
             && self.config_dir.join(rel).is_file()
     }
+}
+
+// True for Windows paths that leave the local drives: UNC shares, verbatim and device paths.
+pub(crate) fn is_network_path(path: &str) -> bool {
+    matches!(
+        Path::new(path).components().next(),
+        Some(Component::Prefix(p)) if !matches!(p.kind(), Prefix::Disk(_))
+    )
 }
 
 #[cfg(test)]

@@ -35,6 +35,7 @@ pub enum Version {
 }
 
 pub(super) const NEEDS_PASSWORD: &str = "this server needs a password";
+const NEEDS_USERNAME: &str = "this server needs a username";
 const REFUSED: &str = "the server refused the connection";
 
 pub fn security_name(t: u8) -> String {
@@ -63,13 +64,24 @@ fn offers_only(offered: &[u8]) -> String {
 
 // A password is never given up for type 1: a hostile server could advertise it to get us to
 // connect unauthenticated.
-pub fn choose_security(offered: &[u8], has_password: bool) -> Result<u8, String> {
-    let preferred: &[u8] = if has_password { &[19, 30, 2] } else { &[1, 19] };
+pub fn choose_security(
+    offered: &[u8],
+    has_password: bool,
+    has_username: bool,
+) -> Result<u8, String> {
+    let preferred: &[u8] = match (has_password, has_username) {
+        (true, true) => &[19, 30, 2],
+        (true, false) => &[19, 2],
+        (false, _) => &[1, 19],
+    };
     if let Some(t) = preferred.iter().find(|t| offered.contains(t)) {
         return Ok(*t);
     }
     if !has_password && offered.iter().any(|t| matches!(t, 2 | 30)) {
         return Err(NEEDS_PASSWORD.into());
+    }
+    if !has_username && offered.contains(&30) {
+        return Err(NEEDS_USERNAME.into());
     }
     Err(offers_only(offered))
 }
@@ -147,9 +159,11 @@ pub async fn handshake(
     let has_password = !login.password.is_empty();
     let usable: Vec<u8> =
         offered.iter().copied().filter(|t| matches!(t, 1 | 2 | 19 | 30)).collect();
-    let security = match choose_security(&usable, has_password) {
+    let security = match choose_security(&usable, has_password, !login.username.is_empty()) {
         Ok(security) => security,
-        Err(reason) if reason == NEEDS_PASSWORD => return Err(err(reason)),
+        Err(reason) if reason == NEEDS_PASSWORD || reason == NEEDS_USERNAME => {
+            return Err(err(reason));
+        }
         Err(_) => return Err(err(offers_only(&offered))),
     };
     // VeNCrypt asks this itself once it knows whether its login runs inside TLS.
@@ -241,6 +255,15 @@ mod tests {
 
     // `pinned` is on record for the host before the client connects.
     async fn play_pinned(script: Vec<Step>, password: &str, pinned: Option<&str>) -> Outcome {
+        play_as(script, "", password, pinned).await
+    }
+
+    async fn play_as(
+        script: Vec<Step>,
+        username: &str,
+        password: &str,
+        pinned: Option<&str>,
+    ) -> Outcome {
         let (client, mut server) = tokio::io::duplex(4096);
         let peer = tokio::spawn(async move {
             let mut sent = Vec::new();
@@ -265,7 +288,7 @@ mod tests {
         }
         let known = KnownHostsState(Arc::new(Mutex::new(hosts)));
         let tls = TlsContext { host: "127.0.0.1", port: 5900, known: &known };
-        let login = Login { username: "", password };
+        let login = Login { username, password };
         // Buffered, so a write the handshake does not flush never reaches the server.
         let client = tokio::io::BufWriter::new(client);
         let outcome = tokio::time::timeout(Duration::from_secs(2), async {
@@ -364,35 +387,56 @@ mod tests {
 
     #[test]
     fn password_logins_are_chosen_strongest_first() {
-        assert_eq!(choose_security(&[1, 2], true), Ok(2));
-        assert_eq!(choose_security(&[2, 19, 30], true), Ok(19));
-        assert_eq!(choose_security(&[2, 30], true), Ok(30));
+        assert_eq!(choose_security(&[1, 2], true, false), Ok(2));
+        assert_eq!(choose_security(&[1, 2], true, true), Ok(2));
+        assert_eq!(choose_security(&[2, 19, 30], true, true), Ok(19));
+        assert_eq!(choose_security(&[2, 30], true, true), Ok(30));
+    }
+
+    #[test]
+    fn the_apple_login_is_only_chosen_with_a_username() {
+        assert_eq!(choose_security(&[2, 30], true, false), Ok(2));
+        assert_eq!(choose_security(&[30, 19, 2], true, false), Ok(19));
+        for offered in [&[30][..], &[30, 16], &[1, 30]] {
+            assert_eq!(
+                choose_security(offered, true, false),
+                Err("this server needs a username".into()),
+                "{offered:?}",
+            );
+        }
+        for has_username in [false, true] {
+            assert_eq!(
+                choose_security(&[30], false, has_username),
+                Err("this server needs a password".into()),
+            );
+        }
     }
 
     #[test]
     fn a_password_never_falls_back_to_no_login() {
-        assert_eq!(choose_security(&[1], true), Err("the server offers only: None".into()));
-        let refused = choose_security(&[5, 16], true).unwrap_err();
+        let refused = choose_security(&[1], true, true);
+        assert_eq!(refused, Err("the server offers only: None".into()));
+        let refused = choose_security(&[5, 16], true, false).unwrap_err();
         assert!(refused.contains("RealVNC RA2") && refused.contains("Tight"), "{refused}");
         assert_eq!(
-            choose_security(&[5, 6, 16, 1], true),
+            choose_security(&[5, 6, 16, 1], true, true),
             Err("the server offers only: RealVNC RA2, Tight, None".into()),
         );
     }
 
     #[test]
     fn without_a_password_none_comes_before_vencrypt() {
-        assert_eq!(choose_security(&[1, 2], false), Ok(1));
-        assert_eq!(choose_security(&[19, 1], false), Ok(1));
-        assert_eq!(choose_security(&[2, 30, 19], false), Ok(19));
+        assert_eq!(choose_security(&[1, 2], false, false), Ok(1));
+        assert_eq!(choose_security(&[19, 1], false, true), Ok(1));
+        assert_eq!(choose_security(&[2, 30, 19], false, false), Ok(19));
         for needs_password in [2, 30] {
             assert_eq!(
-                choose_security(&[16, needs_password], false),
+                choose_security(&[16, needs_password], false, false),
                 Err("this server needs a password".into()),
             );
         }
         assert_eq!(
-            choose_security(&[5, 16], false),
+            choose_security(&[5, 16], false, false),
             Err("the server offers only: RealVNC RA2, Tight".into()),
         );
     }
@@ -528,7 +572,7 @@ mod tests {
 
     // Each server sends what would follow the choice along with its offer, so a client that
     // carried on would be seen answering it.
-    fn unencrypted_servers() -> Vec<(Vec<Step>, &'static str)> {
+    fn unencrypted_servers() -> Vec<(Vec<Step>, &'static str, &'static str)> {
         let offer = |banner: &str, types: &[u8], next: &[u8]| {
             let mut script = offering(banner, types);
             let Some(Write(list)) = script.last_mut() else { unreachable!() };
@@ -541,18 +585,18 @@ mod tests {
             Write([&[0, 0, 0, 2][..], &[7; 16]].concat()),
         ];
         vec![
-            (offer("RFB 003.008\n", &[2], &[7; 16]), "hunter2"),
-            (offer("RFB 003.008\n", &[1], &[0; 4]), ""),
-            (offer("RFB 003.007\n", &[1], &server_init(800, 600, "desk")), ""),
-            (offer("RFB 003.889\n", &[30], &APPLE_KEY), "hunter2"),
-            (v33, "hunter2"),
+            (offer("RFB 003.008\n", &[2], &[7; 16]), "", "hunter2"),
+            (offer("RFB 003.008\n", &[1], &[0; 4]), "", ""),
+            (offer("RFB 003.007\n", &[1], &server_init(800, 600, "desk")), "", ""),
+            (offer("RFB 003.889\n", &[30], &APPLE_KEY), "faye", "hunter2"),
+            (v33, "", "hunter2"),
         ]
     }
 
     #[tokio::test]
     async fn unencrypted_login_to_a_host_with_a_certificate_pin_is_refused() {
-        for (n, (script, password)) in unencrypted_servers().into_iter().enumerate() {
-            let outcome = play_pinned(script, password, Some("SHA256:ab")).await;
+        for (n, (script, username, password)) in unencrypted_servers().into_iter().enumerate() {
+            let outcome = play_as(script, username, password, Some("SHA256:ab")).await;
             match &outcome.result {
                 Err(AppError::HostKeyMismatch { host, port, stored, offered }) => {
                     assert_eq!(host, "vnc/127.0.0.1", "{n}");
@@ -804,7 +848,7 @@ mod tests {
         let mut script = offering("RFB 003.889\n", &[2, 30]);
         script.extend([Read(1), Write(APPLE_KEY.into()), Read(128 + 8), Write(vec![0; 4])]);
         script.extend([Read(1), Write(server_init(800, 600, "mac"))]);
-        let outcome = play(script, "hunter2").await;
+        let outcome = play_as(script, "faye", "hunter2", None).await;
         assert_eq!(outcome.sent.len(), 12 + 1 + 128 + 8 + 1);
         assert_eq!(&outcome.sent[..13], b"RFB 003.008\n\x1e");
         assert_eq!(outcome.sent[149], 1);
@@ -812,20 +856,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn without_a_username_the_vnc_password_is_used_instead_of_the_apple_login() {
+        let mut script = offering("RFB 003.889\n", &[2, 30]);
+        script.extend([Read(1), Write(vec![7; 16]), Read(16), Write(vec![0; 4])]);
+        script.extend([Read(1), Write(server_init(800, 600, "mac"))]);
+        let outcome = play(script, "hunter2").await;
+        assert_eq!(outcome.sent, [&answered("RFB 003.008\n")[..], &[1]].concat());
+        assert_eq!(outcome.result.unwrap().name, "mac");
+    }
+
+    #[tokio::test]
+    async fn apple_login_without_a_username_asks_for_one() {
+        for types in [&[30][..], &[30, 16], &[1, 30]] {
+            let outcome = play(offering("RFB 003.889\n", types), "hunter2").await;
+            assert!(refusal(&outcome).ends_with("vnc: this server needs a username"), "{types:?}");
+            assert_eq!(outcome.sent, b"RFB 003.008\n", "{types:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn apple_login_refused_is_a_wrong_password() {
         let mut script = offering("RFB 003.889\n", &[30]);
         script.extend([Read(1), Write(APPLE_KEY.into()), Read(128 + 8)]);
         script.push(Write([&[0, 0, 0, 1][..], &reason("")].concat()));
-        let outcome = play(script, "hunter2").await;
+        let outcome = play_as(script, "faye", "hunter2", None).await;
         assert!(refusal(&outcome).contains("wrong password"));
         assert_eq!(outcome.sent.len(), 12 + 1 + 128 + 8);
     }
 
     #[tokio::test]
     async fn apple_login_needs_a_password() {
-        let outcome = play(offering("RFB 003.889\n", &[30]), "").await;
-        assert!(refusal(&outcome).contains("this server needs a password"));
-        assert_eq!(outcome.sent, b"RFB 003.008\n");
+        for username in ["", "faye"] {
+            let outcome = play_as(offering("RFB 003.889\n", &[30]), username, "", None).await;
+            assert!(refusal(&outcome).contains("this server needs a password"), "{username:?}");
+            assert_eq!(outcome.sent, b"RFB 003.008\n", "{username:?}");
+        }
     }
 
     #[tokio::test]

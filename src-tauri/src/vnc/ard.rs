@@ -2,23 +2,26 @@ use aes::cipher::{Block, BlockCipherEncrypt, KeyInit};
 use aes::Aes128;
 use num_bigint::BigUint;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use zeroize::Zeroizing;
 
 use super::handshake::Login;
 use super::{bounded, err};
 use crate::error::{AppError, AppResult};
 
-const MAX_KEY: usize = 1024;
+// Apple's servers use 128 bytes; the arithmetic for 1024 would hold a thread for 0.3 s.
+const MAX_KEY: usize = 512;
 
-fn left_padded(value: &BigUint, len: usize) -> Vec<u8> {
-    let bytes = value.to_bytes_be();
-    let mut out = vec![0u8; len - bytes.len()];
-    out.extend(bytes);
+fn left_padded(value: &BigUint, len: usize) -> Zeroizing<Vec<u8>> {
+    let bytes = Zeroizing::new(value.to_bytes_be());
+    let mut out = Zeroizing::new(vec![0u8; len]);
+    out[len - bytes.len()..].copy_from_slice(&bytes);
     out
 }
 
 // Apple Remote Desktop login (RFB security type 30): a Diffie-Hellman exchange, then the
 // username and password in one 128-byte block under AES-128-ECB with the MD5 of the shared
-// secret as the key. The prime must not be zero.
+// secret as the key. The prime must not be zero. The secrets are wiped after use, except for
+// the copies inside `BigUint`, which it gives no way to wipe.
 pub fn response(
     generator: u16,
     prime: &[u8],
@@ -32,7 +35,7 @@ pub fn response(
     let private = BigUint::from_bytes_be(private);
     let public = BigUint::from(generator).modpow(&private, &modulus);
     let shared = BigUint::from_bytes_be(server_public).modpow(&private, &modulus);
-    let key = md5::compute(left_padded(&shared, prime.len()));
+    let key = Zeroizing::new(md5::compute(left_padded(&shared, prime.len())).0);
 
     let mut block = *pad;
     for (at, text) in [(0, username), (64, password)] {
@@ -40,13 +43,13 @@ pub fn response(
         block[at..at + text.len()].copy_from_slice(text);
         block[at + text.len()] = 0;
     }
-    let cipher = Aes128::new_from_slice(&key.0).expect("16-byte AES key");
+    let cipher = Aes128::new_from_slice(&*key).expect("16-byte AES key");
     for chunk in block.chunks_mut(16) {
         let mut b = Block::<Aes128>::try_from(&*chunk).expect("16-byte block");
         cipher.encrypt_block(&mut b);
         chunk.copy_from_slice(&b);
     }
-    (block.to_vec(), left_padded(&public, prime.len()))
+    (block.to_vec(), left_padded(&public, prime.len()).to_vec())
 }
 
 pub async fn login(
@@ -63,7 +66,7 @@ pub async fn login(
         return Err(err("the server sent an invalid key"));
     }
 
-    let mut private = vec![0u8; key_len];
+    let mut private = Zeroizing::new(vec![0u8; key_len]);
     getrandom::fill(&mut private).map_err(|_| AppError::Crypto)?;
     let mut pad = [0u8; 128];
     getrandom::fill(&mut pad).map_err(|_| AppError::Crypto)?;
@@ -250,12 +253,21 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("the server sent an invalid key"));
         assert!(sent.is_empty());
 
-        for key_len in [1025, 2000] {
+        for key_len in [513, 2000] {
             let (result, sent) = play(params(2, key_len, &[], &[]), "faye", "hunter2").await;
             let refused = result.unwrap_err().to_string();
-            assert!(refused.contains(&format!("declared length {key_len} exceeds 1024")));
+            assert!(refused.contains(&format!("declared length {key_len} exceeds 512")));
             assert!(sent.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn the_longest_key_is_512_bytes() {
+        let mut prime = [0xff; 512];
+        prime[511] = 0xfb;
+        let (result, sent) = play(params(2, 512, &prime, &[3; 512]), "faye", "hunter2").await;
+        result.unwrap();
+        assert_eq!(sent.len(), 128 + 512);
     }
 
     #[tokio::test]

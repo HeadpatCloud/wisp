@@ -8,7 +8,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use super::bundle::{KeyFile, Payload};
-use super::plan::{digest, group_depth, plan, same_tunnel, Plan};
+use super::plan::{digest, field, group_depth, plan, same_tunnel, Plan};
 use super::{ApplySummary, Env, ItemDecision, ItemKind, ItemProblem, ReviewItem};
 use crate::error::{AppError, AppResult};
 use crate::store::model::{AuthMethod, Group, IconRef, Profile, ProfileKey, ProfileStore, Tunnel};
@@ -258,16 +258,16 @@ pub fn stage(
                     .find(|x| x.id == local_id)
                     .cloned()
                     .expect("matched group exists");
-                if fields.contains("name") {
+                if fields.contains(field::NAME) {
                     next.name = g.name.clone();
                 }
-                if fields.contains("parentId") {
+                if fields.contains(field::PARENT_ID) {
                     match parent {
                         Ok(p) => next.parent_id = p,
                         Err(m) => s.problem(&key, m),
                     }
                 }
-                if fields.contains("icon") {
+                if fields.contains(field::ICON) {
                     next.icon = g.icon.clone();
                 }
                 if let Some(slot) = s.data.groups.iter_mut().find(|x| x.id == local_id) {
@@ -331,24 +331,24 @@ pub fn stage(
                     .expect("matched profile exists");
                 for f in &fields {
                     match *f {
-                        "name" => next.name = inc.name.clone(),
-                        "host" => next.host = inc.host.clone(),
-                        "port" => next.port = inc.port,
-                        "username" => next.username = inc.username.clone(),
-                        "authMethod" => next.auth_method = inc.auth_method,
-                        "groupId" => match s.group(inc.group_id.as_deref()) {
+                        field::NAME => next.name = inc.name.clone(),
+                        field::HOST => next.host = inc.host.clone(),
+                        field::PORT => next.port = inc.port,
+                        field::USERNAME => next.username = inc.username.clone(),
+                        field::AUTH_METHOD => next.auth_method = inc.auth_method,
+                        field::GROUP_ID => match s.group(inc.group_id.as_deref()) {
                             Ok(g) => next.group_id = g,
                             Err(m) => s.problem(&key, m),
                         },
-                        "jumpHostId" => match s.jump(inc.jump_host_id.as_deref()) {
+                        field::JUMP_HOST_ID => match s.jump(inc.jump_host_id.as_deref()) {
                             Ok(j) => next.jump_host_id = j,
                             Err(m) => s.problem(&key, m),
                         },
-                        "icon" => next.icon = inc.icon.clone(),
-                        "appearance" => next.appearance = inc.appearance.clone(),
-                        "tunnels" => next.tunnels = fresh_tunnels(&next.tunnels, &inc.tunnels),
-                        "keys" => next.keys = s.keys(&next.keys.clone(), &inc.keys),
-                        "password" => {
+                        field::ICON => next.icon = inc.icon.clone(),
+                        field::APPEARANCE => next.appearance = inc.appearance.clone(),
+                        field::TUNNELS => next.tunnels = fresh_tunnels(&next.tunnels, &inc.tunnels),
+                        field::KEYS => next.keys = s.keys(&next.keys.clone(), &inc.keys),
+                        field::PASSWORD => {
                             s.replaced.extend(next.secret_id.take());
                             next.secret_id = s.secret(inc.secret_id.as_deref());
                         }
@@ -424,14 +424,14 @@ pub fn stage(
                     .expect("matched sftp profile exists");
                 for f in &fields {
                     match *f {
-                        "name" => next.name = inc.name.clone(),
-                        "host" => next.host = inc.host.clone(),
-                        "port" => next.port = inc.port,
-                        "username" => next.username = inc.username.clone(),
-                        "authMethod" => next.auth_method = inc.auth_method,
-                        "icon" => next.icon = inc.icon.clone(),
-                        "keys" => next.keys = s.keys(&next.keys.clone(), &inc.keys),
-                        "password" => {
+                        field::NAME => next.name = inc.name.clone(),
+                        field::HOST => next.host = inc.host.clone(),
+                        field::PORT => next.port = inc.port,
+                        field::USERNAME => next.username = inc.username.clone(),
+                        field::AUTH_METHOD => next.auth_method = inc.auth_method,
+                        field::ICON => next.icon = inc.icon.clone(),
+                        field::KEYS => next.keys = s.keys(&next.keys.clone(), &inc.keys),
+                        field::PASSWORD => {
                             s.replaced.extend(next.secret_id.take());
                             next.secret_id = s.secret(inc.secret_id.as_deref());
                         }
@@ -485,16 +485,16 @@ pub fn stage(
                     .expect("matched s3 profile exists");
                 for f in &fields {
                     match *f {
-                        "name" => next.name = inc.name.clone(),
-                        "endpoint" => next.endpoint = inc.endpoint.clone(),
-                        "port" => next.port = inc.port,
-                        "region" => next.region = inc.region.clone(),
-                        "useTls" => next.use_tls = inc.use_tls,
-                        "pathStyle" => next.path_style = inc.path_style,
-                        "accessKeyId" => next.access_key_id = inc.access_key_id.clone(),
-                        "bucket" => next.bucket = inc.bucket.clone(),
-                        "icon" => next.icon = inc.icon.clone(),
-                        "password" => {
+                        field::NAME => next.name = inc.name.clone(),
+                        field::ENDPOINT => next.endpoint = inc.endpoint.clone(),
+                        field::PORT => next.port = inc.port,
+                        field::REGION => next.region = inc.region.clone(),
+                        field::USE_TLS => next.use_tls = inc.use_tls,
+                        field::PATH_STYLE => next.path_style = inc.path_style,
+                        field::ACCESS_KEY_ID => next.access_key_id = inc.access_key_id.clone(),
+                        field::BUCKET => next.bucket = inc.bucket.clone(),
+                        field::ICON => next.icon = inc.icon.clone(),
+                        field::PASSWORD => {
                             s.replaced.extend(next.secret_id.take());
                             next.secret_id = s.secret(inc.secret_id.as_deref());
                         }

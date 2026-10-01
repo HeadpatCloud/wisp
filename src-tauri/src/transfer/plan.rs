@@ -7,7 +7,8 @@ use sha2::{Digest, Sha256};
 use super::bundle::Payload;
 use super::{Env, FieldDiff, ItemKind, ItemStatus, LocalMatch, ReviewItem};
 use crate::store::model::{
-    AuthMethod, Group, IconRef, ProfileAppearance, ProfileKey, ProfileStore, Tunnel, TunnelKind,
+    AuthMethod, Group, IconRef, Profile, ProfileAppearance, ProfileKey, ProfileStore, S3Profile,
+    SftpProfile, Tunnel, TunnelKind,
 };
 use crate::store::normalize_keys;
 
@@ -15,6 +16,30 @@ pub struct Plan {
     pub items: Vec<ReviewItem>,
     pub unchanged: u32,
     pub matches: HashMap<String, String>,
+}
+
+// The ids of the review rows. The frontend sends them back in the decisions and `stage` applies
+// a row by its id, so they must not change.
+pub mod field {
+    pub const NAME: &str = "name";
+    pub const PARENT_ID: &str = "parentId";
+    pub const ICON: &str = "icon";
+    pub const HOST: &str = "host";
+    pub const PORT: &str = "port";
+    pub const USERNAME: &str = "username";
+    pub const AUTH_METHOD: &str = "authMethod";
+    pub const GROUP_ID: &str = "groupId";
+    pub const JUMP_HOST_ID: &str = "jumpHostId";
+    pub const APPEARANCE: &str = "appearance";
+    pub const TUNNELS: &str = "tunnels";
+    pub const KEYS: &str = "keys";
+    pub const PASSWORD: &str = "password";
+    pub const ENDPOINT: &str = "endpoint";
+    pub const REGION: &str = "region";
+    pub const USE_TLS: &str = "useTls";
+    pub const PATH_STYLE: &str = "pathStyle";
+    pub const ACCESS_KEY_ID: &str = "accessKeyId";
+    pub const BUCKET: &str = "bucket";
 }
 
 pub fn digest(bytes: &[u8]) -> String {
@@ -167,7 +192,7 @@ fn icon_field(
     }
     if local != incoming {
         fields.push(FieldDiff {
-            field: "icon".into(),
+            field: field::ICON.into(),
             label: "Icon".into(),
             local: icon_label(local),
             incoming: icon_label(incoming),
@@ -265,7 +290,7 @@ fn keys_field(
                 });
             if !same {
                 fields.push(FieldDiff {
-                    field: "keys".into(),
+                    field: field::KEYS.into(),
                     label: "Private keys".into(),
                     local: keys_label(&loc),
                     incoming: keys_label(&inc),
@@ -297,7 +322,7 @@ fn password_field(
         return;
     }
     fields.push(FieldDiff {
-        field: "password".into(),
+        field: field::PASSWORD.into(),
         label: label.into(),
         local: if current.is_some() { "••••".into() } else { "(none)".into() },
         incoming: if current.is_some() { "•••• (different)".into() } else { "••••".into() },
@@ -371,6 +396,183 @@ impl Collector<'_> {
             .map(|p| p.name.clone())
             .unwrap_or_else(|| id.into())
     }
+
+    fn group_fields(
+        &self,
+        l: &Group,
+        g: &Group,
+        parent: Option<&str>,
+        env: &dyn Env,
+        notes: &mut Vec<String>,
+    ) -> Vec<FieldDiff> {
+        let mut fields = vec![];
+        push(&mut fields, field::NAME, "Name", l.name.clone(), g.name.clone());
+        if l.parent_id.as_deref() != parent {
+            fields.push(FieldDiff {
+                field: field::PARENT_ID.into(),
+                label: "Parent group".into(),
+                local: l
+                    .parent_id
+                    .as_deref()
+                    .map(|p| self.group_name(p))
+                    .unwrap_or_else(|| "(top level)".into()),
+                incoming: parent
+                    .map(|p| self.group_name(p))
+                    .unwrap_or_else(|| "(top level)".into()),
+            });
+        }
+        icon_field(&l.icon, &g.icon, env, &mut fields, notes);
+        fields
+    }
+
+    fn ssh_fields(
+        &self,
+        l: &Profile,
+        inc: &Profile,
+        group: Option<&str>,
+        jump: Option<&str>,
+        env: &dyn Env,
+        notes: &mut Vec<String>,
+    ) -> Vec<FieldDiff> {
+        let mut fields = vec![];
+        push(&mut fields, field::NAME, "Name", l.name.clone(), inc.name.clone());
+        push(&mut fields, field::HOST, "Host", l.host.clone(), inc.host.clone());
+        push(&mut fields, field::PORT, "Port", l.port.to_string(), inc.port.to_string());
+        push(&mut fields, field::USERNAME, "Username", l.username.clone(), inc.username.clone());
+        push(&mut fields, field::AUTH_METHOD, "Login", auth(l.auth_method), auth(inc.auth_method));
+        if l.group_id.as_deref() != group {
+            fields.push(FieldDiff {
+                field: field::GROUP_ID.into(),
+                label: "Group".into(),
+                local: l
+                    .group_id
+                    .as_deref()
+                    .map(|g| self.group_name(g))
+                    .unwrap_or_else(|| "(ungrouped)".into()),
+                incoming: group.map(|g| self.group_name(g)).unwrap_or_else(|| "(ungrouped)".into()),
+            });
+        }
+        if l.jump_host_id.as_deref() != jump {
+            fields.push(FieldDiff {
+                field: field::JUMP_HOST_ID.into(),
+                label: "Jump host".into(),
+                local: text(l.jump_host_id.as_deref().map(|j| self.profile_name(j)).as_deref()),
+                incoming: text(jump.map(|j| self.profile_name(j)).as_deref()),
+            });
+        }
+        icon_field(&l.icon, &inc.icon, env, &mut fields, notes);
+        push(
+            &mut fields,
+            field::APPEARANCE,
+            "Appearance",
+            appearance_label(&l.appearance),
+            appearance_label(&inc.appearance),
+        );
+        let same_tunnels = l.tunnels.len() == inc.tunnels.len()
+            && l.tunnels.iter().zip(&inc.tunnels).all(|(a, b)| same_tunnel(a, b));
+        if !same_tunnels {
+            fields.push(FieldDiff {
+                field: field::TUNNELS.into(),
+                label: "Tunnels".into(),
+                local: tunnels_label(&l.tunnels),
+                incoming: tunnels_label(&inc.tunnels),
+            });
+        }
+        keys_field(Some(l.keys.as_slice()), &inc.keys, self.payload, env, &mut fields, notes);
+        password_field(
+            "Password",
+            l.secret_id.as_deref(),
+            inc.secret_id.as_deref(),
+            self.payload,
+            env,
+            &mut fields,
+        );
+        fields
+    }
+
+    fn sftp_fields(
+        &self,
+        l: &SftpProfile,
+        inc: &SftpProfile,
+        env: &dyn Env,
+        notes: &mut Vec<String>,
+    ) -> Vec<FieldDiff> {
+        let mut fields = vec![];
+        push(&mut fields, field::NAME, "Name", l.name.clone(), inc.name.clone());
+        push(&mut fields, field::HOST, "Host", l.host.clone(), inc.host.clone());
+        push(&mut fields, field::PORT, "Port", l.port.to_string(), inc.port.to_string());
+        push(&mut fields, field::USERNAME, "Username", l.username.clone(), inc.username.clone());
+        push(&mut fields, field::AUTH_METHOD, "Login", auth(l.auth_method), auth(inc.auth_method));
+        icon_field(&l.icon, &inc.icon, env, &mut fields, notes);
+        keys_field(Some(l.keys.as_slice()), &inc.keys, self.payload, env, &mut fields, notes);
+        password_field(
+            "Password",
+            l.secret_id.as_deref(),
+            inc.secret_id.as_deref(),
+            self.payload,
+            env,
+            &mut fields,
+        );
+        fields
+    }
+
+    fn s3_fields(
+        &self,
+        l: &S3Profile,
+        inc: &S3Profile,
+        env: &dyn Env,
+        notes: &mut Vec<String>,
+    ) -> Vec<FieldDiff> {
+        let mut fields = vec![];
+        push(&mut fields, field::NAME, "Name", l.name.clone(), inc.name.clone());
+        push(&mut fields, field::ENDPOINT, "Endpoint", l.endpoint.clone(), inc.endpoint.clone());
+        push(
+            &mut fields,
+            field::PORT,
+            "Port",
+            text(l.port.map(|p| p.to_string()).as_deref()),
+            text(inc.port.map(|p| p.to_string()).as_deref()),
+        );
+        push(&mut fields, field::REGION, "Region", l.region.clone(), inc.region.clone());
+        push(
+            &mut fields,
+            field::USE_TLS,
+            "Use TLS",
+            l.use_tls.to_string(),
+            inc.use_tls.to_string(),
+        );
+        push(
+            &mut fields,
+            field::PATH_STYLE,
+            "Path-style addressing",
+            l.path_style.to_string(),
+            inc.path_style.to_string(),
+        );
+        push(
+            &mut fields,
+            field::ACCESS_KEY_ID,
+            "Access key id",
+            l.access_key_id.clone(),
+            inc.access_key_id.clone(),
+        );
+        push(
+            &mut fields,
+            field::BUCKET,
+            "Bucket",
+            text(l.bucket.as_deref()),
+            text(inc.bucket.as_deref()),
+        );
+        icon_field(&l.icon, &inc.icon, env, &mut fields, notes);
+        password_field(
+            "Secret access key",
+            l.secret_id.as_deref(),
+            inc.secret_id.as_deref(),
+            self.payload,
+            env,
+            &mut fields,
+        );
+        fields
+    }
 }
 
 // Where an incoming group reference lands locally: the matched group, a group arriving in the
@@ -415,24 +617,8 @@ pub fn plan(local: &ProfileStore, payload: &Payload, env: &dyn Env) -> Plan {
         let as_new = vec![];
         match found {
             Some(l) => {
-                let (mut fields, mut notes) = (vec![], vec![]);
-                push(&mut fields, "name", "Name", l.name.clone(), g.name.clone());
-                if l.parent_id != parent {
-                    fields.push(FieldDiff {
-                        field: "parentId".into(),
-                        label: "Parent group".into(),
-                        local: l
-                            .parent_id
-                            .as_deref()
-                            .map(|p| c.group_name(p))
-                            .unwrap_or_else(|| "(top level)".into()),
-                        incoming: parent
-                            .as_deref()
-                            .map(|p| c.group_name(p))
-                            .unwrap_or_else(|| "(top level)".into()),
-                    });
-                }
-                icon_field(&l.icon, &g.icon, env, &mut fields, &mut notes);
+                let mut notes = vec![];
+                let fields = c.group_fields(l, g, parent.as_deref(), env, &mut notes);
                 c.matched(key, ItemKind::Group, &g.name, (&l.id, &l.name), fields, (notes, as_new));
             }
             None => c.added(key, ItemKind::Group, &g.name, as_new),
@@ -459,7 +645,7 @@ pub fn plan(local: &ProfileStore, payload: &Payload, env: &dyn Env) -> Plan {
     );
     for (inc, found) in ssh.iter().zip(found) {
         let key = ItemKind::Ssh.key(&inc.id);
-        let (mut fields, mut notes) = (vec![], vec![]);
+        let mut notes = vec![];
         let group = group_ref(inc.group_id.as_deref(), &group_map, payload, local, &mut notes);
         let mut as_new = notes.clone();
         let jump_ref = |same_jump: bool, notes: &mut Vec<String>| {
@@ -488,76 +674,8 @@ pub fn plan(local: &ProfileStore, payload: &Payload, env: &dyn Env) -> Plan {
             Some(l) => {
                 // A jump host the import leaves alone is not a change, even if it points nowhere.
                 let jump = jump_ref(l.jump_host_id == inc.jump_host_id, &mut notes);
-                push(&mut fields, "name", "Name", l.name.clone(), inc.name.clone());
-                push(&mut fields, "host", "Host", l.host.clone(), inc.host.clone());
-                push(&mut fields, "port", "Port", l.port.to_string(), inc.port.to_string());
-                push(&mut fields, "username", "Username", l.username.clone(), inc.username.clone());
-                push(
-                    &mut fields,
-                    "authMethod",
-                    "Login",
-                    auth(l.auth_method),
-                    auth(inc.auth_method),
-                );
-                if l.group_id != group {
-                    fields.push(FieldDiff {
-                        field: "groupId".into(),
-                        label: "Group".into(),
-                        local: l
-                            .group_id
-                            .as_deref()
-                            .map(|g| c.group_name(g))
-                            .unwrap_or_else(|| "(ungrouped)".into()),
-                        incoming: group
-                            .as_deref()
-                            .map(|g| c.group_name(g))
-                            .unwrap_or_else(|| "(ungrouped)".into()),
-                    });
-                }
-                if l.jump_host_id != jump {
-                    fields.push(FieldDiff {
-                        field: "jumpHostId".into(),
-                        label: "Jump host".into(),
-                        local: text(
-                            l.jump_host_id.as_deref().map(|j| c.profile_name(j)).as_deref(),
-                        ),
-                        incoming: text(jump.as_deref().map(|j| c.profile_name(j)).as_deref()),
-                    });
-                }
-                icon_field(&l.icon, &inc.icon, env, &mut fields, &mut notes);
-                push(
-                    &mut fields,
-                    "appearance",
-                    "Appearance",
-                    appearance_label(&l.appearance),
-                    appearance_label(&inc.appearance),
-                );
-                let same_tunnels = l.tunnels.len() == inc.tunnels.len()
-                    && l.tunnels.iter().zip(&inc.tunnels).all(|(a, b)| same_tunnel(a, b));
-                if !same_tunnels {
-                    fields.push(FieldDiff {
-                        field: "tunnels".into(),
-                        label: "Tunnels".into(),
-                        local: tunnels_label(&l.tunnels),
-                        incoming: tunnels_label(&inc.tunnels),
-                    });
-                }
-                keys_field(
-                    Some(l.keys.as_slice()),
-                    &inc.keys,
-                    payload,
-                    env,
-                    &mut fields,
-                    &mut notes,
-                );
-                password_field(
-                    "Password",
-                    l.secret_id.as_deref(),
-                    inc.secret_id.as_deref(),
-                    payload,
-                    env,
-                    &mut fields,
-                );
+                let fields =
+                    c.ssh_fields(l, inc, group.as_deref(), jump.as_deref(), env, &mut notes);
                 c.matched(key, ItemKind::Ssh, &inc.name, (&l.id, &l.name), fields, (notes, as_new));
             }
             None => c.added(key, ItemKind::Ssh, &inc.name, as_new),
@@ -575,39 +693,12 @@ pub fn plan(local: &ProfileStore, payload: &Payload, env: &dyn Env) -> Plan {
     );
     for (inc, found) in payload.sftp_profiles.iter().zip(found) {
         let key = ItemKind::Sftp.key(&inc.id);
-        let (mut fields, mut notes) = (vec![], vec![]);
         let mut as_new = vec![];
         keys_field(None, &inc.keys, payload, env, &mut vec![], &mut as_new);
         match found {
             Some(l) => {
-                push(&mut fields, "name", "Name", l.name.clone(), inc.name.clone());
-                push(&mut fields, "host", "Host", l.host.clone(), inc.host.clone());
-                push(&mut fields, "port", "Port", l.port.to_string(), inc.port.to_string());
-                push(&mut fields, "username", "Username", l.username.clone(), inc.username.clone());
-                push(
-                    &mut fields,
-                    "authMethod",
-                    "Login",
-                    auth(l.auth_method),
-                    auth(inc.auth_method),
-                );
-                icon_field(&l.icon, &inc.icon, env, &mut fields, &mut notes);
-                keys_field(
-                    Some(l.keys.as_slice()),
-                    &inc.keys,
-                    payload,
-                    env,
-                    &mut fields,
-                    &mut notes,
-                );
-                password_field(
-                    "Password",
-                    l.secret_id.as_deref(),
-                    inc.secret_id.as_deref(),
-                    payload,
-                    env,
-                    &mut fields,
-                );
+                let mut notes = vec![];
+                let fields = c.sftp_fields(l, inc, env, &mut notes);
                 c.matched(
                     key,
                     ItemKind::Sftp,
@@ -635,57 +726,11 @@ pub fn plan(local: &ProfileStore, payload: &Payload, env: &dyn Env) -> Plan {
     );
     for (inc, found) in payload.s3_profiles.iter().zip(found) {
         let key = ItemKind::S3.key(&inc.id);
-        let (mut fields, mut notes) = (vec![], vec![]);
         let as_new = vec![];
         match found {
             Some(l) => {
-                push(&mut fields, "name", "Name", l.name.clone(), inc.name.clone());
-                push(&mut fields, "endpoint", "Endpoint", l.endpoint.clone(), inc.endpoint.clone());
-                push(
-                    &mut fields,
-                    "port",
-                    "Port",
-                    text(l.port.map(|p| p.to_string()).as_deref()),
-                    text(inc.port.map(|p| p.to_string()).as_deref()),
-                );
-                push(&mut fields, "region", "Region", l.region.clone(), inc.region.clone());
-                push(
-                    &mut fields,
-                    "useTls",
-                    "Use TLS",
-                    l.use_tls.to_string(),
-                    inc.use_tls.to_string(),
-                );
-                push(
-                    &mut fields,
-                    "pathStyle",
-                    "Path-style addressing",
-                    l.path_style.to_string(),
-                    inc.path_style.to_string(),
-                );
-                push(
-                    &mut fields,
-                    "accessKeyId",
-                    "Access key id",
-                    l.access_key_id.clone(),
-                    inc.access_key_id.clone(),
-                );
-                push(
-                    &mut fields,
-                    "bucket",
-                    "Bucket",
-                    text(l.bucket.as_deref()),
-                    text(inc.bucket.as_deref()),
-                );
-                icon_field(&l.icon, &inc.icon, env, &mut fields, &mut notes);
-                password_field(
-                    "Secret access key",
-                    l.secret_id.as_deref(),
-                    inc.secret_id.as_deref(),
-                    payload,
-                    env,
-                    &mut fields,
-                );
+                let mut notes = vec![];
+                let fields = c.s3_fields(l, inc, env, &mut notes);
                 c.matched(key, ItemKind::S3, &inc.name, (&l.id, &l.name), fields, (notes, as_new));
             }
             None => c.added(key, ItemKind::S3, &inc.name, as_new),

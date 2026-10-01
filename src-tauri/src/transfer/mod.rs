@@ -5,6 +5,7 @@ pub mod plan;
 
 #[cfg(test)]
 use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, Prefix};
 
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,7 @@ pub trait Env {
     fn secret(&self, id: &str) -> Option<Zeroizing<Vec<u8>>>;
     fn read_file(&self, path: &str) -> Option<Vec<u8>>;
     fn icon_exists(&self, rel: &str) -> bool;
+    fn in_keys_dir(&self, path: &str) -> bool;
 }
 
 pub struct LocalEnv<'a> {
@@ -56,6 +58,10 @@ impl Env for LocalEnv<'_> {
         // The path comes from an imported bundle and is later joined onto the config dir.
         is_icon_path(rel) && self.config_dir.join(rel).is_file()
     }
+
+    fn in_keys_dir(&self, path: &str) -> bool {
+        is_in_dir(path, &self.config_dir.join("keys"))
+    }
 }
 
 // True for Windows paths that leave the local drives: UNC shares, verbatim and device paths, and
@@ -68,12 +74,30 @@ pub(crate) fn is_network_path(path: &str) -> bool {
         )
 }
 
+// True when `path` names an entry directly in `dir`. The folder is compared the way Windows
+// resolves it: case is ignored, and so are trailing dots and spaces on the folder's own name.
+fn is_in_dir(path: &str, dir: &Path) -> bool {
+    let folded = |p: &Path| -> Vec<OsString> {
+        p.components().map(|c| c.as_os_str().to_ascii_lowercase()).collect()
+    };
+    let parent = Path::new(path).parent();
+    let name = parent.and_then(Path::file_name).and_then(OsStr::to_str);
+    match (name, parent.and_then(Path::parent), dir.file_name(), dir.parent()) {
+        (Some(name), Some(above), Some(dir_name), Some(dir_above)) => {
+            dir_name.eq_ignore_ascii_case(name.trim_end_matches(['.', ' ']))
+                && folded(above) == folded(dir_above)
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 #[derive(Default)]
 pub struct MapEnv {
     pub secrets: HashMap<String, Vec<u8>>,
     pub files: HashMap<String, Vec<u8>>,
     pub icons: HashSet<String>,
+    pub keys_dir: Option<std::path::PathBuf>,
 }
 
 #[cfg(test)]
@@ -88,6 +112,10 @@ impl Env for MapEnv {
 
     fn icon_exists(&self, rel: &str) -> bool {
         self.icons.contains(rel)
+    }
+
+    fn in_keys_dir(&self, path: &str) -> bool {
+        self.keys_dir.as_deref().is_some_and(|dir| is_in_dir(path, dir))
     }
 }
 
@@ -278,6 +306,36 @@ mod tests {
             }
             let accepted: Vec<_> = spellings.iter().filter(|p| env.icon_exists(p)).collect();
             assert!(accepted.is_empty(), "{accepted:?}");
+        }
+    }
+
+    #[test]
+    fn is_in_dir_ignores_case_and_trailing_dots_on_the_folder() {
+        let config = std::env::temp_dir().join("wisp");
+        let dir = config.join("keys");
+        let text = |p: std::path::PathBuf| p.to_string_lossy().into_owned();
+        for inside in [
+            text(dir.join("id")),
+            text(dir.join("id.")),
+            text(dir.join("id::$DATA")),
+            text(dir.join("id")).to_ascii_uppercase(),
+            text(config.join("keys.").join("id")),
+            text(config.join("Keys . ").join("id")),
+        ] {
+            assert!(is_in_dir(&inside, &dir), "{inside}");
+        }
+        for outside in [
+            text(dir.clone()),
+            text(config.join("id")),
+            text(dir.join("sub").join("id")),
+            text(dir.join("..").join("id")),
+            text(config.join("keys2").join("id")),
+            text(config.join(".keys").join("id")),
+            text(std::env::temp_dir().join("keys").join("id")),
+            "id".to_string(),
+            String::new(),
+        ] {
+            assert!(!is_in_dir(&outside, &dir), "{outside}");
         }
     }
 

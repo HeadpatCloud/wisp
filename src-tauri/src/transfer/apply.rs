@@ -139,8 +139,12 @@ impl<'a> Stager<'a> {
             // A key path on a network share is never stored: opening it at connect time would
             // send the user's credentials to whatever server the bundle named. Nor is a path
             // spelled like a placeholder, which would alias another item's embedded key file.
+            // Nor is a path into the app's keys folder, unless the profile has that very path:
+            // under another spelling it would not keep the file it opens from being cleaned up.
             if embedded.is_none()
-                && (super::is_network_path(&k.path) || k.path.starts_with(KEY_PREFIX))
+                && (super::is_network_path(&k.path)
+                    || k.path.starts_with(KEY_PREFIX)
+                    || (self.env.in_keys_dir(&k.path) && !local.iter().any(|l| l.path == k.path)))
             {
                 continue;
             }
@@ -594,12 +598,15 @@ pub fn stage_reviewed(
 }
 
 fn safe_name(name: &str) -> String {
-    let cleaned: String = name
+    let head: String = name.chars().take(64).collect();
+    // Windows drops trailing dots and spaces from the name it creates; the stored path must be
+    // the name the file really has.
+    let cleaned: String = head
+        .trim_end_matches(['.', ' '])
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
-        .take(64)
         .collect();
-    if cleaned.trim_matches('.').is_empty() {
+    if cleaned.is_empty() {
         "key".into()
     } else {
         cleaned
@@ -1577,6 +1584,114 @@ mod tests {
             .collect();
         remove_unreferenced_keys(&keys, &spellings, &store_of(vec![web]));
         assert!(on_disk(&used));
+    }
+
+    #[test]
+    fn safe_name_drops_trailing_dots_and_spaces() {
+        assert_eq!(safe_name("id."), "id");
+        assert_eq!(safe_name("id. "), "id");
+        assert_eq!(safe_name("..."), "key");
+        assert_eq!(safe_name(&format!("{}.pub", "a".repeat(63))), "a".repeat(63));
+    }
+
+    // Other ways to write the path of an app-made key; Windows opens the same file for each.
+    fn spellings(key: &ProfileKey) -> [String; 4] {
+        let path = Path::new(&key.path);
+        let folder = path.parent().unwrap().to_string_lossy().to_ascii_uppercase();
+        let upper_folder = Path::new(&folder).join(path.file_name().unwrap());
+        [
+            format!("{}.", key.path),
+            format!("{} ", key.path),
+            format!("{}::$DATA", key.path),
+            upper_folder.to_string_lossy().into_owned(),
+        ]
+    }
+
+    #[test]
+    fn key_paths_into_the_keys_folder_are_never_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = dir.path().join("keys");
+        std::fs::create_dir(&keys).unwrap();
+        let v = vault(dir.path());
+        let env = LocalEnv { vault: &v, config_dir: dir.path() };
+        let used = app_key(&keys, 1);
+        let mut owner = profile("o", "owner", "h1");
+        owner.keys = vec![used.clone()];
+        let local = store_of(vec![owner, profile("pc", "web", "h2")]);
+
+        let mut new = profile("n", "new", "h9");
+        new.keys = spellings(&used)
+            .into_iter()
+            .chain([used.path.clone()])
+            .map(|path| ProfileKey { path, secret_id: None })
+            .collect();
+        let mut mac = profile("mac", "web", "h2");
+        mac.keys = new.keys.clone();
+        let payload = Payload { profiles: vec![new, mac], ..Default::default() };
+        let decisions = [accept("ssh:n", &[]), accept("ssh:mac", &["keys"])];
+        let staged =
+            stage(&local, &payload, &plan(&local, &payload, &env), &decisions, &env).unwrap();
+        assert_eq!(staged.summary, ApplySummary { added: 1, updated: 1 });
+        let stored: Vec<_> =
+            staged.data.profiles.iter().filter(|p| p.id != "o").flat_map(|p| &p.keys).collect();
+        assert!(stored.is_empty(), "{stored:?}");
+    }
+
+    // Imports new keys for a profile that uses an app-made key: `path` of that key, and one
+    // embedded key. Returns the app-made key, the keys the profile has afterwards, and whether
+    // the app-made file is still there after the cleanup.
+    fn import_over_app_key(
+        path: impl Fn(&ProfileKey) -> String,
+    ) -> (ProfileKey, Vec<ProfileKey>, bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = dir.path().join("keys");
+        std::fs::create_dir(&keys).unwrap();
+        let used = app_key(&keys, 1);
+        let mut pc = profile("pc", "web", "h1");
+        pc.auth_method = AuthMethod::Key;
+        pc.keys = vec![used.clone()];
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        let mut v = vault(dir.path());
+        store.commit(store_of(vec![pc.clone()])).unwrap();
+
+        let mut mac = pc.clone();
+        mac.id = "mac".into();
+        mac.keys = [path(&used), "/Users/me/c".into()]
+            .map(|path| ProfileKey { path, secret_id: None })
+            .into();
+        let mut payload = Payload { profiles: vec![mac], ..Default::default() };
+        payload.key_files.insert(
+            "/Users/me/c".into(),
+            KeyFile { file_name: "c".into(), data: Zeroizing::new(STANDARD.encode(b"C")) },
+        );
+        let snapshot = store.snapshot();
+        let staged = {
+            let env = LocalEnv { vault: &v, config_dir: dir.path() };
+            let planned = plan(&snapshot, &payload, &env);
+            stage(&snapshot, &payload, &planned, &[accept("ssh:mac", &["keys"])], &env).unwrap()
+        };
+        execute(&mut store, &mut v, &keys, staged).unwrap();
+        remove_unreferenced_keys(&keys, &pc.keys, &store.snapshot());
+        let stored = store.profiles().remove(0).keys;
+        let kept = on_disk(&used);
+        (used, stored, kept)
+    }
+
+    #[test]
+    fn another_spelling_of_the_profiles_app_key_is_not_stored_and_the_file_survives() {
+        for n in 0..4 {
+            let (used, stored, kept) = import_over_app_key(|key| spellings(key)[n].clone());
+            assert_eq!(stored, [used], "{n}");
+            assert!(kept, "{n}");
+        }
+    }
+
+    #[test]
+    fn the_profiles_own_app_key_path_is_kept() {
+        let (used, stored, kept) = import_over_app_key(|key| key.path.clone());
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0], used);
+        assert!(kept);
     }
 
     #[cfg(unix)]

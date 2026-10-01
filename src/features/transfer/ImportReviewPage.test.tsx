@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { StrictMode } from 'react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
@@ -343,6 +343,26 @@ test('Open is disabled while the password is checked and Enter submits', async (
   expect(readBundle).toHaveBeenCalledTimes(2)
   await act(async () => read.resolve({ kind: 'review', review }))
   expect(screen.getByText(/1 new/)).toBeInTheDocument()
+})
+
+test('Open submits its own tab when another import tab also asks for a password', async () => {
+  vi.mocked(readBundle).mockResolvedValue({ kind: 'needsPassword' })
+  const user = userEvent.setup()
+  render(
+    <>
+      <div className="hidden">
+        <ImportReviewPage tabId="a" path="C:/a.json" />
+      </div>
+      <div data-testid="second">
+        <ImportReviewPage tabId="b" path="C:/b.json" />
+      </div>
+    </>,
+  )
+  const second = within(screen.getByTestId('second'))
+  await user.type(await second.findByLabelText('Export password'), 'pw')
+  await user.click(second.getByRole('button', { name: 'Open' }))
+  expect(readBundle).toHaveBeenCalledWith('C:/b.json', 'pw')
+  expect(readBundle).not.toHaveBeenCalledWith('C:/a.json', expect.any(String))
 })
 
 test('a failed password read shows its message and the next attempt clears it', async () => {

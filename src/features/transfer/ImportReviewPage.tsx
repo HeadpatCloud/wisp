@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useRef, useState } from 'react'
 import type { ApplySummary, ImportReview, ItemKind, ItemProblem, ReviewItem } from '@/bindings'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -52,6 +52,9 @@ export function ImportReviewPage({ tabId, path }: { tabId: string; path: string 
   const reviewIdRef = useRef<string | null>(null)
   const runRef = useRef(0)
   const failedRef = useRef<Decisions | null>(null)
+  // Several import tabs can be mounted at once, so fixed ids would collide.
+  const formId = useId()
+  const passwordId = useId()
 
   // StrictMode mounts twice; a read that lands after its run ended still holds a decrypted
   // bundle in the backend, so it is discarded instead of shown.
@@ -170,14 +173,14 @@ export function ImportReviewPage({ tabId, path }: { tabId: string; path: string 
             <Button type="button" variant="ghost" onClick={() => removeTab(tabId)}>
               Cancel
             </Button>
-            <Button type="submit" form="import-password-form" disabled={!password || busy}>
+            <Button type="submit" form={formId} disabled={!password || busy}>
               Open
             </Button>
           </>
         }
       >
         <form
-          id="import-password-form"
+          id={formId}
           className="max-w-sm space-y-2 text-sm"
           onSubmit={(e) => {
             e.preventDefault()
@@ -186,9 +189,9 @@ export function ImportReviewPage({ tabId, path }: { tabId: string; path: string 
         >
           <p>This export is encrypted.</p>
           <div className="space-y-1">
-            <Label htmlFor="import-password">Export password</Label>
+            <Label htmlFor={passwordId}>Export password</Label>
             <Input
-              id="import-password"
+              id={passwordId}
               type="password"
               autoFocus
               value={password}

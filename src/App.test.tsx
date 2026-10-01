@@ -154,3 +154,27 @@ test('an active import review tab renders a single view host', () => {
   expect(screen.getAllByTestId('view-host')).toHaveLength(1)
   expect(screen.getByTestId('tabpane-tab-import')).toContainElement(screen.getByTestId('view-host'))
 })
+
+test('closing an import review tab unmounts it', () => {
+  useSessionStore.setState({ tabs: [tab1, importTab], activeTabId: 'tab-1' })
+  render(<App />)
+  expect(screen.getByTestId('tabpane-tab-import')).toBeInTheDocument()
+  act(() => {
+    useSessionStore.getState().removeTab('tab-import')
+  })
+  expect(screen.queryByTestId('tabpane-tab-import')).not.toBeInTheDocument()
+  expect(screen.queryByTestId('view-host')).not.toBeInTheDocument()
+})
+
+test('an export tab stays mounted while another tab is active', () => {
+  const exportTab = {
+    id: 'tab-export',
+    kind: 'view' as const,
+    view: { kind: 'transfer-export' as const },
+    title: 'Export profiles',
+  }
+  useSessionStore.setState({ tabs: [tab1, exportTab], activeTabId: 'tab-1' })
+  render(<App />)
+  expect(screen.getByTestId('tabpane-tab-export').className).toContain('hidden')
+  expect(screen.getByTestId('tabpane-tab-export')).toContainElement(screen.getByTestId('view-host'))
+})

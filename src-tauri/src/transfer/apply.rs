@@ -685,7 +685,7 @@ mod tests {
     use crate::store::model::{AuthMethod, Group, IconRef, Profile, ProfileKey};
     use crate::transfer::bundle::KeyFile;
     use crate::transfer::plan::plan;
-    use crate::transfer::MapEnv;
+    use crate::transfer::{LocalEnv, MapEnv};
     use zeroize::Zeroizing;
 
     fn profile(id: &str, name: &str, host: &str) -> Profile {
@@ -978,6 +978,28 @@ mod tests {
             KeyFile { file_name: "id".into(), data: Zeroizing::new(STANDARD.encode(b"K")) },
         );
         run(&store_of(vec![]), &payload, &[accept("ssh:n", &[])]).unwrap()
+    }
+
+    #[test]
+    fn icon_outside_the_icons_folder_becomes_the_default_icon() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = vault(dir.path());
+        std::fs::write(dir.path().join("vault.enc"), b"x").unwrap();
+        let env = LocalEnv { vault: &v, config_dir: dir.path() };
+        let icon = IconRef::Custom { path: "vault.enc".into() };
+        let mut inc = profile("n", "new", "h9");
+        inc.icon = icon.clone();
+        let payload = Payload {
+            groups: vec![Group { icon, ..group("g", "Lab", None) }],
+            profiles: vec![inc],
+            ..Default::default()
+        };
+        let local = store_of(vec![]);
+        let decisions = [accept("group:g", &[]), accept("ssh:n", &[])];
+        let staged =
+            stage(&local, &payload, &plan(&local, &payload, &env), &decisions, &env).unwrap();
+        assert_eq!(staged.data.groups[0].icon, IconRef::default());
+        assert_eq!(staged.data.profiles[0].icon, IconRef::default());
     }
 
     #[test]

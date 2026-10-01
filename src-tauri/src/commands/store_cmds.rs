@@ -3,17 +3,25 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Manager, State};
 
 use crate::error::{AppError, AppResult};
-use crate::store::model::{Group, IconRef, Profile, S3Profile, Settings, SftpProfile};
-use crate::store::Store;
+use crate::store::model::{Group, IconRef, Profile, ProfileStore, S3Profile, Settings, SftpProfile};
+use crate::store::{is_icon_path, Store};
 
 fn poisoned() -> AppError {
     AppError::Internal("store lock poisoned".into())
 }
 
-fn remove_custom_icon(app: &AppHandle, icon: &IconRef) {
+fn icon_in_use(data: &ProfileStore, path: &str) -> bool {
+    let same = |icon: &IconRef| matches!(icon, IconRef::Custom { path: p } if p == path);
+    data.groups.iter().any(|g| same(&g.icon))
+        || data.profiles.iter().any(|p| same(&p.icon))
+        || data.sftp_profiles.iter().any(|p| same(&p.icon))
+        || data.s3_profiles.iter().any(|p| same(&p.icon))
+}
+
+fn remove_custom_icon(app: &AppHandle, icon: &IconRef, data: &ProfileStore) {
     // Best-effort: a leftover icon file must never block deleting the profile.
     if let IconRef::Custom { path } = icon {
-        if path.contains("..") {
+        if !is_icon_path(path) || icon_in_use(data, path) {
             return;
         }
         if let Ok(dir) = app.path().app_config_dir() {
@@ -49,14 +57,11 @@ pub fn upsert_group(store: State<'_, Mutex<Store>>, group: Group) -> AppResult<(
 #[tauri::command]
 #[specta::specta]
 pub fn delete_group(app: AppHandle, store: State<'_, Mutex<Store>>, id: String) -> AppResult<()> {
-    let icon = {
-        let mut s = store.lock().map_err(|_| poisoned())?;
-        let icon = s.groups().into_iter().find(|g| g.id == id).map(|g| g.icon);
-        s.delete_group(&id)?;
-        icon
-    };
+    let mut s = store.lock().map_err(|_| poisoned())?;
+    let icon = s.groups().into_iter().find(|g| g.id == id).map(|g| g.icon);
+    s.delete_group(&id)?;
     if let Some(icon) = icon {
-        remove_custom_icon(&app, &icon);
+        remove_custom_icon(&app, &icon, &s.snapshot());
     }
     Ok(())
 }
@@ -70,14 +75,11 @@ pub fn upsert_profile(store: State<'_, Mutex<Store>>, profile: Profile) -> AppRe
 #[tauri::command]
 #[specta::specta]
 pub fn delete_profile(app: AppHandle, store: State<'_, Mutex<Store>>, id: String) -> AppResult<()> {
-    let icon = {
-        let mut s = store.lock().map_err(|_| poisoned())?;
-        let icon = s.profiles().into_iter().find(|p| p.id == id).map(|p| p.icon);
-        s.delete_profile(&id)?;
-        icon
-    };
+    let mut s = store.lock().map_err(|_| poisoned())?;
+    let icon = s.profiles().into_iter().find(|p| p.id == id).map(|p| p.icon);
+    s.delete_profile(&id)?;
     if let Some(icon) = icon {
-        remove_custom_icon(&app, &icon);
+        remove_custom_icon(&app, &icon, &s.snapshot());
     }
     Ok(())
 }
@@ -107,14 +109,11 @@ pub fn delete_s3_profile(
     store: State<'_, Mutex<Store>>,
     id: String,
 ) -> AppResult<()> {
-    let icon = {
-        let mut s = store.lock().map_err(|_| poisoned())?;
-        let icon = s.s3_profiles().into_iter().find(|p| p.id == id).map(|p| p.icon);
-        s.delete_s3_profile(&id)?;
-        icon
-    };
+    let mut s = store.lock().map_err(|_| poisoned())?;
+    let icon = s.s3_profiles().into_iter().find(|p| p.id == id).map(|p| p.icon);
+    s.delete_s3_profile(&id)?;
     if let Some(icon) = icon {
-        remove_custom_icon(&app, &icon);
+        remove_custom_icon(&app, &icon, &s.snapshot());
     }
     Ok(())
 }
@@ -138,14 +137,47 @@ pub fn delete_sftp_profile(
     store: State<'_, Mutex<Store>>,
     id: String,
 ) -> AppResult<()> {
-    let icon = {
-        let mut s = store.lock().map_err(|_| poisoned())?;
-        let icon = s.sftp_profiles().into_iter().find(|p| p.id == id).map(|p| p.icon);
-        s.delete_sftp_profile(&id)?;
-        icon
-    };
+    let mut s = store.lock().map_err(|_| poisoned())?;
+    let icon = s.sftp_profiles().into_iter().find(|p| p.id == id).map(|p| p.icon);
+    s.delete_sftp_profile(&id)?;
     if let Some(icon) = icon {
-        remove_custom_icon(&app, &icon);
+        remove_custom_icon(&app, &icon, &s.snapshot());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn icon_is_in_use_while_any_group_or_profile_points_at_it() {
+        let custom = |path: &str| serde_json::json!({ "kind": "custom", "path": path });
+        let data: ProfileStore = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "groups": [{
+                "id": "g", "name": "g", "parentId": null, "icon": custom("icons/g.png"), "order": 0
+            }],
+            "profiles": [{
+                "id": "p", "name": "p", "groupId": null, "host": "h", "port": 22, "username": "u",
+                "authMethod": "agent", "secretId": null, "icon": custom("icons/p.png"),
+                "order": 0, "jumpHostId": null
+            }],
+            "sftpProfiles": [{
+                "id": "f", "name": "f", "host": "h", "port": 22, "username": "u",
+                "authMethod": "agent", "secretId": null, "icon": custom("icons/f.png"), "order": 0
+            }],
+            "s3Profiles": [{
+                "id": "s", "name": "s", "endpoint": "e", "port": null, "region": "r",
+                "useTls": true, "pathStyle": false, "accessKeyId": "AK", "secretId": null,
+                "bucket": null, "icon": custom("icons/s.png"), "order": 0
+            }]
+        }))
+        .unwrap();
+        for path in ["icons/g.png", "icons/p.png", "icons/f.png", "icons/s.png"] {
+            assert!(icon_in_use(&data, path), "{path}");
+        }
+        assert!(!icon_in_use(&data, "icons/other.png"));
+        assert!(!icon_in_use(&ProfileStore::default(), "icons/g.png"));
+    }
 }

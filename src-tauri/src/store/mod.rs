@@ -1,7 +1,7 @@
 pub mod io;
 pub mod model;
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use crate::error::{AppError, AppResult};
 use model::{AuthMethod, Group, Profile, ProfileKey, ProfileStore, S3Profile, SftpProfile, Settings};
@@ -23,6 +23,15 @@ pub(crate) fn normalize_keys(p: &mut Profile) {
     }
     let secret_id = if p.auth_method == AuthMethod::Key { p.secret_id.take() } else { None };
     p.keys.push(ProfileKey { path, secret_id });
+}
+
+// A custom icon is always `icons/<file>`. The path can come from an imported bundle and is
+// joined onto the config dir, where it is read and later deleted.
+pub(crate) fn is_icon_path(rel: &str) -> bool {
+    let mut parts = Path::new(rel).components();
+    matches!(parts.next(), Some(Component::Normal(dir)) if dir == "icons")
+        && matches!(parts.next(), Some(Component::Normal(_)))
+        && parts.next().is_none()
 }
 
 impl Store {

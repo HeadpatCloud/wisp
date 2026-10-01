@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 use zeroize::Zeroizing;
 
+use crate::store::is_icon_path;
 use crate::vault::Vault;
 
 pub trait Env {
@@ -53,8 +54,7 @@ impl Env for LocalEnv<'_> {
 
     fn icon_exists(&self, rel: &str) -> bool {
         // The path comes from an imported bundle and is later joined onto the config dir.
-        Path::new(rel).components().all(|c| matches!(c, Component::Normal(_)))
-            && self.config_dir.join(rel).is_file()
+        is_icon_path(rel) && self.config_dir.join(rel).is_file()
     }
 }
 
@@ -217,7 +217,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn icon_exists_only_for_files_inside_the_config_dir() {
+    fn icon_exists_only_for_files_in_the_icons_folder() {
         let dir = tempfile::tempdir().unwrap();
         let vault =
             Vault::open_with_key(dir.path().join("vault.enc"), Zeroizing::new([1u8; 32])).unwrap();
@@ -230,6 +230,16 @@ mod tests {
         assert!(!env.icon_exists("icons/missing.png"));
         assert!(!env.icon_exists(""));
         assert!(!env.icon_exists(icon.to_str().unwrap()));
+
+        std::fs::create_dir(dir.path().join("icons").join("a")).unwrap();
+        std::fs::create_dir(dir.path().join("keys")).unwrap();
+        for other in
+            ["vault.enc", "profiles.json", "keys/x", "icons/a/b.png", "icons/../vault.enc"]
+        {
+            std::fs::write(dir.path().join(other), b"x").unwrap();
+            assert!(dir.path().join(other).is_file());
+            assert!(!env.icon_exists(other), "{other}");
+        }
 
         let dir_name = dir.path().file_name().unwrap().to_str().unwrap();
         let outside = format!("../{dir_name}/icons/a.png");

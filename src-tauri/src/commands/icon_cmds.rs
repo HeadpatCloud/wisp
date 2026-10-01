@@ -5,6 +5,7 @@ use base64::Engine as _;
 use tauri::{AppHandle, Manager};
 
 use crate::error::{AppError, AppResult};
+use crate::store::is_icon_path;
 
 const MAX_ICON_BYTES: u64 = 2 * 1024 * 1024;
 
@@ -65,7 +66,7 @@ pub async fn import_icon(app: AppHandle, source_path: String) -> AppResult<Strin
 #[tauri::command]
 #[specta::specta]
 pub async fn read_icon(app: AppHandle, rel_path: String) -> AppResult<String> {
-    if rel_path.contains("..") {
+    if !is_icon_path(&rel_path) {
         return Err(AppError::Io("invalid icon path".into()));
     }
     let path = app

@@ -10,14 +10,14 @@ use crate::store::Store;
 use crate::transfer::bundle::{self, Opened, Payload};
 use crate::transfer::{
     apply, export, plan, ApplySummary, ExportOptions, ExportSelection, ExportSummary, ImportReview,
-    ItemDecision, ItemProblem, LocalEnv, ReadOutcome,
+    ItemDecision, ItemProblem, LocalEnv, ReadOutcome, ReviewItem,
 };
 use crate::vault::Vault;
 
 // Decoded bundles (possibly with secrets) wait here between review and apply, so nothing
-// sensitive ever crosses into the webview.
+// sensitive ever crosses into the webview. Each is kept with the items the user was shown.
 #[derive(Default)]
-pub struct PendingImports(pub Mutex<HashMap<String, Payload>>);
+pub struct PendingImports(pub Mutex<HashMap<String, (Payload, Vec<ReviewItem>)>>);
 
 fn poisoned() -> AppError {
     AppError::Internal("lock poisoned".into())
@@ -98,7 +98,8 @@ pub fn transfer_read(
         plan::plan(&s.snapshot(), &payload, &LocalEnv { vault: &v, config_dir: &dir })
     };
     let review_id = uuid::Uuid::new_v4().to_string();
-    pending.0.lock().map_err(|_| poisoned())?.insert(review_id.clone(), payload);
+    let reviewed = planned.items.clone();
+    pending.0.lock().map_err(|_| poisoned())?.insert(review_id.clone(), (payload, reviewed));
     Ok(ReadOutcome::Review {
         review: ImportReview { review_id, items: planned.items, unchanged: planned.unchanged },
     })
@@ -116,15 +117,15 @@ pub fn transfer_validate(
 ) -> AppResult<Vec<ItemProblem>> {
     let dir = config_dir(&app)?;
     let pending = pending.0.lock().map_err(|_| poisoned())?;
-    let payload = pending
+    let (payload, reviewed) = pending
         .get(&review_id)
         .ok_or_else(|| AppError::NotFound(format!("import {review_id}")))?;
     let s = store.lock().map_err(|_| poisoned())?;
     let v = vault.lock().map_err(|_| poisoned())?;
     let snapshot = s.snapshot();
     let env = LocalEnv { vault: &v, config_dir: &dir };
-    let planned = plan::plan(&snapshot, payload, &env);
-    Ok(apply::stage(&snapshot, payload, &planned, &decisions, &env).err().unwrap_or_default())
+    let staged = apply::stage_reviewed(&snapshot, payload, reviewed, &decisions, &env)?;
+    Ok(staged.err().unwrap_or_default())
 }
 
 #[tauri::command]
@@ -139,7 +140,7 @@ pub fn transfer_apply(
 ) -> AppResult<ApplySummary> {
     let dir = config_dir(&app)?;
     let mut pending = pending.0.lock().map_err(|_| poisoned())?;
-    let payload = pending
+    let (payload, reviewed) = pending
         .get(&review_id)
         .ok_or_else(|| AppError::NotFound(format!("import {review_id}")))?;
     let mut s = store.lock().map_err(|_| poisoned())?;
@@ -147,8 +148,7 @@ pub fn transfer_apply(
     let snapshot = s.snapshot();
     let staged = {
         let env = LocalEnv { vault: &v, config_dir: &dir };
-        let planned = plan::plan(&snapshot, payload, &env);
-        apply::stage(&snapshot, payload, &planned, &decisions, &env)
+        apply::stage_reviewed(&snapshot, payload, reviewed, &decisions, &env)?
             .map_err(|p| AppError::Import(format!("{} item(s) still need attention", p.len())))?
     };
     let summary = apply::execute(&mut s, &mut v, &dir.join("keys"), staged)?;

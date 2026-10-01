@@ -7,8 +7,8 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use super::bundle::{KeyFile, Payload};
-use super::plan::{digest, group_depth, same_tunnel, Plan};
-use super::{ApplySummary, Env, ItemDecision, ItemKind, ItemProblem};
+use super::plan::{digest, group_depth, plan, same_tunnel, Plan};
+use super::{ApplySummary, Env, ItemDecision, ItemKind, ItemProblem, ReviewItem};
 use crate::error::{AppError, AppResult};
 use crate::store::model::{AuthMethod, Group, IconRef, Profile, ProfileKey, ProfileStore, Tunnel};
 use crate::store::{normalize_keys, Store};
@@ -566,6 +566,26 @@ pub fn stage(
     })
 }
 
+pub fn stage_reviewed(
+    local: &ProfileStore,
+    payload: &Payload,
+    reviewed: &[ReviewItem],
+    decisions: &[ItemDecision],
+    env: &dyn Env,
+) -> AppResult<Result<Staged, Vec<ItemProblem>>> {
+    let planned = plan(local, payload, env);
+    // The decisions were made on the stored review; on a different plan they could land on a
+    // profile the user never saw.
+    if planned.items != reviewed {
+        return Err(AppError::Import(
+            "your profiles changed since this file was opened; close this tab and import the \
+             file again"
+                .into(),
+        ));
+    }
+    Ok(stage(local, payload, &planned, decisions, env))
+}
+
 fn safe_name(name: &str) -> String {
     let cleaned: String = name
         .chars()
@@ -1092,6 +1112,74 @@ mod tests {
         payload.secrets.insert("mac-pw".into(), Zeroizing::new("new".into()));
         let staged = run(&store.snapshot(), &payload, &[accept("ssh:mac", &["password"])]).unwrap();
         (store, v, old, staged)
+    }
+
+    // Two local profiles on one server, and a review of an incoming profile that matched "web".
+    fn reviewed_import(dir: &std::path::Path) -> (Store, Vault, String, Payload, Vec<ReviewItem>) {
+        let mut store = Store::load(dir.to_path_buf()).unwrap();
+        let mut v = vault(dir);
+        let old = v.set_secret(b"old").unwrap();
+        let mut web = profile("w", "web", "h1");
+        web.secret_id = Some(old.clone());
+        store.commit(store_of(vec![web, profile("d", "db", "h1")])).unwrap();
+        let mut mac = profile("mac", "web", "h1");
+        mac.auth_method = AuthMethod::Agent;
+        mac.secret_id = Some("mac-pw".into());
+        let mut payload = Payload { profiles: vec![mac], ..Default::default() };
+        payload.secrets.insert("mac-pw".into(), Zeroizing::new("new".into()));
+        let items =
+            plan(&store.snapshot(), &payload, &LocalEnv { vault: &v, config_dir: dir }).items;
+        assert_eq!(items[0].matched.as_ref().unwrap().id, "w");
+        (store, v, old, payload, items)
+    }
+
+    #[test]
+    fn reviewed_import_applies_while_the_store_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, mut v, old, payload, items) = reviewed_import(dir.path());
+        let decisions = [accept("ssh:mac", &["authMethod", "password"])];
+        let staged = {
+            let env = LocalEnv { vault: &v, config_dir: dir.path() };
+            stage_reviewed(&store.snapshot(), &payload, &items, &decisions, &env).unwrap().unwrap()
+        };
+        execute(&mut store, &mut v, &dir.path().join("keys"), staged).unwrap();
+        let profiles = store.profiles();
+        assert_eq!(profiles[0].auth_method, AuthMethod::Agent);
+        assert_eq!(
+            v.get_secret(profiles[0].secret_id.as_deref().unwrap()).unwrap().as_slice(),
+            b"new"
+        );
+        assert!(!v.has_secret(&old));
+        assert_eq!(profiles[1], profile("d", "db", "h1"));
+    }
+
+    #[test]
+    fn import_is_refused_when_its_match_changed_after_the_review() {
+        let delete: fn(&mut Store) = |s| s.delete_profile("w").unwrap();
+        let edit: fn(&mut Store) = |s| {
+            let mut web = s.profiles()[0].clone();
+            web.auth_method = AuthMethod::Key;
+            s.upsert_profile(web).unwrap();
+        };
+        for change in [delete, edit] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut store, v, old, payload, items) = reviewed_import(dir.path());
+            change(&mut store);
+            let on_disk = |name: &str| std::fs::read(dir.path().join(name)).unwrap();
+            let before = (store.snapshot(), on_disk("profiles.json"), on_disk("vault.enc"));
+
+            let env = LocalEnv { vault: &v, config_dir: dir.path() };
+            let decisions = [accept("ssh:mac", &["authMethod", "password"])];
+            let result = stage_reviewed(&store.snapshot(), &payload, &items, &decisions, &env);
+            let Err(AppError::Import(message)) = result else { panic!("not refused") };
+            assert_eq!(
+                message,
+                "your profiles changed since this file was opened; close this tab and import \
+                 the file again"
+            );
+            assert_eq!((store.snapshot(), on_disk("profiles.json"), on_disk("vault.enc")), before);
+            assert_eq!(v.get_secret(&old).unwrap().as_slice(), b"old");
+        }
     }
 
     #[test]

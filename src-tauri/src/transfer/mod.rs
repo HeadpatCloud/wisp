@@ -3,7 +3,7 @@ pub mod export;
 
 #[cfg(test)]
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Component, Path};
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -32,7 +32,9 @@ impl Env for LocalEnv<'_> {
     }
 
     fn icon_exists(&self, rel: &str) -> bool {
-        !rel.contains("..") && self.config_dir.join(rel).is_file()
+        // The path comes from an imported bundle and is later joined onto the config dir.
+        Path::new(rel).components().all(|c| matches!(c, Component::Normal(_)))
+            && self.config_dir.join(rel).is_file()
     }
 }
 
@@ -176,4 +178,45 @@ pub struct ItemProblem {
 pub struct ApplySummary {
     pub added: u32,
     pub updated: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn icon_exists_only_for_files_inside_the_config_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault =
+            Vault::open_with_key(dir.path().join("vault.enc"), Zeroizing::new([1u8; 32])).unwrap();
+        let env = LocalEnv { vault: &vault, config_dir: dir.path() };
+        std::fs::create_dir(dir.path().join("icons")).unwrap();
+        let icon = dir.path().join("icons").join("a.png");
+        std::fs::write(&icon, b"png").unwrap();
+
+        assert!(env.icon_exists("icons/a.png"));
+        assert!(!env.icon_exists("icons/missing.png"));
+        assert!(!env.icon_exists(""));
+        assert!(!env.icon_exists(icon.to_str().unwrap()));
+
+        let dir_name = dir.path().file_name().unwrap().to_str().unwrap();
+        let outside = format!("../{dir_name}/icons/a.png");
+        assert!(dir.path().join(&outside).is_file());
+        assert!(!env.icon_exists(&outside));
+
+        #[cfg(windows)]
+        {
+            let rooted: std::path::PathBuf = icon
+                .components()
+                .filter(|c| !matches!(c, std::path::Component::Prefix(_)))
+                .collect();
+            let rooted = rooted.to_str().unwrap();
+            assert!(rooted.starts_with('\\'));
+            let forward = icon.to_str().unwrap().replace('\\', "/");
+            for path in [rooted.to_string(), rooted.replace('\\', "/"), forward] {
+                assert!(dir.path().join(&path).is_file());
+                assert!(!env.icon_exists(&path));
+            }
+        }
+    }
 }

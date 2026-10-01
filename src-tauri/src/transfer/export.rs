@@ -34,10 +34,12 @@ pub fn build(
             break;
         }
         for id in missing {
+            if !profile_ids.insert(id) {
+                continue;
+            }
             if let Some(p) = data.profiles.iter().find(|p| p.id == id) {
                 warnings.push(format!("Also exported jump host \"{}\"", p.name));
             }
-            profile_ids.insert(id);
         }
     }
 
@@ -193,6 +195,16 @@ mod tests {
         let profiles: Vec<_> = payload.profiles.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(profiles, ["web", "bastion"]);
         assert!(warnings.iter().any(|w| w.contains("bastion")));
+    }
+
+    #[test]
+    fn shared_jump_host_is_warned_about_once() {
+        let mut data = store();
+        data.profiles.push(profile("db", None, Some("bastion")));
+        let (payload, warnings) =
+            build(&data, &MapEnv::default(), &select(&["web", "db"]), &ExportOptions::default());
+        assert_eq!(payload.profiles.len(), 3);
+        assert_eq!(warnings.iter().filter(|w| w.contains("bastion")).count(), 1);
     }
 
     #[test]

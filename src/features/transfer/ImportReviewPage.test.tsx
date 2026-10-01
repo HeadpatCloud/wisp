@@ -1,6 +1,7 @@
 import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { beforeEach, expect, test, vi } from 'vitest'
+import { StrictMode } from 'react'
+import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
 vi.mock('@/bindings', () => ({}))
 vi.mock('@/lib/transfer', () => ({
@@ -73,6 +74,10 @@ beforeEach(() => {
   useSessionStore.setState({ removeTab } as never)
 })
 
+afterEach(() => {
+  vi.restoreAllMocks()
+})
+
 test('asks for the password, reports a wrong one, then shows the review', async () => {
   vi.mocked(readBundle)
     .mockResolvedValueOnce({ kind: 'needsPassword' })
@@ -104,6 +109,17 @@ test('field toggles, apply payload, reload and summary', async () => {
   ])
   expect(await screen.findByText('Imported: 1 added, 1 updated.')).toBeInTheDocument()
   expect(load).toHaveBeenCalledTimes(3)
+})
+
+test('the first changed profile is selected even when a new one comes first', async () => {
+  vi.mocked(readBundle).mockResolvedValue({
+    kind: 'review',
+    review: { ...review, items: [review.items[1], review.items[0]] },
+  })
+  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  expect(await screen.findByText('Matches your SSH "web"')).toBeInTheDocument()
+  expect(screen.getByLabelText('Accept Host')).toBeInTheDocument()
+  expect(screen.queryByText('New SSH')).not.toBeInTheDocument()
 })
 
 test('decline all turns every row off', async () => {
@@ -186,7 +202,20 @@ test('repeated notes and problems are listed once', async () => {
   expect(screen.getAllByText('Its jump hosts would form a loop')).toHaveLength(1)
   expect(screen.getAllByText(note)).toHaveLength(1)
   expect(consoleError).not.toHaveBeenCalled()
-  consoleError.mockRestore()
+})
+
+test('a decision changed right before Apply is not validated after the apply', async () => {
+  vi.mocked(readBundle).mockResolvedValue({ kind: 'review', review })
+  const user = userEvent.setup()
+  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  await waitFor(() => expect(validateImport).toHaveBeenCalledTimes(1))
+  vi.mocked(validateImport).mockRejectedValue(new Error('not found: import r1'))
+  await user.click(screen.getByLabelText('Accept Host'))
+  await user.click(screen.getByRole('button', { name: 'Apply' }))
+  expect(await screen.findByText('Imported: 1 added, 1 updated.')).toBeInTheDocument()
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  expect(validateImport).toHaveBeenCalledTimes(1)
+  expect(screen.queryByText(/not found/)).not.toBeInTheDocument()
 })
 
 test('discards the pending import on unmount', async () => {
@@ -207,6 +236,25 @@ test('a read that finishes after unmount is discarded', async () => {
   await waitFor(() => expect(discardImport).toHaveBeenCalledWith('r2'))
 })
 
+test('under StrictMode every review the page received is shown or discarded', async () => {
+  const stale = { ...review, reviewId: 'first', items: [{ ...review.items[1], name: 'stale' }] }
+  const shown = { ...review, reviewId: 'second', items: [{ ...review.items[1], name: 'shown' }] }
+  vi.mocked(readBundle)
+    .mockResolvedValueOnce({ kind: 'review', review: stale })
+    .mockResolvedValueOnce({ kind: 'review', review: shown })
+  const { unmount } = render(
+    <StrictMode>
+      <ImportReviewPage tabId="t" path="C:/in.json" />
+    </StrictMode>,
+  )
+  expect(await screen.findByLabelText('Import shown')).toBeInTheDocument()
+  expect(screen.queryByLabelText('Import stale')).not.toBeInTheDocument()
+  expect(readBundle).toHaveBeenCalledTimes(2)
+  expect(vi.mocked(discardImport).mock.calls).toEqual([['first']])
+  unmount()
+  expect(vi.mocked(discardImport).mock.calls).toEqual([['first'], ['second']])
+})
+
 test('a file that cannot be read shows the message without an Error prefix', async () => {
   vi.mocked(readBundle).mockRejectedValueOnce(new Error('import error: not a wisp export'))
   render(<ImportReviewPage tabId="t" path="C:/in.json" />)
@@ -216,23 +264,65 @@ test('a file that cannot be read shows the message without an Error prefix', asy
 
 test('a failed apply shows the message and keeps the review open', async () => {
   vi.mocked(readBundle).mockResolvedValue({ kind: 'review', review })
-  vi.mocked(applyImport).mockRejectedValueOnce(
-    new Error('import error: 1 item(s) still need attention'),
-  )
+  vi.mocked(applyImport).mockRejectedValueOnce(new Error('io: denied'))
   const user = userEvent.setup()
   const { unmount } = render(<ImportReviewPage tabId="t" path="C:/in.json" />)
-  const apply = await screen.findByRole('button', { name: 'Apply' })
+  await waitFor(() => expect(validateImport).toHaveBeenCalledTimes(1))
+  const apply = screen.getByRole('button', { name: 'Apply' })
   await user.click(apply)
-  expect(
-    await screen.findByText('import error: 1 item(s) still need attention'),
-  ).toBeInTheDocument()
+  expect(await screen.findByText('io: denied')).toBeInTheDocument()
   expect(screen.queryByText(/Error:/)).not.toBeInTheDocument()
   expect(screen.getByText(/1 new/)).toBeInTheDocument()
   expect(screen.getByLabelText('Import web')).toBeChecked()
   expect(apply).toBeEnabled()
   expect(load).not.toHaveBeenCalled()
+  await waitFor(() => expect(validateImport).toHaveBeenCalledTimes(2))
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  expect(screen.getByText('io: denied')).toBeInTheDocument()
   unmount()
   await waitFor(() => expect(discardImport).toHaveBeenCalledWith('r1'))
+})
+
+test('a failed apply refreshes the problems and its message goes once they are fixed', async () => {
+  vi.mocked(readBundle).mockResolvedValue({ kind: 'review', review })
+  vi.mocked(applyImport).mockRejectedValueOnce(
+    new Error('import error: 1 item(s) still need attention'),
+  )
+  const user = userEvent.setup()
+  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  const apply = await screen.findByRole('button', { name: 'Apply' })
+  vi.mocked(validateImport).mockResolvedValue([
+    { key: 'ssh:n', message: 'Key login needs at least one private key' },
+  ])
+  await user.click(apply)
+  expect(
+    await screen.findByText('import error: 1 item(s) still need attention'),
+  ).toBeInTheDocument()
+  expect(
+    await screen.findByText('fresh: Key login needs at least one private key'),
+  ).toBeInTheDocument()
+  expect(apply).toBeDisabled()
+  vi.mocked(validateImport).mockResolvedValue([])
+  await user.click(screen.getByLabelText('Import fresh'))
+  await waitFor(() => expect(screen.queryByText(/Key login needs/)).not.toBeInTheDocument())
+  expect(screen.queryByText(/still need attention/)).not.toBeInTheDocument()
+  expect(apply).toBeEnabled()
+})
+
+test('a failed profile reload still shows the import summary', async () => {
+  vi.mocked(readBundle).mockResolvedValue({ kind: 'review', review })
+  load.mockRejectedValueOnce(new Error('io: denied'))
+  const user = userEvent.setup()
+  const { unmount } = render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  await user.click(await screen.findByRole('button', { name: 'Apply' }))
+  expect(await screen.findByText('Imported: 1 added, 1 updated.')).toBeInTheDocument()
+  expect(
+    await screen.findByText('The profile list could not be refreshed: io: denied'),
+  ).toBeInTheDocument()
+  expect(load).toHaveBeenCalledTimes(3)
+  expect(screen.queryByRole('button', { name: 'Apply' })).not.toBeInTheDocument()
+  unmount()
+  expect(discardImport).not.toHaveBeenCalled()
 })
 
 test('Open is disabled while the password is checked and Enter submits', async () => {
@@ -249,7 +339,7 @@ test('Open is disabled while the password is checked and Enter submits', async (
   await user.keyboard('{Enter}')
   expect(readBundle).toHaveBeenLastCalledWith('C:/in.json', 'pw')
   expect(open).toBeDisabled()
-  await user.click(open)
+  await user.keyboard('{Enter}')
   expect(readBundle).toHaveBeenCalledTimes(2)
   await act(async () => read.resolve({ kind: 'review', review }))
   expect(screen.getByText(/1 new/)).toBeInTheDocument()
@@ -274,4 +364,22 @@ test('a failed password read shows its message and the next attempt clears it', 
   await act(async () => retry.resolve({ kind: 'wrongPassword' }))
   expect(screen.getByText('Wrong password.')).toBeInTheDocument()
   expect(open).toBeEnabled()
+})
+
+test('Wrong password. goes away while the next attempt is checked', async () => {
+  const retry = deferred<ReadResult>()
+  vi.mocked(readBundle)
+    .mockResolvedValueOnce({ kind: 'needsPassword' })
+    .mockResolvedValueOnce({ kind: 'wrongPassword' })
+    .mockReturnValueOnce(retry.promise)
+  const user = userEvent.setup()
+  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  await user.type(await screen.findByLabelText('Export password'), 'x')
+  const open = screen.getByRole('button', { name: 'Open' })
+  await user.click(open)
+  expect(await screen.findByText('Wrong password.')).toBeInTheDocument()
+  await user.click(open)
+  expect(screen.queryByText('Wrong password.')).not.toBeInTheDocument()
+  await act(async () => retry.resolve({ kind: 'review', review }))
+  expect(screen.getByText(/1 new/)).toBeInTheDocument()
 })

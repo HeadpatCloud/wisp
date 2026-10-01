@@ -51,6 +51,7 @@ export function ImportReviewPage({ tabId, path }: { tabId: string; path: string 
   const [summary, setSummary] = useState<ApplySummary | null>(null)
   const reviewIdRef = useRef<string | null>(null)
   const runRef = useRef(0)
+  const failedRef = useRef<Decisions | null>(null)
 
   // StrictMode mounts twice; a read that lands after its run ended still holds a decrypted
   // bundle in the backend, so it is discarded instead of shown.
@@ -63,7 +64,9 @@ export function ImportReviewPage({ tabId, path }: { tabId: string; path: string 
       reviewIdRef.current = res.review.reviewId
       setReview(res.review)
       setDecisions(initialDecisions(res.review))
-      setSelectedKey(res.review.items[0]?.key ?? null)
+      setSelectedKey(
+        (res.review.items.find((i) => i.status === 'conflict') ?? res.review.items[0])?.key ?? null,
+      )
       setPassword('')
       setStage('review')
       return
@@ -87,12 +90,15 @@ export function ImportReviewPage({ tabId, path }: { tabId: string; path: string 
   }, [path, handle])
 
   useEffect(() => {
-    if (!review) return
+    if (!review || busy || stage !== 'review') return
     let active = true
     const timer = setTimeout(() => {
       validateImport(review.reviewId, toPayload(review, decisions))
         .then((found) => {
-          if (active) setProblems(found)
+          if (!active) return
+          setProblems(found)
+          // The re-check that follows a failed apply must not wipe that apply's message.
+          if (decisions !== failedRef.current) setError(null)
         })
         .catch((e) => {
           if (active) setError(errorText(e))
@@ -102,12 +108,14 @@ export function ImportReviewPage({ tabId, path }: { tabId: string; path: string 
       active = false
       clearTimeout(timer)
     }
-  }, [review, decisions])
+  }, [review, decisions, busy, stage])
 
   function submitPassword() {
+    if (busy || !password) return
     const run = runRef.current
     setBusy(true)
     setError(null)
+    setWrongPassword(false)
     readBundle(path, password)
       .then((res) => handle(res, run))
       .catch((e) => setError(errorText(e)))
@@ -121,10 +129,11 @@ export function ImportReviewPage({ tabId, path }: { tabId: string; path: string 
     try {
       const result = await applyImport(review.reviewId, toPayload(review, decisions))
       reviewIdRef.current = null
-      await Promise.all([reloadProfiles(), reloadSftp(), reloadS3()])
       setSummary(result)
       setStage('done')
+      await Promise.all([reloadProfiles(), reloadSftp(), reloadS3()])
     } catch (e) {
+      failedRef.current = decisions
       setError(errorText(e))
     } finally {
       setBusy(false)
@@ -140,9 +149,14 @@ export function ImportReviewPage({ tabId, path }: { tabId: string; path: string 
   if (stage === 'done' && summary) {
     return (
       <PageShell title="Import profiles" footer={close}>
-        <p className="text-sm">
-          Imported: {summary.added} added, {summary.updated} updated.
-        </p>
+        <div className="space-y-2 text-sm">
+          <p>
+            Imported: {summary.added} added, {summary.updated} updated.
+          </p>
+          {error && (
+            <p className="text-destructive">The profile list could not be refreshed: {error}</p>
+          )}
+        </div>
       </PageShell>
     )
   }

@@ -40,6 +40,7 @@ const review: ImportReview = {
         { field: 'host', label: 'Host', local: 'a', incoming: 'b' },
       ],
       notes: ['Kept your local keys; not on this machine: /Users/me/id'],
+      notesAsNew: ['Key file not on this machine: /Users/me/id'],
     },
     {
       key: 'ssh:n',
@@ -49,6 +50,7 @@ const review: ImportReview = {
       matched: null,
       fields: [],
       notes: [],
+      notesAsNew: [],
     },
   ],
 }
@@ -157,6 +159,23 @@ test('add as new instead is sent with the apply', async () => {
     { key: 'ssh:a', accept: true, asNew: true, fields: [] },
     { key: 'ssh:n', accept: true, asNew: false, fields: [] },
   ])
+})
+
+test('add as new instead shows the notes a new profile gets', async () => {
+  vi.mocked(readBundle).mockResolvedValue({ kind: 'review', review })
+  const kept = 'Kept your local keys; not on this machine: /Users/me/id'
+  const asNew = 'Key file not on this machine: /Users/me/id'
+  const user = userEvent.setup()
+  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  const toggle = await screen.findByLabelText('Add as new instead')
+  expect(screen.getByText(kept)).toBeInTheDocument()
+  expect(screen.queryByText(asNew)).not.toBeInTheDocument()
+  await user.click(toggle)
+  expect(screen.getByText(asNew)).toBeInTheDocument()
+  expect(screen.queryByText(kept)).not.toBeInTheDocument()
+  await user.click(toggle)
+  expect(screen.getByText(kept)).toBeInTheDocument()
+  expect(screen.queryByText(asNew)).not.toBeInTheDocument()
 })
 
 test('validation problems are shown and block apply', async () => {

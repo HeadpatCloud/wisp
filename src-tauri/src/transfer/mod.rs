@@ -170,6 +170,8 @@ pub struct ReviewItem {
     pub matched: Option<LocalMatch>,
     pub fields: Vec<FieldDiff>,
     pub notes: Vec<String>,
+    // What `notes` would say with no local match, for a match the user adds as new instead.
+    pub notes_as_new: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]

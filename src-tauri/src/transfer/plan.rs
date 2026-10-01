@@ -308,7 +308,7 @@ impl Collector<'_> {
         name: &str,
         local: (&str, &str),
         fields: Vec<FieldDiff>,
-        notes: Vec<String>,
+        (notes, notes_as_new): (Vec<String>, Vec<String>),
     ) {
         self.matches.insert(key.clone(), local.0.to_string());
         if fields.is_empty() {
@@ -323,6 +323,7 @@ impl Collector<'_> {
             matched: Some(LocalMatch { id: local.0.into(), name: local.1.into() }),
             fields,
             notes,
+            notes_as_new,
         });
     }
 
@@ -334,6 +335,7 @@ impl Collector<'_> {
             status: ItemStatus::New,
             matched: None,
             fields: vec![],
+            notes_as_new: notes.clone(),
             notes,
         });
     }
@@ -398,6 +400,7 @@ pub fn plan(local: &ProfileStore, payload: &Payload, env: &dyn Env) -> Plan {
         let parent =
             g.parent_id.as_ref().map(|p| group_map.get(p).cloned().unwrap_or_else(|| p.clone()));
         let key = ItemKind::Group.key(&g.id);
+        let as_new = vec![];
         match found {
             Some(l) => {
                 let (mut fields, mut notes) = (vec![], vec![]);
@@ -418,9 +421,9 @@ pub fn plan(local: &ProfileStore, payload: &Payload, env: &dyn Env) -> Plan {
                     });
                 }
                 icon_field(&l.icon, &g.icon, env, &mut fields, &mut notes);
-                c.matched(key, ItemKind::Group, &g.name, (&l.id, &l.name), fields, notes);
+                c.matched(key, ItemKind::Group, &g.name, (&l.id, &l.name), fields, (notes, as_new));
             }
-            None => c.added(key, ItemKind::Group, &g.name, vec![]),
+            None => c.added(key, ItemKind::Group, &g.name, as_new),
         }
     }
 
@@ -446,25 +449,33 @@ pub fn plan(local: &ProfileStore, payload: &Payload, env: &dyn Env) -> Plan {
         let key = ItemKind::Ssh.key(&inc.id);
         let (mut fields, mut notes) = (vec![], vec![]);
         let group = group_ref(inc.group_id.as_deref(), &group_map, payload, local, &mut notes);
-        // A jump host the import leaves alone is not a change, even if it points nowhere.
-        let same_jump = found.is_some_and(|l| l.jump_host_id == inc.jump_host_id);
-        let jump = inc.jump_host_id.as_deref().and_then(|j| {
-            if same_jump {
-                return Some(j.to_string());
-            }
-            if let Some(mapped) = profile_map.get(j) {
-                return Some(mapped.clone());
-            }
-            if payload.profiles.iter().any(|p| p.id == j)
-                || local.profiles.iter().any(|p| p.id == j)
-            {
-                return Some(j.to_string());
-            }
-            notes.push("Its jump host isn't in the export; it will connect directly".into());
-            None
-        });
+        let mut as_new = notes.clone();
+        let jump_ref = |same_jump: bool, notes: &mut Vec<String>| {
+            inc.jump_host_id.as_deref().and_then(|j| {
+                if same_jump {
+                    return Some(j.to_string());
+                }
+                if let Some(mapped) = profile_map.get(j) {
+                    return Some(mapped.clone());
+                }
+                if payload.profiles.iter().any(|p| p.id == j)
+                    || local.profiles.iter().any(|p| p.id == j)
+                {
+                    return Some(j.to_string());
+                }
+                notes.push("Its jump host isn't in the export; it will connect directly".into());
+                None
+            })
+        };
+        jump_ref(false, &mut as_new);
+        keys_field(None, &inc.keys, payload, env, &mut vec![], &mut as_new);
+        if matches!(&inc.icon, IconRef::Custom { path } if !env.icon_exists(path)) {
+            as_new.push("The custom icon isn't on this machine; using the default icon".into());
+        }
         match found {
             Some(l) => {
+                // A jump host the import leaves alone is not a change, even if it points nowhere.
+                let jump = jump_ref(l.jump_host_id == inc.jump_host_id, &mut notes);
                 push(&mut fields, "name", "Name", l.name.clone(), inc.name.clone());
                 push(&mut fields, "host", "Host", l.host.clone(), inc.host.clone());
                 push(&mut fields, "port", "Port", l.port.to_string(), inc.port.to_string());
@@ -535,17 +546,9 @@ pub fn plan(local: &ProfileStore, payload: &Payload, env: &dyn Env) -> Plan {
                     env,
                     &mut fields,
                 );
-                c.matched(key, ItemKind::Ssh, &inc.name, (&l.id, &l.name), fields, notes);
+                c.matched(key, ItemKind::Ssh, &inc.name, (&l.id, &l.name), fields, (notes, as_new));
             }
-            None => {
-                keys_field(None, &inc.keys, payload, env, &mut fields, &mut notes);
-                if matches!(&inc.icon, IconRef::Custom { path } if !env.icon_exists(path)) {
-                    notes.push(
-                        "The custom icon isn't on this machine; using the default icon".into(),
-                    );
-                }
-                c.added(key, ItemKind::Ssh, &inc.name, notes);
-            }
+            None => c.added(key, ItemKind::Ssh, &inc.name, as_new),
         }
     }
 
@@ -561,6 +564,8 @@ pub fn plan(local: &ProfileStore, payload: &Payload, env: &dyn Env) -> Plan {
     for (inc, found) in payload.sftp_profiles.iter().zip(found) {
         let key = ItemKind::Sftp.key(&inc.id);
         let (mut fields, mut notes) = (vec![], vec![]);
+        let mut as_new = vec![];
+        keys_field(None, &inc.keys, payload, env, &mut vec![], &mut as_new);
         match found {
             Some(l) => {
                 push(&mut fields, "name", "Name", l.name.clone(), inc.name.clone());
@@ -591,12 +596,16 @@ pub fn plan(local: &ProfileStore, payload: &Payload, env: &dyn Env) -> Plan {
                     env,
                     &mut fields,
                 );
-                c.matched(key, ItemKind::Sftp, &inc.name, (&l.id, &l.name), fields, notes);
+                c.matched(
+                    key,
+                    ItemKind::Sftp,
+                    &inc.name,
+                    (&l.id, &l.name),
+                    fields,
+                    (notes, as_new),
+                );
             }
-            None => {
-                keys_field(None, &inc.keys, payload, env, &mut fields, &mut notes);
-                c.added(key, ItemKind::Sftp, &inc.name, notes);
-            }
+            None => c.added(key, ItemKind::Sftp, &inc.name, as_new),
         }
     }
 
@@ -615,6 +624,7 @@ pub fn plan(local: &ProfileStore, payload: &Payload, env: &dyn Env) -> Plan {
     for (inc, found) in payload.s3_profiles.iter().zip(found) {
         let key = ItemKind::S3.key(&inc.id);
         let (mut fields, mut notes) = (vec![], vec![]);
+        let as_new = vec![];
         match found {
             Some(l) => {
                 push(&mut fields, "name", "Name", l.name.clone(), inc.name.clone());
@@ -664,9 +674,9 @@ pub fn plan(local: &ProfileStore, payload: &Payload, env: &dyn Env) -> Plan {
                     env,
                     &mut fields,
                 );
-                c.matched(key, ItemKind::S3, &inc.name, (&l.id, &l.name), fields, notes);
+                c.matched(key, ItemKind::S3, &inc.name, (&l.id, &l.name), fields, (notes, as_new));
             }
-            None => c.added(key, ItemKind::S3, &inc.name, notes),
+            None => c.added(key, ItemKind::S3, &inc.name, as_new),
         }
     }
 
@@ -676,7 +686,7 @@ pub fn plan(local: &ProfileStore, payload: &Payload, env: &dyn Env) -> Plan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::model::{AuthMethod, Group, IconRef, Profile, ProfileKey};
+    use crate::store::model::{AuthMethod, Group, IconRef, Profile, ProfileKey, SftpProfile};
     use crate::transfer::bundle::KeyFile;
     use crate::transfer::MapEnv;
     use zeroize::Zeroizing;
@@ -767,6 +777,67 @@ mod tests {
         let p = plan(&local(vec![pc]), &incoming(vec![mac]), &env);
         assert!(p.items.is_empty(), "keys kept, nothing else differs");
         assert_eq!(p.unchanged, 1);
+    }
+
+    #[test]
+    fn missing_key_note_depends_on_whether_the_match_is_added_as_new() {
+        let mut pc = profile("pc", "web", "h1");
+        pc.auth_method = AuthMethod::Key;
+        pc.keys = vec![ProfileKey { path: "C:\\keys\\id".into(), secret_id: None }];
+        let mut mac = pc.clone();
+        mac.id = "mac".into();
+        mac.name = "web (mac)".into();
+        mac.keys = vec![ProfileKey { path: "/Users/me/.ssh/id".into(), secret_id: None }];
+        let mut env = MapEnv::default();
+        env.files.insert("C:\\keys\\id".into(), b"PC".to_vec());
+        let p = plan(&local(vec![pc]), &incoming(vec![mac]), &env);
+        assert_eq!(p.items[0].status, ItemStatus::Conflict);
+        assert_eq!(
+            p.items[0].notes,
+            ["Kept your local keys; not on this machine: /Users/me/.ssh/id"]
+        );
+        assert_eq!(p.items[0].notes_as_new, ["Key file not on this machine: /Users/me/.ssh/id"]);
+    }
+
+    #[test]
+    fn matched_sftp_profile_gets_the_new_item_key_note_too() {
+        let pc = SftpProfile {
+            id: "pc".into(),
+            name: "files".into(),
+            host: "h1".into(),
+            port: 22,
+            username: "me".into(),
+            auth_method: AuthMethod::Key,
+            keys: vec![ProfileKey { path: "C:\\keys\\id".into(), secret_id: None }],
+            secret_id: None,
+            icon: IconRef::default(),
+            order: 0,
+        };
+        let mac = SftpProfile {
+            id: "mac".into(),
+            name: "files (mac)".into(),
+            keys: vec![ProfileKey { path: "/Users/me/.ssh/id".into(), secret_id: None }],
+            ..pc.clone()
+        };
+        let l = ProfileStore { sftp_profiles: vec![pc], ..local(vec![]) };
+        let payload = Payload { sftp_profiles: vec![mac], ..Default::default() };
+        let p = plan(&l, &payload, &MapEnv::default());
+        assert_eq!(
+            p.items[0].notes,
+            ["Kept your local keys; not on this machine: /Users/me/.ssh/id"]
+        );
+        assert_eq!(p.items[0].notes_as_new, ["Key file not on this machine: /Users/me/.ssh/id"]);
+    }
+
+    #[test]
+    fn unmatched_item_has_the_same_notes_either_way() {
+        let mut mac = profile("mac", "web", "h9");
+        mac.group_id = Some("nowhere".into());
+        mac.keys = vec![ProfileKey { path: "/Users/me/.ssh/id".into(), secret_id: None }];
+        let p = plan(&local(vec![]), &incoming(vec![mac]), &MapEnv::default());
+        assert_eq!(p.items[0].status, ItemStatus::New);
+        assert_eq!(p.items[0].notes.len(), 2);
+        assert_eq!(p.items[0].notes_as_new, p.items[0].notes);
     }
 
     #[test]
@@ -933,5 +1004,9 @@ mod tests {
         let fields: Vec<_> = p.items[0].fields.iter().map(|f| f.field.as_str()).collect();
         assert_eq!(fields, ["name"]);
         assert!(p.items[0].notes.is_empty());
+        assert_eq!(
+            p.items[0].notes_as_new,
+            ["Its jump host isn't in the export; it will connect directly"]
+        );
     }
 }

@@ -220,6 +220,9 @@ export function ImportReviewPage({ tabId, path }: { tabId: string; path: string 
   const changed = review.items.filter((i) => i.status === 'conflict')
   const fresh = review.items.filter((i) => i.status === 'new')
   const selected = review.items.find((i) => i.key === selectedKey) ?? null
+  const notes = selected
+    ? [...new Set(decisions[selected.key].asNew ? selected.notesAsNew : selected.notes)]
+    : []
   const problemsFor = (key: string) => [
     ...new Set(problems.filter((p) => p.key === key).map((p) => p.message)),
   ]
@@ -393,9 +396,9 @@ export function ImportReviewPage({ tabId, path }: { tabId: string; path: string 
                     )}
                   </>
                 )}
-                {selected.notes.length > 0 && (
+                {notes.length > 0 && (
                   <ul className="space-y-1 text-muted-foreground">
-                    {[...new Set(selected.notes)].map((n) => (
+                    {notes.map((n) => (
                       <li key={n}>{n}</li>
                     ))}
                   </ul>

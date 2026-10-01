@@ -25,8 +25,18 @@ const review: ImportReview = {
         { field: 'host', label: 'Host', local: 'a', incoming: 'b' },
       ],
       notes: [],
+      notesAsNew: [],
     },
-    { key: 'ssh:n', kind: 'ssh', name: 'new', status: 'new', matched: null, fields: [], notes: [] },
+    {
+      key: 'ssh:n',
+      kind: 'ssh',
+      name: 'new',
+      status: 'new',
+      matched: null,
+      fields: [],
+      notes: [],
+      notesAsNew: [],
+    },
   ],
 }
 const [conflict, fresh] = review.items

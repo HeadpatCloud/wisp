@@ -6,6 +6,7 @@ mod s3;
 mod sftp;
 mod ssh;
 mod store;
+mod transfer;
 mod tunnel;
 mod vault;
 mod vnc;

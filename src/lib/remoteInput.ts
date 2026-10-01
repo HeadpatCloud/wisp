@@ -1,3 +1,5 @@
+import { LEGACY_KEYSYMS } from '@/lib/keysymTable'
+
 const KEYSYMS = new Map([
   ['ShiftLeft', 0xffe1],
   ['ShiftRight', 0xffe2],
@@ -28,7 +30,6 @@ const KEYSYMS = new Map([
   ['Pause', 0xff13],
   ['NumLock', 0xff7f],
   ['ContextMenu', 0xff67],
-  ['Space', 0x20],
 ])
 for (let n = 1; n <= 24; n++) KEYSYMS.set(`F${n}`, 0xffbe + n - 1)
 
@@ -59,12 +60,15 @@ export function keysymFor(e: { code: string; key: string }): number | null {
   if (e.code === 'AltRight' && e.key === 'AltGraph') return 0xfe03
   const named = KEYSYMS.get(e.code)
   if (named !== undefined) return named
+  if (e.key === 'Dead' || e.key === 'Process' || e.key === 'Unidentified') return null
   const cp = e.key.codePointAt(0)
   if (cp === undefined || [...e.key].length !== 1) return NUMPAD_NAVIGATION.get(e.code) ?? null
+  if (cp < 0x20 || (cp >= 0x7f && cp <= 0x9f) || (cp >= 0xd800 && cp <= 0xdfff)) return null
+  if (e.code === 'NumpadDecimal' && e.key === ',') return 0xffac
   const numpad = NUMPAD_CHARACTERS.get(e.code)
   if (numpad !== undefined) return numpad
-  if ((cp >= 0x20 && cp <= 0x7e) || (cp >= 0xa0 && cp <= 0xff)) return cp
-  return 0x01000000 + cp
+  if (cp <= 0xff) return cp
+  return LEGACY_KEYSYMS.get(cp) ?? 0x01000000 + cp
 }
 
 // VNC wheel buttons: 4 up, 5 down, 6 left, 7 right.

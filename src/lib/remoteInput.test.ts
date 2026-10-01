@@ -57,7 +57,6 @@ describe('keysymFor', () => {
     ['Pause', 'Pause', 0xff13],
     ['NumLock', 'NumLock', 0xff7f],
     ['ContextMenu', 'ContextMenu', 0xff67],
-    ['Space', ' ', 0x20],
   ])('maps %s (%s) by code', (code, key, keysym) => {
     expect(keysymFor({ code, key })).toBe(keysym)
   })
@@ -90,7 +89,7 @@ describe('keysymFor', () => {
     ['Numpad8', '8', 0xffb8],
     ['Numpad9', '9', 0xffb9],
     ['NumpadDecimal', '.', 0xffae],
-    ['NumpadDecimal', ',', 0xffae],
+    ['NumpadDecimal', ',', 0xffac],
     ['NumpadAdd', '+', 0xffab],
     ['NumpadSubtract', '-', 0xffad],
     ['NumpadMultiply', '*', 0xffaa],
@@ -102,18 +101,36 @@ describe('keysymFor', () => {
   it.each([
     ['KeyA', 'a', 0x61],
     ['KeyA', 'A', 0x41],
-    ['KeyE', '€', 0x010020ac],
     ['KeyQ', 'ä', 0xe4],
-    ['KeyE', '😀', 0x0101f600],
     ['Backquote', '~', 0x7e],
-    ['Digit1', ' ', 0xa0],
+    ['Digit1', '\u00a0', 0xa0],
     ['KeyY', 'ÿ', 0xff],
-    ['KeyA', 'Ā', 0x01000100],
     ['', ' ', 0x20],
-    ['', '\u001f', 0x0100001f],
-    ['', '\u007f', 0x0100007f],
-    ['', '\u009f', 0x0100009f],
-  ])('maps %s (%s) by key', (code, key, keysym) => {
+    ['Space', ' ', 0x20],
+    ['Space', '\u00a0', 0xa0],
+  ])('maps %s (%j) to its own code point', (code, key, keysym) => {
+    expect(keysymFor({ code, key })).toBe(keysym)
+  })
+
+  it.each([
+    ['KeyE', '€', 0x20ac],
+    ['KeyF', '\u0430', 0x6c1],
+    ['KeyA', 'ą', 0x1b1],
+    ['KeyA', 'α', 0x7e1],
+    ['Minus', '—', 0xaa9],
+    ['Digit2', '“', 0xad2],
+    ['KeyA', 'Ā', 0x3c0],
+  ])('maps %s (%j) to its legacy keysym', (code, key, keysym) => {
+    expect(keysymFor({ code, key })).toBe(keysym)
+  })
+
+  it.each([
+    ['KeyA', '中', 0x01004e2d],
+    ['KeyE', '😀', 0x0101f600],
+    ['Space', '\u202f', 0x0100202f],
+    ['', '\ud7ff', 0x0100d7ff],
+    ['', '\ue000', 0x0100e000],
+  ])('maps %s (%j) to its Unicode keysym', (code, key, keysym) => {
     expect(keysymFor({ code, key })).toBe(keysym)
   })
 
@@ -122,9 +139,19 @@ describe('keysymFor', () => {
     ['', 'Unidentified'],
     ['KeyA', 'Process'],
     ['AudioVolumeUp', 'AudioVolumeUp'],
-    ['KeyE', 'é'],
+    ['Space', 'Unidentified'],
+    ['KeyE', 'e\u0301'],
     ['KeyA', ''],
-  ])('returns null for %s (%s)', (code, key) => {
+    ['Numpad1', 'Dead'],
+    ['Numpad5', 'Process'],
+    ['NumpadDecimal', 'Unidentified'],
+    ['', '\u0008'],
+    ['', '\u001f'],
+    ['', '\u007f'],
+    ['', '\u009f'],
+    ['', '\ud800'],
+    ['', '\udfff'],
+  ])('returns null for %s (%j)', (code, key) => {
     expect(keysymFor({ code, key })).toBeNull()
   })
 })

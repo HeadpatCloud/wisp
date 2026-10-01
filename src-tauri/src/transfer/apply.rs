@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsStr;
 use std::path::Path;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
+use same_file::is_same_file;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -139,12 +139,8 @@ impl<'a> Stager<'a> {
             // A key path on a network share is never stored: opening it at connect time would
             // send the user's credentials to whatever server the bundle named. Nor is a path
             // spelled like a placeholder, which would alias another item's embedded key file.
-            // Nor is a path into the app's keys folder, unless the profile has that very path:
-            // under another spelling it would not keep the file it opens from being cleaned up.
             if embedded.is_none()
-                && (super::is_network_path(&k.path)
-                    || k.path.starts_with(KEY_PREFIX)
-                    || (self.env.in_keys_dir(&k.path) && !local.iter().any(|l| l.path == k.path)))
+                && (super::is_network_path(&k.path) || k.path.starts_with(KEY_PREFIX))
             {
                 continue;
             }
@@ -733,12 +729,12 @@ pub fn remove_unreferenced_keys(keys_dir: &Path, previous: &[ProfileKey], data: 
     if !std::fs::symlink_metadata(keys_dir).is_ok_and(|m| m.is_dir()) {
         return;
     }
-    let used: Vec<&OsStr> = data
+    let used: Vec<&Path> = data
         .profiles
         .iter()
         .flat_map(|p| &p.keys)
         .chain(data.sftp_profiles.iter().flat_map(|p| &p.keys))
-        .filter_map(|k| Path::new(&k.path).file_name())
+        .map(|k| Path::new(&k.path))
         .collect();
     for key in previous {
         let path = Path::new(&key.path);
@@ -755,9 +751,13 @@ pub fn remove_unreferenced_keys(keys_dir: &Path, previous: &[ProfileKey], data: 
                     .is_some_and(|rest| safe_name(rest) == rest && !rest.ends_with('.'))
         });
         // Case is ignored: on Windows and macOS a differently cased path is the same file.
+        // A stored path can also reach the file under another name (a trailing dot, a stream
+        // suffix, a link), so the files themselves are compared too. A path that cannot be
+        // opened is not this file.
         if app_made
-            && !used.iter().any(|u| u.eq_ignore_ascii_case(name))
+            && !used.iter().any(|u| u.file_name().is_some_and(|n| n.eq_ignore_ascii_case(name)))
             && std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
+            && !used.iter().any(|u| matches!(is_same_file(u, path), Ok(true)))
         {
             // Best-effort: a leftover key file must never fail the save or delete that got here.
             let _ = std::fs::remove_file(path);
@@ -1594,106 +1594,6 @@ mod tests {
         assert_eq!(safe_name(&format!("{}.pub", "a".repeat(63))), "a".repeat(63));
     }
 
-    // Other ways to write the path of an app-made key; Windows opens the same file for each.
-    fn spellings(key: &ProfileKey) -> [String; 4] {
-        let path = Path::new(&key.path);
-        let folder = path.parent().unwrap().to_string_lossy().to_ascii_uppercase();
-        let upper_folder = Path::new(&folder).join(path.file_name().unwrap());
-        [
-            format!("{}.", key.path),
-            format!("{} ", key.path),
-            format!("{}::$DATA", key.path),
-            upper_folder.to_string_lossy().into_owned(),
-        ]
-    }
-
-    #[test]
-    fn key_paths_into_the_keys_folder_are_never_stored() {
-        let dir = tempfile::tempdir().unwrap();
-        let keys = dir.path().join("keys");
-        std::fs::create_dir(&keys).unwrap();
-        let v = vault(dir.path());
-        let env = LocalEnv { vault: &v, config_dir: dir.path() };
-        let used = app_key(&keys, 1);
-        let mut owner = profile("o", "owner", "h1");
-        owner.keys = vec![used.clone()];
-        let local = store_of(vec![owner, profile("pc", "web", "h2")]);
-
-        let mut new = profile("n", "new", "h9");
-        new.keys = spellings(&used)
-            .into_iter()
-            .chain([used.path.clone()])
-            .map(|path| ProfileKey { path, secret_id: None })
-            .collect();
-        let mut mac = profile("mac", "web", "h2");
-        mac.keys = new.keys.clone();
-        let payload = Payload { profiles: vec![new, mac], ..Default::default() };
-        let decisions = [accept("ssh:n", &[]), accept("ssh:mac", &["keys"])];
-        let staged =
-            stage(&local, &payload, &plan(&local, &payload, &env), &decisions, &env).unwrap();
-        assert_eq!(staged.summary, ApplySummary { added: 1, updated: 1 });
-        let stored: Vec<_> =
-            staged.data.profiles.iter().filter(|p| p.id != "o").flat_map(|p| &p.keys).collect();
-        assert!(stored.is_empty(), "{stored:?}");
-    }
-
-    // Imports new keys for a profile that uses an app-made key: `path` of that key, and one
-    // embedded key. Returns the app-made key, the keys the profile has afterwards, and whether
-    // the app-made file is still there after the cleanup.
-    fn import_over_app_key(
-        path: impl Fn(&ProfileKey) -> String,
-    ) -> (ProfileKey, Vec<ProfileKey>, bool) {
-        let dir = tempfile::tempdir().unwrap();
-        let keys = dir.path().join("keys");
-        std::fs::create_dir(&keys).unwrap();
-        let used = app_key(&keys, 1);
-        let mut pc = profile("pc", "web", "h1");
-        pc.auth_method = AuthMethod::Key;
-        pc.keys = vec![used.clone()];
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        let mut v = vault(dir.path());
-        store.commit(store_of(vec![pc.clone()])).unwrap();
-
-        let mut mac = pc.clone();
-        mac.id = "mac".into();
-        mac.keys = [path(&used), "/Users/me/c".into()]
-            .map(|path| ProfileKey { path, secret_id: None })
-            .into();
-        let mut payload = Payload { profiles: vec![mac], ..Default::default() };
-        payload.key_files.insert(
-            "/Users/me/c".into(),
-            KeyFile { file_name: "c".into(), data: Zeroizing::new(STANDARD.encode(b"C")) },
-        );
-        let snapshot = store.snapshot();
-        let staged = {
-            let env = LocalEnv { vault: &v, config_dir: dir.path() };
-            let planned = plan(&snapshot, &payload, &env);
-            stage(&snapshot, &payload, &planned, &[accept("ssh:mac", &["keys"])], &env).unwrap()
-        };
-        execute(&mut store, &mut v, &keys, staged).unwrap();
-        remove_unreferenced_keys(&keys, &pc.keys, &store.snapshot());
-        let stored = store.profiles().remove(0).keys;
-        let kept = on_disk(&used);
-        (used, stored, kept)
-    }
-
-    #[test]
-    fn another_spelling_of_the_profiles_app_key_is_not_stored_and_the_file_survives() {
-        for n in 0..4 {
-            let (used, stored, kept) = import_over_app_key(|key| spellings(key)[n].clone());
-            assert_eq!(stored, [used], "{n}");
-            assert!(kept, "{n}");
-        }
-    }
-
-    #[test]
-    fn the_profiles_own_app_key_path_is_kept() {
-        let (used, stored, kept) = import_over_app_key(|key| key.path.clone());
-        assert_eq!(stored.len(), 2);
-        assert_eq!(stored[0], used);
-        assert!(kept);
-    }
-
     #[cfg(unix)]
     fn link_dir(target: &Path, link: &Path) {
         std::os::unix::fs::symlink(target, link).unwrap();
@@ -1724,6 +1624,65 @@ mod tests {
         let direct = app_key(&elsewhere, 1);
         remove_unreferenced_keys(&elsewhere, &[direct.clone()], &store_of(vec![]));
         assert!(!on_disk(&direct) && !on_disk(&through_link));
+    }
+
+    // Other paths to the file of `key`, which is in `<dir>/real/keys`; `<dir>/via` links to
+    // `<dir>/real`. On Windows none of them ends in the file's own name.
+    #[cfg(windows)]
+    fn other_paths(dir: &Path, key: &ProfileKey) -> Vec<String> {
+        let name = Path::new(&key.path).file_name().unwrap().to_string_lossy().into_owned();
+        let keys = dir.join("real").join("keys").to_string_lossy().into_owned();
+        vec![
+            format!("{}.", key.path),
+            format!("{}::$DATA", key.path),
+            format!("{}\\{name}.", keys.to_ascii_uppercase()),
+            format!("{keys}\\sub\\..\\{name}."),
+            format!("{}\\keys\\{name}.", dir.join("via").to_string_lossy()),
+        ]
+    }
+
+    // Only the symlink has another name here; the other two are the same file under its own.
+    #[cfg(unix)]
+    fn other_paths(dir: &Path, key: &ProfileKey) -> Vec<String> {
+        let name = Path::new(&key.path).file_name().unwrap();
+        let link = dir.join("id_link");
+        std::os::unix::fs::symlink(&key.path, &link).unwrap();
+        [link, dir.join("real/keys/sub/..").join(name), dir.join("via/keys").join(name)]
+            .map(|path| path.to_string_lossy().into_owned())
+            .into()
+    }
+
+    #[test]
+    fn key_a_profile_reaches_through_another_path_is_not_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("real");
+        let keys = config.join("keys");
+        std::fs::create_dir_all(keys.join("sub")).unwrap();
+        link_dir(&config, &dir.path().join("via"));
+        let used = app_key(&keys, 1);
+        let unused = app_key(&keys, 2);
+        let previous = [used.clone(), unused.clone()];
+        for path in other_paths(dir.path(), &used) {
+            assert_eq!(std::fs::read(&path).unwrap(), b"K", "{path}");
+            let mut web = profile("w", "web", "h1");
+            web.keys = vec![ProfileKey { path: path.clone(), secret_id: None }];
+            remove_unreferenced_keys(&keys, &previous, &store_of(vec![web]));
+            assert!(on_disk(&used), "{path}");
+            assert!(!on_disk(&unused), "{path}");
+        }
+    }
+
+    #[test]
+    fn stored_path_to_a_missing_file_does_not_keep_another_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = dir.path().join("keys");
+        std::fs::create_dir(&keys).unwrap();
+        let dropped = app_key(&keys, 1);
+        let mut web = profile("w", "web", "h1");
+        let gone = keys.join("gone").to_string_lossy().into_owned();
+        web.keys = vec![ProfileKey { path: gone, secret_id: None }];
+        remove_unreferenced_keys(&keys, &[dropped.clone()], &store_of(vec![web]));
+        assert!(!on_disk(&dropped));
     }
 
     #[test]

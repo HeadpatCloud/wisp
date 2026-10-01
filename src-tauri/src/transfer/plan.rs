@@ -207,25 +207,18 @@ struct KeyView {
     usable: bool,
 }
 
-fn incoming_keys(
-    local: &[ProfileKey],
-    keys: &[ProfileKey],
-    payload: &Payload,
-    env: &dyn Env,
-) -> Vec<KeyView> {
+fn incoming_keys(keys: &[ProfileKey], payload: &Payload, env: &dyn Env) -> Vec<KeyView> {
     keys.iter()
         .map(|k| {
             let embedded = payload
                 .key_files
                 .get(&k.path)
                 .and_then(|f| STANDARD.decode(f.data.as_bytes()).ok());
-            // A path into the app's keys folder is only taken from the profile that has it.
-            let foreign = env.in_keys_dir(&k.path) && !local.iter().any(|l| l.path == k.path);
             let (content, usable, label) = match embedded {
                 Some(bytes) => (Some(digest(&bytes)), true, format!("{} (in export)", k.path)),
                 None => match env.read_file(&k.path) {
-                    Some(bytes) if !foreign => (Some(digest(&bytes)), true, k.path.clone()),
-                    _ => (None, false, format!("{} (not on this machine)", k.path)),
+                    Some(bytes) => (Some(digest(&bytes)), true, k.path.clone()),
+                    None => (None, false, format!("{} (not on this machine)", k.path)),
                 },
             };
             let passphrase = k
@@ -264,7 +257,7 @@ fn keys_field(
     fields: &mut Vec<FieldDiff>,
     notes: &mut Vec<String>,
 ) {
-    let inc = incoming_keys(local.unwrap_or_default(), incoming, payload, env);
+    let inc = incoming_keys(incoming, payload, env);
     let missing: Vec<&str> = incoming
         .iter()
         .zip(&inc)
@@ -918,37 +911,6 @@ mod tests {
         // Same bytes under a different path: not a change.
         env.files.insert("C:\\keys\\id".into(), b"MAC".to_vec());
         assert!(plan(&local(vec![pc]), &payload, &env).items.is_empty());
-    }
-
-    #[test]
-    fn key_path_into_the_keys_folder_counts_as_not_on_this_machine() {
-        let keys_dir = std::env::temp_dir().join("wisp").join("keys");
-        let own = keys_dir.join("id").to_string_lossy().into_owned();
-        let other = format!("{own}.");
-        let mut env = MapEnv { keys_dir: Some(keys_dir), ..Default::default() };
-        env.files.insert(own.clone(), b"K".to_vec());
-        env.files.insert(other.clone(), b"K".to_vec());
-        let mut pc = profile("pc", "web", "h1");
-        pc.keys = vec![ProfileKey { path: own.clone(), secret_id: None }];
-        let l = local(vec![pc.clone()]);
-        let mut mac = pc;
-        mac.id = "mac".into();
-        assert!(plan(&l, &incoming(vec![mac.clone()]), &env).items.is_empty());
-
-        mac.name = "web (mac)".into();
-        let p = plan(&l, &incoming(vec![mac.clone()]), &env);
-        assert!(p.items[0].notes.is_empty());
-        assert_eq!(p.items[0].notes_as_new, [format!("Key file not on this machine: {own}")]);
-
-        mac.keys[0].path = other.clone();
-        let p = plan(&l, &incoming(vec![mac]), &env);
-        let fields: Vec<_> = p.items[0].fields.iter().map(|f| f.field.as_str()).collect();
-        assert_eq!(fields, ["name"]);
-        assert_eq!(
-            p.items[0].notes,
-            [format!("Kept your local keys; not on this machine: {other}")]
-        );
-        assert_eq!(p.items[0].notes_as_new, [format!("Key file not on this machine: {other}")]);
     }
 
     #[test]

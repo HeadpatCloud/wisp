@@ -1,7 +1,9 @@
 pub mod io;
 pub mod model;
 
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
+
+use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 use model::{AuthMethod, Group, Profile, ProfileKey, ProfileStore, S3Profile, SftpProfile, Settings};
@@ -25,13 +27,16 @@ pub(crate) fn normalize_keys(p: &mut Profile) {
     p.keys.push(ProfileKey { path, secret_id });
 }
 
-// A custom icon is always `icons/<file>`. The path can come from an imported bundle and is
-// joined onto the config dir, where it is read and later deleted.
+pub(crate) const ICON_EXTENSIONS: [&str; 6] = ["png", "jpg", "jpeg", "gif", "webp", "svg"];
+
+// A custom icon is always `icons/<uuid>.<ext>`, exactly as `import_icon` writes it. The path
+// can come from an imported bundle and is joined onto the config dir, where it is read and
+// later deleted. Another spelling of the same file would get past the shared-icon check.
 pub(crate) fn is_icon_path(rel: &str) -> bool {
-    let mut parts = Path::new(rel).components();
-    matches!(parts.next(), Some(Component::Normal(dir)) if dir == "icons")
-        && matches!(parts.next(), Some(Component::Normal(_)))
-        && parts.next().is_none()
+    rel.strip_prefix("icons/").and_then(|file| file.split_once('.')).is_some_and(|(id, ext)| {
+        Uuid::parse_str(id).is_ok_and(|uuid| uuid.hyphenated().to_string() == id)
+            && ICON_EXTENSIONS.contains(&ext)
+    })
 }
 
 impl Store {
@@ -198,6 +203,33 @@ mod tests {
 
     fn group(id: &str) -> Group {
         Group { id: id.into(), name: id.into(), parent_id: None, icon: IconRef::default(), order: 0 }
+    }
+
+    #[test]
+    fn icon_path_is_only_what_import_icon_writes() {
+        for ext in ICON_EXTENSIONS {
+            let path = format!("icons/{}.{ext}", uuid::Uuid::new_v4());
+            assert!(is_icon_path(&path), "{path}");
+        }
+
+        let id = "6f1c2a9e-8d0b-4c57-9a3e-2b7d5e41f0c8";
+        let others = [
+            format!("icons/{}.png", id.to_uppercase()),
+            format!("icons/{id}.PNG"),
+            format!("icons\\{id}.png"),
+            format!("icons//{id}.png"),
+            format!("Icons/{id}.png"),
+            format!("icons/{id}.png."),
+            format!("icons/{id}.png "),
+            format!("icons/{id}.png::$DATA"),
+            format!("icons/{id}.bmp"),
+            format!("icons/{id}"),
+            format!("icons/{}.png", id.replace('-', "")),
+            "icons/NUL".to_string(),
+            "icons/a.png".to_string(),
+        ];
+        let accepted: Vec<_> = others.iter().filter(|p| is_icon_path(p)).collect();
+        assert!(accepted.is_empty(), "{accepted:?}");
     }
 
     #[test]

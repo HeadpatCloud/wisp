@@ -223,26 +223,32 @@ mod tests {
             Vault::open_with_key(dir.path().join("vault.enc"), Zeroizing::new([1u8; 32])).unwrap();
         let env = LocalEnv { vault: &vault, config_dir: dir.path() };
         std::fs::create_dir(dir.path().join("icons")).unwrap();
-        let icon = dir.path().join("icons").join("a.png");
+        let name = "icons/6f1c2a9e-8d0b-4c57-9a3e-2b7d5e41f0c8.png";
+        let icon = dir.path().join(name);
         std::fs::write(&icon, b"png").unwrap();
 
-        assert!(env.icon_exists("icons/a.png"));
-        assert!(!env.icon_exists("icons/missing.png"));
+        assert!(env.icon_exists(name));
+        assert!(!env.icon_exists("icons/6f1c2a9e-8d0b-4c57-9a3e-2b7d5e41f0c9.png"));
         assert!(!env.icon_exists(""));
         assert!(!env.icon_exists(icon.to_str().unwrap()));
 
         std::fs::create_dir(dir.path().join("icons").join("a")).unwrap();
         std::fs::create_dir(dir.path().join("keys")).unwrap();
-        for other in
-            ["vault.enc", "profiles.json", "keys/x", "icons/a/b.png", "icons/../vault.enc"]
-        {
+        for other in [
+            "vault.enc",
+            "profiles.json",
+            "keys/x",
+            "icons/a.png",
+            "icons/a/b.png",
+            "icons/../vault.enc",
+        ] {
             std::fs::write(dir.path().join(other), b"x").unwrap();
             assert!(dir.path().join(other).is_file());
             assert!(!env.icon_exists(other), "{other}");
         }
 
         let dir_name = dir.path().file_name().unwrap().to_str().unwrap();
-        let outside = format!("../{dir_name}/icons/a.png");
+        let outside = format!("../{dir_name}/{name}");
         assert!(dir.path().join(&outside).is_file());
         assert!(!env.icon_exists(&outside));
 
@@ -259,6 +265,19 @@ mod tests {
                 assert!(dir.path().join(&path).is_file());
                 assert!(!env.icon_exists(&path));
             }
+
+            // Other spellings Windows resolves to the same file.
+            let spellings = [
+                name.to_uppercase(),
+                name.replace('/', "\\"),
+                format!("{name}."),
+                format!("{name}::$DATA"),
+            ];
+            for path in &spellings {
+                assert!(dir.path().join(path).is_file(), "{path}");
+            }
+            let accepted: Vec<_> = spellings.iter().filter(|p| env.icon_exists(p)).collect();
+            assert!(accepted.is_empty(), "{accepted:?}");
         }
     }
 

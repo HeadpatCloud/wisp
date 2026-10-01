@@ -183,32 +183,33 @@ mod tests {
 
     #[test]
     fn icon_is_in_use_while_any_group_or_profile_points_at_it() {
-        let custom = |path: &str| serde_json::json!({ "kind": "custom", "path": path });
+        let path = |n: u8| format!("icons/6f1c2a9e-8d0b-4c57-9a3e-2b7d5e41f0c{n}.png");
+        let custom = |n: u8| serde_json::json!({ "kind": "custom", "path": path(n) });
         let data: ProfileStore = serde_json::from_value(serde_json::json!({
             "version": 1,
             "groups": [{
-                "id": "g", "name": "g", "parentId": null, "icon": custom("icons/g.png"), "order": 0
+                "id": "g", "name": "g", "parentId": null, "icon": custom(1), "order": 0
             }],
             "profiles": [{
                 "id": "p", "name": "p", "groupId": null, "host": "h", "port": 22, "username": "u",
-                "authMethod": "agent", "secretId": null, "icon": custom("icons/p.png"),
-                "order": 0, "jumpHostId": null
+                "authMethod": "agent", "secretId": null, "icon": custom(2), "order": 0,
+                "jumpHostId": null
             }],
             "sftpProfiles": [{
                 "id": "f", "name": "f", "host": "h", "port": 22, "username": "u",
-                "authMethod": "agent", "secretId": null, "icon": custom("icons/f.png"), "order": 0
+                "authMethod": "agent", "secretId": null, "icon": custom(3), "order": 0
             }],
             "s3Profiles": [{
                 "id": "s", "name": "s", "endpoint": "e", "port": null, "region": "r",
                 "useTls": true, "pathStyle": false, "accessKeyId": "AK", "secretId": null,
-                "bucket": null, "icon": custom("icons/s.png"), "order": 0
+                "bucket": null, "icon": custom(4), "order": 0
             }]
         }))
         .unwrap();
-        for path in ["icons/g.png", "icons/p.png", "icons/f.png", "icons/s.png"] {
-            assert!(icon_in_use(&data, path), "{path}");
+        for n in 1..=4 {
+            assert!(icon_in_use(&data, &path(n)), "{n}");
         }
-        assert!(!icon_in_use(&data, "icons/other.png"));
-        assert!(!icon_in_use(&ProfileStore::default(), "icons/g.png"));
+        assert!(!icon_in_use(&data, &path(5)));
+        assert!(!icon_in_use(&ProfileStore::default(), &path(1)));
     }
 }

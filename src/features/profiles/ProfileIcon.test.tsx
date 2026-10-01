@@ -16,9 +16,14 @@ test('renders a lucide svg for a builtin icon', () => {
 })
 
 test('renders an img with the data URL for a custom icon', async () => {
-  render(<ProfileIcon icon={{ kind: 'custom', path: 'icons/x.png' }} className="size-4" />)
+  render(
+    <ProfileIcon
+      icon={{ kind: 'custom', path: 'icons/6f1c2a9e-8d0b-4c57-9a3e-2b7d5e41f0c8.png' }}
+      className="size-4"
+    />,
+  )
   await waitFor(() =>
     expect(screen.getByRole('img')).toHaveAttribute('src', 'data:image/png;base64,AAA'),
   )
-  expect(m.readIcon).toHaveBeenCalledWith('icons/x.png')
+  expect(m.readIcon).toHaveBeenCalledWith('icons/6f1c2a9e-8d0b-4c57-9a3e-2b7d5e41f0c8.png')
 })

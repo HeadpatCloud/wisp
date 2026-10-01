@@ -5,7 +5,7 @@ use base64::Engine as _;
 use tauri::{AppHandle, Manager};
 
 use crate::error::{AppError, AppResult};
-use crate::store::is_icon_path;
+use crate::store::{is_icon_path, ICON_EXTENSIONS};
 
 const MAX_ICON_BYTES: u64 = 2 * 1024 * 1024;
 
@@ -15,9 +15,10 @@ fn icon_extension(source_path: &str) -> AppResult<String> {
         .and_then(|e| e.to_str())
         .map(|e| e.to_lowercase())
         .ok_or_else(|| AppError::Io("icon has no file extension".into()))?;
-    match ext.as_str() {
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" => Ok(ext),
-        _ => Err(AppError::Io(format!("unsupported icon type: {ext}"))),
+    if ICON_EXTENSIONS.contains(&ext.as_str()) {
+        Ok(ext)
+    } else {
+        Err(AppError::Io(format!("unsupported icon type: {ext}")))
     }
 }
 

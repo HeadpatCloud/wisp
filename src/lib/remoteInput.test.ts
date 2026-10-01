@@ -713,7 +713,6 @@ describe('RemoteKeyboard', () => {
     ['ControlRight', 'Control', 0xffe4],
     ['AltLeft', 'Alt', 0xffe9],
     ['AltRight', 'Alt', 0xffea],
-    ['CapsLock', 'CapsLock', 0xffe5],
     ['MetaRight', 'Meta', 0xffec],
   ])('holds %s pressed while Cmd is held on macOS', (code, key, keysym) => {
     const { kb, sent } = keyboard('mac')
@@ -725,6 +724,44 @@ describe('RemoteKeyboard', () => {
     ])
     kb.keyup({ code, key })
     expect(sent.slice(2)).toEqual([[false, keysym]])
+  })
+
+  it('sends a full Caps Lock press for each Caps Lock event on macOS', () => {
+    const { kb, sent } = keyboard('mac')
+    expect(kb.keydown({ code: 'CapsLock', key: 'CapsLock' })).toBe(true)
+    expect(sent).toEqual([
+      [true, 0xffe5],
+      [false, 0xffe5],
+    ])
+    expect(kb.keyup({ code: 'CapsLock', key: 'CapsLock' })).toBe(true)
+    expect(sent.slice(2)).toEqual([
+      [true, 0xffe5],
+      [false, 0xffe5],
+    ])
+    kb.keydown({ code: 'CapsLock', key: 'CapsLock' })
+    kb.releaseAll()
+    expect(sent).toHaveLength(6)
+  })
+
+  it('sends a full Caps Lock press on macOS while Cmd is held', () => {
+    const { kb, sent } = keyboard('mac')
+    kb.keydown({ code: 'MetaLeft', key: 'Meta' })
+    kb.keydown({ code: 'CapsLock', key: 'CapsLock' })
+    expect(sent.slice(1)).toEqual([
+      [true, 0xffe5],
+      [false, 0xffe5],
+    ])
+  })
+
+  it.each(['windows', 'other'] as const)('holds Caps Lock like any key on %s', (platform) => {
+    const { kb, sent } = keyboard(platform)
+    kb.keydown({ code: 'CapsLock', key: 'CapsLock' })
+    expect(sent).toEqual([[true, 0xffe5]])
+    kb.keyup({ code: 'CapsLock', key: 'CapsLock' })
+    expect(sent).toEqual([
+      [true, 0xffe5],
+      [false, 0xffe5],
+    ])
   })
 
   it('holds MetaLeft pressed while the right Cmd is held on macOS', () => {

@@ -65,7 +65,6 @@ const MODIFIERS = new Set([
   'AltRight',
   'MetaLeft',
   'MetaRight',
-  'CapsLock',
 ])
 
 // Virtual keyboards and input injectors report keys without a usable code.
@@ -186,9 +185,8 @@ export class RemoteKeyboard {
     }
     const keysym = keysymFor(e)
     if (keysym === null) return false
-    if (hasNoCode(e.code) || this.lostKeyup(e.code)) {
-      this.send(true, keysym)
-      this.send(false, keysym)
+    if (hasNoCode(e.code) || this.macCapsLock(e.code) || this.lostKeyup(e.code)) {
+      this.click(keysym)
     } else if (
       this.platform === 'windows' &&
       e.code === 'ControlLeft' &&
@@ -204,6 +202,11 @@ export class RemoteKeyboard {
 
   keyup(e: { code: string; key: string; timeStamp?: number }): boolean {
     this.flush()
+    const mapped = keysymFor(e)
+    if (mapped !== null && this.macCapsLock(e.code)) {
+      this.click(mapped)
+      return true
+    }
     const keysym = this.held.release(e.code)
     if (keysym !== null) this.send(false, keysym)
     // Windows delivers a single keyup when both Shift keys were down.
@@ -211,7 +214,7 @@ export class RemoteKeyboard {
       const other = this.held.release(e.code === 'ShiftLeft' ? 'ShiftRight' : 'ShiftLeft')
       if (other !== null) this.send(false, other)
     }
-    return keysym !== null || keysymFor(e) !== null
+    return keysym !== null || mapped !== null
   }
 
   flush(): void {
@@ -224,6 +227,16 @@ export class RemoteKeyboard {
   releaseAll(): void {
     this.cancelControl()
     for (const keysym of this.held.releaseAll()) this.send(false, keysym)
+  }
+
+  private click(keysym: number): void {
+    this.send(true, keysym)
+    this.send(false, keysym)
+  }
+
+  // macOS reports Caps Lock turning on as a keydown and turning off as a keyup.
+  private macCapsLock(code: string): boolean {
+    return this.platform === 'mac' && code === 'CapsLock'
   }
 
   // macOS delivers no keyup for a non-modifier key pressed while Cmd is held.

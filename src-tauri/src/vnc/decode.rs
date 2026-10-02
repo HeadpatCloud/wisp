@@ -301,9 +301,9 @@ impl Decoder {
         Ok(())
     }
 
-    fn count(&self, drawn: &mut usize, w: u16, h: u16) -> AppResult<()> {
+    fn count(drawn: &mut usize, largest: usize, w: u16, h: u16) -> AppResult<()> {
         *drawn += w as usize * h as usize;
-        if *drawn > 4 * self.width as usize * self.height as usize {
+        if *drawn > 4 * largest {
             return Err(invalid());
         }
         Ok(())
@@ -329,9 +329,11 @@ impl Decoder {
     ) -> AppResult<()> {
         let mut head = [0u8; 3];
         r.read_exact(&mut head).await?;
-        // Pixels drawn since the update began or the screen was resized. Rectangles cost a server
-        // next to nothing, so an update may cover the screen four times and no more.
+        // Pixels drawn since the update began, and the largest screen it has had. Rectangles cost a
+        // server next to nothing, so an update may cover that screen four times and no more. A
+        // resize does not start the count again, or alternating sizes would lift the limit.
         let mut drawn = 0;
+        let mut largest = self.width as usize * self.height as usize;
         for _ in 0..u16::from_be_bytes([head[1], head[2]]) {
             let mut rect = [0u8; 12];
             r.read_exact(&mut rect).await?;
@@ -340,7 +342,7 @@ impl Decoder {
             match encoding {
                 0 | 5 | 16 => {
                     self.on_screen(x, y, w, h)?;
-                    self.count(&mut drawn, w, h)?;
+                    Self::count(&mut drawn, largest, w, h)?;
                     let (width, height) = (w as usize, h as usize);
                     let mut rgba = vec![0u8; width * height * 4];
                     match encoding {
@@ -371,14 +373,14 @@ impl Decoder {
                     let (src_x, src_y) = (r.read_u16().await?, r.read_u16().await?);
                     self.on_screen(x, y, w, h)?;
                     self.on_screen(src_x, src_y, w, h)?;
-                    self.count(&mut drawn, w, h)?;
+                    Self::count(&mut drawn, largest, w, h)?;
                     if w != 0 && h != 0 {
                         sink(FrameOp::Copy { x, y, w, h, src_x, src_y });
                     }
                 }
                 -223 => {
                     if let Some(op) = self.resize(w, h)? {
-                        drawn = 0;
+                        largest = largest.max(w as usize * h as usize);
                         sink(op);
                     }
                 }
@@ -390,7 +392,7 @@ impl Decoder {
                     // status, and not 0 then means the server refused.
                     if x != 1 || y == 0 {
                         if let Some(op) = self.resize(w, h)? {
-                            drawn = 0;
+                            largest = largest.max(w as usize * h as usize);
                             sink(op);
                         }
                     }
@@ -1184,23 +1186,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_resize_starts_the_count_again_and_cursors_are_not_counted() {
-        for resize in [rect(0, 0, 4, 1, -223, &[]), rect(0, 0, 4, 1, -308, &[0, 0, 0, 0])] {
+    async fn the_count_goes_on_after_a_resize_and_cursors_are_not_counted() {
+        for resize in [rect(0, 0, 4, 2, -223, &[]), rect(0, 0, 4, 2, -308, &[0, 0, 0, 0])] {
             let mut rects = four_screens(&mut compressor());
             rects.push(rect(0, 0, 2, 2, -239, &[0xFF; 16 + 2]));
-            rects.push(resize.clone());
+            rects.push(resize);
             rects.extend(vec![rect(0, 0, 4, 1, 1, &[0, 0, 0, 0]); 4]);
             rects.push(rect(0, 0, 4, 1, -239, &[0xFF; 16 + 1]));
             let ops = decode(&mut sized(2, 2), &update(&rects)).await.unwrap();
             assert_eq!(ops.len(), 4 + 1 + 1 + 4 + 1);
 
-            // the size announced again is no resize, so the count goes on
-            rects.insert(7, resize);
+            // the 16 pixels from before the resize and these 16 are four screens of 4 x 2
             rects.push(rect(3, 0, 1, 1, 1, &[0, 0, 0, 0]));
             let (ops, result) = decode_some(&mut sized(2, 2), &update(&rects)).await;
             assert!(matches!(result, Err(AppError::Internal(m)) if m.ends_with("invalid update")));
             assert_eq!(ops.len(), 4 + 1 + 1 + 4 + 1);
         }
+    }
+
+    #[tokio::test]
+    async fn alternating_between_two_sizes_does_not_refill_the_budget() {
+        for encoding in [-223, -308] {
+            let resize = |w, h| match encoding {
+                -223 => rect(0, 0, w, h, -223, &[]),
+                _ => rect(0, 0, w, h, -308, &[0, 0, 0, 0]),
+            };
+            let mut rects = Vec::new();
+            for _ in 0..3 {
+                rects.push(resize(4, 2));
+                rects.push(rect(0, 0, 4, 2, 1, &[0, 0, 0, 0]));
+                rects.push(resize(2, 2));
+                rects.push(rect(0, 0, 2, 2, 1, &[0, 0, 0, 0]));
+            }
+            // 8 + 4 + 8 + 4 + 8 pixels are four screens of 4 x 2
+            let ops = decode(&mut sized(2, 2), &update(&rects[..10])).await.unwrap();
+            assert_eq!(ops.len(), 10, "{encoding}");
+
+            let (ops, result) = decode_some(&mut sized(2, 2), &update(&rects)).await;
+            assert!(
+                matches!(result, Err(AppError::Internal(m)) if m.ends_with("invalid update")),
+                "{encoding}"
+            );
+            assert_eq!(ops.len(), 11, "{encoding}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_screen_that_shrinks_is_still_repainted_in_the_same_update() {
+        // Three screens of 4 x 4 and four of 2 x 2 are four of the larger one.
+        let mut rects = vec![rect(0, 0, 4, 4, 1, &[0, 0, 0, 0]); 3];
+        rects.push(rect(0, 0, 2, 2, -223, &[]));
+        rects.extend(vec![rect(0, 0, 2, 2, 1, &[0, 0, 0, 0]); 4]);
+        let ops = decode(&mut sized(4, 4), &update(&rects)).await.unwrap();
+        assert_eq!(ops.len(), 3 + 1 + 4);
+
+        rects.push(rect(0, 0, 1, 1, 1, &[0, 0, 0, 0]));
+        let (ops, result) = decode_some(&mut sized(4, 4), &update(&rects)).await;
+        assert!(matches!(result, Err(AppError::Internal(m)) if m.ends_with("invalid update")));
+        assert_eq!(ops.len(), 3 + 1 + 4);
     }
 
     #[tokio::test]
@@ -1365,6 +1408,7 @@ mod tests {
                 assert!(expected, "round {round}");
             }
             let (mut width, mut height, mut drawn) = (w as usize, h as usize, 0);
+            let mut largest = width * height;
             for op in ops {
                 let fits = |x: u16, y: u16, w: u16, h: u16| {
                     x as usize + w as usize <= width && y as usize + h as usize <= height
@@ -1380,7 +1424,8 @@ mod tests {
                         drawn += w as usize * h as usize;
                     }
                     FrameOp::Resize { w, h } => {
-                        (width, height, drawn) = (w as usize, h as usize, 0);
+                        (width, height) = (w as usize, h as usize);
+                        largest = largest.max(width * height);
                     }
                     FrameOp::Cursor { hot_x, hot_y, w, h, rgba } => {
                         let hidden = (hot_x, hot_y, w, h) == (0, 0, 0, 0);
@@ -1391,7 +1436,7 @@ mod tests {
                         panic!("round {round}")
                     }
                 }
-                assert!(drawn <= 4 * width * height, "round {round}");
+                assert!(drawn <= 4 * largest, "round {round}");
             }
         }
     }

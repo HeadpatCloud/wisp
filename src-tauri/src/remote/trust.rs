@@ -75,6 +75,18 @@ pub fn check_unencrypted(
     }
 }
 
+// Whether the host has shown a certificate that was accepted; an accepted unencrypted login is
+// not one.
+pub fn has_certificate_pin(
+    known: &KnownHostsState,
+    scheme: Scheme,
+    host: &str,
+    port: u16,
+) -> AppResult<bool> {
+    let (_, verdict) = lookup(known, scheme, host, port, UNENCRYPTED)?;
+    Ok(matches!(verdict, HostKeyVerdict::Mismatch { .. }))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -193,6 +205,20 @@ mod tests {
             }
             other => panic!("expected HostKeyMismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn only_a_recorded_certificate_is_a_certificate_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let known = known(&dir);
+        assert!(!has_certificate_pin(&known, Scheme::Vnc, "::1", 5900).unwrap());
+        known.0.lock().unwrap().record("vnc/::1", 5900, &fingerprint(b"cert")).unwrap();
+        assert!(has_certificate_pin(&known, Scheme::Vnc, "::1", 5900).unwrap());
+        assert!(has_certificate_pin(&known, Scheme::Vnc, "[::1]", 5900).unwrap());
+        assert!(!has_certificate_pin(&known, Scheme::Vnc, "::1", 5901).unwrap());
+        assert!(!has_certificate_pin(&known, Scheme::Rdp, "::1", 5900).unwrap());
+        known.0.lock().unwrap().record("vnc/::1", 5900, UNENCRYPTED).unwrap();
+        assert!(!has_certificate_pin(&known, Scheme::Vnc, "::1", 5900).unwrap());
     }
 
     #[test]

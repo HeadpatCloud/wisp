@@ -104,6 +104,13 @@ impl ServerCertVerifier for PinnedLater {
 // rustls has only a Debug dump for a certificate it cannot read.
 fn tls_failure(e: std::io::Error) -> AppError {
     let unsupported = match e.get_ref().and_then(|inner| inner.downcast_ref::<rustls::Error>()) {
+        // An RSA key rustls finds too small is reported exactly as a forged signature is.
+        Some(rustls::Error::InvalidCertificate(CertificateError::BadSignature)) => {
+            return err(
+                "the server's certificate could not be verified \
+                 (bad signature, or an RSA key under 2048 bits)",
+            );
+        }
         Some(rustls::Error::InvalidCertificate(CertificateError::Other(other)))
             if other.to_string() == "UnsupportedCertVersion" =>
         {
@@ -496,7 +503,12 @@ mod tests {
         );
         assert_eq!(
             failure(rustls::CertificateError::BadSignature),
-            "internal error: vnc: TLS handshake failed: invalid peer certificate: BadSignature",
+            "internal error: vnc: the server's certificate could not be verified \
+             (bad signature, or an RSA key under 2048 bits)",
+        );
+        assert_eq!(
+            failure(rustls::CertificateError::Expired),
+            "internal error: vnc: TLS handshake failed: invalid peer certificate: Expired",
         );
     }
 
@@ -670,7 +682,8 @@ mod tests {
         server.tls.as_mut().unwrap().0 = acceptor(forged, &[&TLS13, &TLS12]);
         let login = Login { username: "user", password: "pw" };
         let outcome = play(server, login, Some(&pin)).await;
-        assert!(refusal(&outcome).contains("TLS handshake failed"), "{}", refusal(&outcome));
+        let refused = refusal(&outcome);
+        assert!(refused.contains("the server's certificate could not be verified"), "{refused}");
         assert!(outcome.seen.secured.is_none());
     }
 
@@ -821,6 +834,17 @@ mod tests {
     #[tokio::test]
     async fn handshake_logs_in_with_x509none() {
         let server = rfb("RFB 003.008\n", &[19], x509(&[260], entering()));
+        let login = Login { username: "", password: "" };
+        let pin = fingerprint(&certificate());
+        let outcome = entered(connect(server, login, "127.0.0.1", Some(&pin), true).await);
+        let chose = [&b"RFB 003.008\n"[..], &[19], &[0, 2, 0, 0, 1, 4]].concat();
+        assert_eq!(outcome.seen.plain, chose);
+        assert_eq!(outcome.seen.secured.unwrap(), [1]);
+    }
+
+    #[tokio::test]
+    async fn handshake_takes_x509none_over_no_login_for_a_host_with_a_certificate_pin() {
+        let server = rfb("RFB 003.008\n", &[1, 19], x509(&[260], entering()));
         let login = Login { username: "", password: "" };
         let pin = fingerprint(&certificate());
         let outcome = entered(connect(server, login, "127.0.0.1", Some(&pin), true).await);

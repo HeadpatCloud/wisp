@@ -21,7 +21,8 @@ fn left_padded(value: &BigUint, len: usize) -> Zeroizing<Vec<u8>> {
 // Apple Remote Desktop login (RFB security type 30): a Diffie-Hellman exchange, then the
 // username and password in one 128-byte block under AES-128-ECB with the MD5 of the shared
 // secret as the key. The prime must not be zero. The secrets are wiped after use, except for
-// the copies inside `BigUint`, which it gives no way to wipe.
+// the copies inside `BigUint`, which it gives no way to wipe, and two copies of the AES key
+// that `md5` leaves on the stack in its state and its digest.
 pub fn response(
     generator: u16,
     prime: &[u8],

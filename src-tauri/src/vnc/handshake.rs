@@ -159,7 +159,11 @@ pub async fn handshake(
     let has_password = !login.password.is_empty();
     let usable: Vec<u8> =
         offered.iter().copied().filter(|t| matches!(t, 1 | 2 | 19 | 30)).collect();
+    let pinned = usable.contains(&19)
+        && trust::has_certificate_pin(tls.known, Scheme::Vnc, tls.host, tls.port)?;
     let security = match choose_security(&usable, has_password, !login.username.is_empty()) {
+        // A host that has shown a certificate is asked for it again, not let in without one.
+        Ok(1) if pinned => 19,
         Ok(security) => security,
         Err(reason) if reason == NEEDS_PASSWORD || reason == NEEDS_USERNAME => {
             return Err(err(reason));
@@ -635,6 +639,17 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn without_a_password_a_host_with_a_certificate_pin_is_asked_for_vencrypt() {
+        for (pinned, chosen) in [(Some("SHA256:ab"), 19), (None, 1), (Some(UNENCRYPTED), 1)] {
+            let mut script = offering("RFB 003.008\n", &[1, 19]);
+            script.push(Read(1));
+            let outcome = play_pinned(script, "", pinned).await;
+            assert_eq!(outcome.sent, [&b"RFB 003.008\n"[..], &[chosen]].concat(), "{pinned:?}");
+            assert_eq!(outcome.pin.as_deref(), pinned);
+        }
+    }
+
     // Serves `data`, then fails every read with `then`.
     struct Failing {
         data: std::io::Cursor<Vec<u8>>,
@@ -687,7 +702,9 @@ mod tests {
         ];
         for (then, message) in lost {
             let stream = Failing { data: std::io::Cursor::new(server.clone()), then };
-            let Err(e) = handshake(Box::new(stream), &login, &tls).await else {
+            let attempt = handshake(Box::new(stream), &login, &tls);
+            let attempt = tokio::time::timeout(Duration::from_secs(2), attempt).await;
+            let Err(e) = attempt.expect("handshake script hung") else {
                 panic!("{then:?}: handshake should have failed");
             };
             assert_eq!(e.to_string(), message, "{then:?}");
@@ -891,6 +908,25 @@ mod tests {
             assert!(refusal(&outcome).contains("this server needs a password"), "{username:?}");
             assert_eq!(outcome.sent, b"RFB 003.008\n", "{username:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn v33_server_picks_the_apple_login() {
+        let picking = || vec![Write(b"RFB 003.003\n".into()), Read(12), Write(vec![0, 0, 0, 30])];
+        let mut script = picking();
+        script.extend([Write(APPLE_KEY.into()), Read(128 + 8), Write(vec![0; 4])]);
+        script.extend([Read(1), Write(server_init(800, 600, "mac"))]);
+        let outcome = play_as(script, "faye", "hunter2", None).await;
+        assert_eq!(outcome.sent.len(), 12 + 128 + 8 + 1);
+        assert_eq!(&outcome.sent[..12], b"RFB 003.003\n");
+        // The public key for a 32-bit prime, left-padded to the 8 bytes of the key.
+        assert_eq!(outcome.sent[140..144], [0; 4]);
+        assert_eq!(outcome.sent[148], 1);
+        assert_eq!(outcome.result.unwrap().name, "mac");
+
+        let outcome = play(picking(), "hunter2").await;
+        assert!(refusal(&outcome).ends_with("vnc: this server needs a username"));
+        assert_eq!(outcome.sent, b"RFB 003.003\n");
     }
 
     #[tokio::test]

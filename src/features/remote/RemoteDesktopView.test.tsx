@@ -83,6 +83,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  for (const button of document.querySelectorAll('body > button')) button.remove()
   vi.useRealTimers()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
@@ -187,6 +188,12 @@ async function landWrites(count: number) {
   await act(async () => {
     for (const land of heldWrites?.splice(0, count) ?? []) land()
   })
+}
+
+function outsideButton() {
+  const button = document.createElement('button')
+  document.body.appendChild(button)
+  return button
 }
 
 function runFrames() {
@@ -1282,6 +1289,49 @@ test('an older remote text that lands late does not clear newer refused text', a
   expect(view.driver.clipboard).not.toHaveBeenCalled()
 })
 
+test('local text read before clipboard sync was switched off is not sent', async () => {
+  const view = await connectSynced()
+  let finish: (text: string) => void = () => {}
+  clipboard.readText.mockReturnValueOnce(
+    new Promise<string>((resolve) => {
+      finish = resolve
+    }),
+  )
+  await act(async () => view.canvas.focus())
+  setClipboardSync(false)
+  await act(async () => finish('copied here'))
+  expect(view.driver.clipboard).not.toHaveBeenCalled()
+
+  setClipboardSync(true)
+  localText = 'copied here'
+  await focusAgain(view.canvas)
+  expect(view.driver.clipboard.mock.calls).toEqual([['s1', 'copied here']])
+})
+
+test('an empty local clipboard is not sent', async () => {
+  const view = await connectSynced()
+  localText = ''
+  await act(async () => view.canvas.focus())
+  expect(clipboard.readText).toHaveBeenCalledTimes(1)
+  expect(view.driver.clipboard).not.toHaveBeenCalled()
+
+  localText = 'local'
+  await focusAgain(view.canvas)
+  expect(view.driver.clipboard).not.toHaveBeenCalled()
+})
+
+test('an empty local clipboard does not drop refused remote text', async () => {
+  const view = await connectSynced()
+  clipboard.writeText.mockRejectedValueOnce(new Error('not focused'))
+  await view.emit({ kind: 'clipboard', text: 'remote' })
+  localText = ''
+
+  await act(async () => view.canvas.focus())
+  expect(clipboard.writeText.mock.calls).toEqual([['remote'], ['remote']])
+  expect(localText).toBe('remote')
+  expect(view.driver.clipboard).not.toHaveBeenCalled()
+})
+
 test('local text equal to the refused remote text is not sent back', async () => {
   const view = await connectSynced()
   clipboard.writeText.mockRejectedValueOnce(new Error('not focused'))
@@ -1544,25 +1594,108 @@ test('a session that ends while focus is elsewhere in the window leaves it there
   elsewhere.remove()
 })
 
-test('a session that ends before the view ever had focus does not take it', async () => {
+test('a session that ends with nothing focused moves focus to Reconnect', async () => {
   const view = await connect()
   await view.emit({ kind: 'closed', reason: 'bye' })
-  expect(document.body).toHaveFocus()
+  expect(screen.getByRole('button', { name: 'Reconnect' })).toHaveFocus()
 
   fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }))
-  await view.fail({ kind: 'internal', message: 'timed out' })
-  expect(screen.getByRole('button', { name: 'Reconnect' })).toBeInTheDocument()
   expect(document.body).toHaveFocus()
+  await view.fail({ kind: 'internal', message: 'timed out' })
+  expect(screen.getByRole('button', { name: 'Reconnect' })).toHaveFocus()
 })
 
-test('a session that ends in a hidden tab does not take focus', async () => {
+test('a session that ends in a hidden tab takes focus only once the tab is shown', async () => {
   const view = await connect()
   act(() => view.canvas.focus())
   await view.setActive(false)
   await view.emit({ kind: 'closed', reason: 'bye' })
-
   expect(screen.getByRole('button', { name: 'Reconnect' })).toBeInTheDocument()
   expect(document.body).toHaveFocus()
+
+  await view.setActive(true)
+  expect(screen.getByRole('button', { name: 'Reconnect' })).toHaveFocus()
+})
+
+test('focus that left the canvas for nothing and then went elsewhere is not taken', async () => {
+  const elsewhere = outsideButton()
+  const view = await connect()
+  act(() => view.canvas.focus())
+  act(() => view.canvas.blur())
+  act(() => elsewhere.focus())
+  await view.emit({ kind: 'closed', reason: 'bye' })
+
+  expect(screen.getByRole('button', { name: 'Reconnect' })).toBeInTheDocument()
+  expect(elsewhere).toHaveFocus()
+})
+
+test('focus that went elsewhere after the tab was hidden and shown is not taken', async () => {
+  const elsewhere = outsideButton()
+  const view = await connect()
+  act(() => view.canvas.focus())
+  await view.setActive(false)
+  await view.setActive(true)
+  act(() => elsewhere.focus())
+  await view.emit({ kind: 'closed', reason: 'bye' })
+
+  expect(screen.getByRole('button', { name: 'Reconnect' })).toBeInTheDocument()
+  expect(elsewhere).toHaveFocus()
+})
+
+test('a tab shown again with an ended session does not take focus from elsewhere', async () => {
+  const elsewhere = outsideButton()
+  const view = await connect()
+  act(() => view.canvas.focus())
+  await view.setActive(false)
+  await view.emit({ kind: 'closed', reason: 'bye' })
+  act(() => elsewhere.focus())
+  await view.setActive(true)
+
+  expect(screen.getByRole('button', { name: 'Reconnect' })).toBeInTheDocument()
+  expect(elsewhere).toHaveFocus()
+})
+
+test('focus that left Reconnect for nothing and went elsewhere stays there when the tab is shown again', async () => {
+  const elsewhere = outsideButton()
+  const view = await connect()
+  act(() => view.canvas.focus())
+  await view.emit({ kind: 'closed', reason: 'bye' })
+  expect(screen.getByRole('button', { name: 'Reconnect' })).toHaveFocus()
+
+  act(() => screen.getByRole('button', { name: 'Reconnect' }).blur())
+  act(() => elsewhere.focus())
+  await view.setActive(false)
+  await view.setActive(true)
+  expect(elsewhere).toHaveFocus()
+})
+
+test('focus left inside the view goes to Reconnect when the tab is shown again', async () => {
+  const view = await connect()
+  await view.emit({ kind: 'closed', reason: 'bye' })
+  act(() => screen.getByRole('button', { name: 'Close tab' }).focus())
+  await view.setActive(false)
+  expect(screen.getByRole('button', { name: 'Close tab' })).toHaveFocus()
+
+  await view.setActive(true)
+  expect(screen.getByRole('button', { name: 'Reconnect' })).toHaveFocus()
+})
+
+test('a certificate that cannot be stored moves focus to Reconnect', async () => {
+  vi.mocked(trustHostKey).mockRejectedValue(new Error('io: disk full'))
+  const view = start()
+  await view.fail({
+    kind: 'hostKeyUnknown',
+    message: { host: 'vnc/h', port: 5900, fingerprint: 'SHA256:ab' },
+  })
+  await act(async () => {
+    fireEvent.click(screen.getByRole('button', { name: 'Trust' }))
+  })
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  })
+
+  expect(screen.getByText('io: disk full')).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Reconnect' })).toHaveFocus()
 })
 
 test('a rejected certificate moves focus to Reconnect', async () => {

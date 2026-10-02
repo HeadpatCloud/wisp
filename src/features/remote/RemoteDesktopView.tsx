@@ -96,7 +96,6 @@ export function RemoteDesktopView({
   const liveRef = useRef<Live | null>(null)
   const stopRef = useRef(() => {})
   const attemptRef = useRef(0)
-  const focusWithinRef = useRef(false)
   const removeTab = useSessionStore((s) => s.removeTab)
 
   const connect = useCallback(() => {
@@ -272,7 +271,8 @@ export function RemoteDesktopView({
     navigator.clipboard.readText().then(
       (local) => {
         if (liveRef.current !== live || live.received !== received) return
-        if (local === live.synced) {
+        if (!useSettingsStore.getState().settings.vncClipboardSync) return
+        if (local === '' || local === live.synced) {
           if (live.pending !== null) writeClipboard(live, live.pending)
           return
         }
@@ -334,8 +334,11 @@ export function RemoteDesktopView({
   }, [fullscreen, state.status, active])
 
   useEffect(() => {
-    if (state.status !== 'closed' && state.status !== 'failed') return
-    if (active && focusWithinRef.current) reconnectRef.current?.focus()
+    if (!active || (state.status !== 'closed' && state.status !== 'failed')) return
+    const focused = document.activeElement
+    if (!focused || focused === document.body || containerRef.current?.contains(focused)) {
+      reconnectRef.current?.focus()
+    }
   }, [state.status, active])
 
   const onPointer = (e: PointerEvent<HTMLCanvasElement>) => {
@@ -385,21 +388,16 @@ export function RemoteDesktopView({
     for (const keysym of [0xffff, 0xffe9, 0xffe3]) driver.key(live.id, false, keysym)
   }
 
+  // The closing certificate dialog would otherwise still hold focus when the overlay appears.
+  const leaveDialog = () => {
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur()
+  }
+
   const message =
     state.status === 'closed' ? state.reason : state.status === 'failed' ? state.error : null
 
   return (
-    <div
-      ref={containerRef}
-      onFocusCapture={() => {
-        focusWithinRef.current = true
-      }}
-      onBlurCapture={(e) => {
-        // Focus that goes nowhere (a hidden canvas, a removed button) still counts as ours.
-        if (e.relatedTarget) focusWithinRef.current = false
-      }}
-      className="flex h-full w-full flex-col bg-background"
-    >
+    <div ref={containerRef} className="flex h-full w-full flex-col bg-background">
       {state.status === 'connected' && (
         <div className="flex shrink-0 items-center gap-1 border-border border-b p-1">
           <button
@@ -512,6 +510,7 @@ export function RemoteDesktopView({
           if (state.status !== 'trust') return
           const p = state.prompt
           const attempt = attemptRef.current
+          leaveDialog()
           setState({ status: 'connecting' })
           try {
             await trustHostKey(p.host, p.port, p.kind === 'unknown' ? p.fingerprint : p.offered)
@@ -522,7 +521,10 @@ export function RemoteDesktopView({
           }
           connectRef.current()
         }}
-        onReject={() => setState({ status: 'failed', error: 'Certificate rejected.' })}
+        onReject={() => {
+          leaveDialog()
+          setState({ status: 'failed', error: 'Certificate rejected.' })
+        }}
       />
     </div>
   )

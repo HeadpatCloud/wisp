@@ -127,13 +127,10 @@ fn specta_builder() -> Builder<tauri::Wry> {
             vnc_cmds::vnc_pointer,
             vnc_cmds::vnc_key,
             vnc_cmds::vnc_cut_text,
+            vnc_cmds::vnc_ack,
             vnc_cmds::vnc_close,
         ])
-        .events(collect_events![
-            ssh_cmds::SshStatus,
-            tunnel::TunnelStatus,
-            vnc_cmds::VncClipboard
-        ])
+        .events(collect_events![ssh_cmds::SshStatus, tunnel::TunnelStatus])
 }
 
 // WebKitGTK's GPU paths (DMABUF + accelerated compositing) blank to a white/grey window

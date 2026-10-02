@@ -1,6 +1,6 @@
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { Settings } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { events, type S3Profile, type SftpProfile, type ShellInfo } from '@/bindings'
 import {
   DropdownMenu,
@@ -12,6 +12,7 @@ import { FtpConnectDialog } from '@/features/ftp/FtpConnectDialog'
 import { FtpConnectionView } from '@/features/ftp/FtpConnectionView'
 import { CommandPalette } from '@/features/palette/CommandPalette'
 import { ProfileTree } from '@/features/profiles/ProfileTree'
+import { RemoteDesktopView } from '@/features/remote/RemoteDesktopView'
 import { S3ConnectionView } from '@/features/s3/S3ConnectionView'
 import { S3ProfileDialog } from '@/features/s3/S3ProfileDialog'
 import { LocalTerminalView } from '@/features/sessions/LocalTerminalView'
@@ -20,7 +21,6 @@ import { SftpConnectionView } from '@/features/sessions/SftpConnectionView'
 import { TabBar } from '@/features/sessions/TabBar'
 import { ViewHost } from '@/features/sessions/ViewHost'
 import { VncConnectDialog } from '@/features/sessions/VncConnectDialog'
-import { VncView } from '@/features/sessions/VncView'
 import { SftpConnectDialog } from '@/features/sftp/SftpConnectDialog'
 import { SftpProfileDialog } from '@/features/sftp/SftpProfileDialog'
 import { AppShell } from '@/features/shell/AppShell'
@@ -34,6 +34,7 @@ import { watchSystemTheme } from '@/lib/theme'
 import { pickImportPath } from '@/lib/transfer'
 import { cn } from '@/lib/utils'
 import { setSecret } from '@/lib/vault'
+import { vncDriver } from '@/lib/vnc'
 import { useProfileStore } from '@/stores/profileStore'
 import { useS3ProfileStore } from '@/stores/s3ProfileStore'
 import {
@@ -70,6 +71,16 @@ function nudgeZoom(delta: number, reset = false) {
   if (t?.kind !== 'session') return
   const cur = st.sessions[t.activePaneId]?.zoom ?? 0
   st.setZoom(t.activePaneId, reset ? 0 : cur + delta)
+}
+
+function VncTabView({ tab, active }: { tab: VncTab; active: boolean }) {
+  const { host, port, secretId } = tab
+  // The view reconnects whenever it is given another driver object.
+  const driver = useMemo(
+    () => vncDriver({ host, port, username: null, secretId }),
+    [host, port, secretId],
+  )
+  return <RemoteDesktopView tabId={tab.id} driver={driver} active={active} />
 }
 
 export default function App() {
@@ -195,16 +206,6 @@ export default function App() {
         state: e.payload.state as import('@/stores/tunnelStore').TunnelState,
       }),
     )
-    return () => {
-      un.then((f) => f())
-    }
-  }, [])
-  useEffect(() => {
-    const un = events.vncClipboard.listen((e) => {
-      // Off by default: a remote VNC server shouldn't silently write to the local clipboard
-      if (!useSettingsStore.getState().settings.vncClipboardSync) return
-      navigator.clipboard.writeText(e.payload.text).catch(() => {})
-    })
     return () => {
       un.then((f) => f())
     }
@@ -401,7 +402,7 @@ export default function App() {
                   data-testid={`tabpane-${t.id}`}
                   className={cn('absolute inset-0', t.id !== activeTabId && 'hidden')}
                 >
-                  <VncView host={t.host} port={t.port} secretId={t.secretId} />
+                  <VncTabView tab={t} active={t.id === activeTabId} />
                 </div>
               ))}
               {sftpTabs.map((t) => (

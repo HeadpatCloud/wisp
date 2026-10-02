@@ -7,8 +7,6 @@ use crate::ssh::known_hosts::HostKeyVerdict;
 #[derive(Clone, Copy)]
 pub enum Scheme {
     Vnc,
-    Rdp,
-    Rdg,
 }
 
 pub const UNENCRYPTED: &str = "no certificate (unencrypted login)";
@@ -26,8 +24,6 @@ fn lookup(
 ) -> AppResult<(String, HostKeyVerdict)> {
     let prefix = match scheme {
         Scheme::Vnc => "vnc/",
-        Scheme::Rdp => "rdp/",
-        Scheme::Rdg => "rdg/",
     };
     let host = format!("{prefix}{}", crate::net::normalize_host(host));
     let verdict = {
@@ -189,7 +185,6 @@ mod tests {
             other => panic!("expected HostKeyMismatch, got {other:?}"),
         }
         assert!(check_unencrypted(&known, Scheme::Vnc, "::1", 5901).is_ok());
-        assert!(check_unencrypted(&known, Scheme::Rdp, "::1", 5900).is_ok());
     }
 
     #[test]
@@ -216,24 +211,8 @@ mod tests {
         assert!(has_certificate_pin(&known, Scheme::Vnc, "::1", 5900).unwrap());
         assert!(has_certificate_pin(&known, Scheme::Vnc, "[::1]", 5900).unwrap());
         assert!(!has_certificate_pin(&known, Scheme::Vnc, "::1", 5901).unwrap());
-        assert!(!has_certificate_pin(&known, Scheme::Rdp, "::1", 5900).unwrap());
         known.0.lock().unwrap().record("vnc/::1", 5900, UNENCRYPTED).unwrap();
         assert!(!has_certificate_pin(&known, Scheme::Vnc, "::1", 5900).unwrap());
-    }
-
-    #[test]
-    fn other_schemes_are_separate() {
-        let dir = tempfile::tempdir().unwrap();
-        let known = known(&dir);
-        known.0.lock().unwrap().record("vnc/h", 5900, &fingerprint(b"cert")).unwrap();
-        assert!(matches!(
-            check(&known, Scheme::Rdp, "h", 5900, b"cert"),
-            Err(AppError::HostKeyUnknown { host, .. }) if host == "rdp/h"
-        ));
-        assert!(matches!(
-            check(&known, Scheme::Rdg, "h", 5900, b"cert"),
-            Err(AppError::HostKeyUnknown { host, .. }) if host == "rdg/h"
-        ));
     }
 
     #[test]

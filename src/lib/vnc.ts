@@ -1,60 +1,63 @@
 import { Channel } from '@tauri-apps/api/core'
-import { commands, type FrameUpdate, type VncOpened } from '@/bindings'
+import { commands, type FrameBytes } from '@/bindings'
 import { unwrap } from '@/lib/ipc'
+import type { RemoteDriver } from '@/lib/remoteDriver'
+import { decodeFrame, type FrameMessage } from '@/lib/remoteFrames'
 
-export async function openVnc(
-  host: string,
-  port: number,
-  secretId: string | null,
-  onFrame: (f: FrameUpdate) => void,
-): Promise<VncOpened> {
-  const channel = new Channel<FrameUpdate>()
-  channel.onmessage = onFrame
-  return unwrap(await commands.vncOpen(host, port, secretId, channel))
-}
-
-export async function vncPointer(id: string, buttons: number, x: number, y: number): Promise<void> {
-  unwrap(await commands.vncPointer(id, buttons, x, y))
-}
-
-export async function vncKey(id: string, down: boolean, keysym: number): Promise<void> {
-  unwrap(await commands.vncKey(id, down, keysym))
-}
-
-export async function vncCutText(id: string, text: string): Promise<void> {
-  unwrap(await commands.vncCutText(id, text))
-}
-
-export async function vncClose(id: string): Promise<void> {
-  unwrap(await commands.vncClose(id))
-}
-
-// JS MouseEvent.buttons (1=left, 2=right, 4=middle) -> VNC mask (bit0 left, bit1 middle, bit2 right).
-export function vncButtonMask(jsButtons: number): number {
-  let mask = 0
-  if (jsButtons & 1) mask |= 1
-  if (jsButtons & 4) mask |= 2
-  if (jsButtons & 2) mask |= 4
-  return mask
-}
-
-const KEYSYMS: Record<string, number> = {
-  Enter: 0xff0d,
-  Backspace: 0xff08,
-  Tab: 0xff09,
-  Escape: 0xff1b,
-  Delete: 0xffff,
-  Home: 0xff50,
-  End: 0xff57,
-  ArrowLeft: 0xff51,
-  ArrowUp: 0xff52,
-  ArrowRight: 0xff53,
-  ArrowDown: 0xff54,
-}
-
-// Map a KeyboardEvent.key to an X11 keysym (null if unmapped).
-export function keysymFor(key: string): number | null {
-  if (key in KEYSYMS) return KEYSYMS[key]
-  if (key.length === 1) return key.charCodeAt(0) // printable Latin-1 maps 1:1
-  return null
+export function vncDriver(target: {
+  host: string
+  port: number
+  username: string | null
+  secretId: string | null
+}): RemoteDriver {
+  const close = async (id: string) => {
+    unwrap(await commands.vncClose(id))
+  }
+  return {
+    async open(onFrame) {
+      let id: string | null = null
+      let unreadable = false
+      const channel = new Channel<FrameBytes>()
+      // The bindings say number array; what arrives is an ArrayBuffer, or a number array on a
+      // webview without the custom-protocol IPC.
+      channel.onmessage = (buf: ArrayBuffer | number[]) => {
+        if (unreadable) return
+        let message: FrameMessage
+        try {
+          message = decodeFrame(buf)
+        } catch {
+          unreadable = true
+          onFrame({ kind: 'closed', reason: 'The server sent data this app could not read.' })
+          if (id !== null) close(id)
+          return
+        }
+        onFrame(message)
+      }
+      const res = await commands.vncOpen(
+        target.host,
+        target.port,
+        target.username,
+        target.secretId,
+        channel,
+      )
+      // The error object itself, so that the view can tell a certificate prompt by its kind.
+      if (res.status === 'error') throw res.error
+      id = res.data.id
+      if (unreadable) close(id)
+      return res.data
+    },
+    async pointer(id, buttons, x, y) {
+      unwrap(await commands.vncPointer(id, buttons, x, y))
+    },
+    async key(id, down, keysym) {
+      unwrap(await commands.vncKey(id, down, keysym))
+    },
+    async clipboard(id, text) {
+      unwrap(await commands.vncCutText(id, text))
+    },
+    async ack(id) {
+      unwrap(await commands.vncAck(id))
+    },
+    close,
+  }
 }

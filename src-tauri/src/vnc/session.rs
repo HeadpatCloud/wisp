@@ -127,18 +127,19 @@ impl Session {
     }
 
     async fn close_within(&self, limit: Duration) {
+        let mut task = self.task.lock().await;
         // The empty message stops the writer; what was queued before it, key releases above all,
-        // still goes out first.
-        let written = async {
+        // still goes out first. The task ends once the server has closed its side as well.
+        let finished = async {
             if self.input.send(Vec::new()).await.is_ok() {
-                self.input.closed().await;
+                task.join_next().await;
             }
         };
         tokio::select! {
-            _ = written => {}
+            _ = finished => {}
             _ = tokio::time::sleep(limit) => {}
         }
-        self.task.lock().await.shutdown().await;
+        task.shutdown().await;
     }
 }
 
@@ -165,7 +166,8 @@ pub async fn run(
             writer.write_all(&message).await?;
             writer.flush().await?;
         }
-        std::io::Result::Ok(())
+        // Tells the server that nothing more comes, so that it closes its side.
+        writer.shutdown().await
     });
 
     // `unacked` counts the updates the view has not acknowledged, `requested` says an update is
@@ -232,11 +234,22 @@ pub async fn run(
         }
     }
     .await;
+    // A read that fails once `close` has stopped the writer is the server closing in answer.
+    let ended = match writing.try_join_next() {
+        Some(Ok(Ok(()))) => Ok(()),
+        _ => ended,
+    };
     // Nothing more can be sent once the view hears that the session is over.
     writing.shutdown().await;
     let reason = match ended {
-        // `close` ends this task too, and the view is told nothing.
-        Ok(()) => return,
+        // `close` ends this task too, and the view is told nothing. What the server still sends
+        // is read and thrown away until it closes: a socket dropped with data unread resets the
+        // connection, and the server loses what was written to it last.
+        Ok(()) => {
+            let mut discarded = [0u8; 4096];
+            while matches!(reader.read(&mut discarded).await, Ok(1..)) {}
+            return;
+        }
         Err(AppError::Internal(text)) => text.trim_start_matches("vnc: ").to_string(),
         Err(_) => "network connection lost".to_string(),
     };
@@ -250,8 +263,10 @@ mod tests {
     use std::sync::OnceLock;
     use std::time::Instant;
 
+    use futures_util::future::join_all;
     use futures_util::FutureExt;
     use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
     use tokio::time::timeout;
 
     use super::*;
@@ -768,6 +783,87 @@ mod tests {
         let log = server.wait(|log| log.last() == Some(&Seen::Gone)).await;
         assert_eq!(log, [setup(), vec![Seen::Gone]].concat());
         assert_eq!(rest(&mut ops).await, []);
+    }
+
+    // A server without a login that pushes 40 KB of updates and reads nothing the client writes
+    // after its ClientInit until it is told to; it returns all of that once the client is gone.
+    async fn late_reader() -> (u16, oneshot::Sender<()>, JoinSet<std::io::Result<Vec<u8>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (read, told) = oneshot::channel();
+        let mut served = JoinSet::new();
+        served.spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            stream.write_all(b"RFB 003.003\n").await?;
+            stream.read_exact(&mut [0u8; 12]).await?;
+            stream.write_u32(1).await?;
+            stream.read_u8().await?;
+            stream.write_all(&[&[0, 4, 0, 2][..], &PIXEL_FORMAT, &[0; 4]].concat()).await?;
+            stream.write_all(&dot(0, 0).repeat(2048)).await?;
+            told.await.map_err(std::io::Error::other)?;
+            let mut written = Vec::new();
+            stream.read_to_end(&mut written).await?;
+            Ok(written)
+        });
+        (port, read, served)
+    }
+
+    #[tokio::test]
+    async fn close_delivers_queued_input_to_a_server_that_reads_late() {
+        let mut expected = vec![0u8; 4];
+        expected.extend(PIXEL_FORMAT);
+        expected.extend(set_encodings(&ENCODINGS));
+        expected.extend(fb_update_request(false, 0, 0, 4, 2));
+        expected.extend(key_event(false, 0xFFE1));
+        let rounds = (0..50).map(|_| async {
+            let (port, read, mut served) = late_reader().await;
+            let (session, mut ops) = open(port, "").await;
+            let session = session.unwrap();
+            // Two updates are read; the rest of the 40 KB stays unread.
+            for _ in 0..2 {
+                assert_eq!(next(&mut ops).await, drawn(0, 0));
+                assert_eq!(next(&mut ops).await, FrameOp::Sync);
+            }
+            session.key(false, 0xFFE1).await.unwrap();
+            timeout(WAIT, session.close()).await.expect("close hung");
+            assert!(ops.is_closed());
+            read.send(()).unwrap();
+            let written = timeout(WAIT, served.join_next()).await.expect("the server hung");
+            written.unwrap().unwrap().ok()
+        });
+        let delivered = join_all(rounds).await;
+        let whole = delivered.iter().filter(|written| written.as_ref() == Some(&expected)).count();
+        assert_eq!(whole, 50, "of 50 closes");
+    }
+
+    #[tokio::test]
+    async fn closing_in_the_middle_of_an_update_tells_the_view_nothing() {
+        let mut server = Server::start(script(Vec::new(), After::Hold)).await;
+        let (session, mut ops) = open(server.port, "hunter2").await;
+        let session = session.unwrap();
+        assert_eq!(server.wait(|log| log.len() >= 3).await, setup());
+        server.send(dot(0, 0)[..18].to_vec());
+        server.wait(|log| log.last() == Some(&Seen::Sent)).await;
+        // The server answers the close by closing, which cuts the update off.
+        timeout(WAIT, session.close()).await.expect("close hung");
+        assert!(ops.is_closed());
+        assert_eq!(rest(&mut ops).await, []);
+        server.wait(|log| log.last() == Some(&Seen::Gone)).await;
+    }
+
+    #[tokio::test]
+    async fn closing_an_idle_session_does_not_wait_for_the_limit() {
+        let mut server = Server::start(script(Vec::new(), After::Hold)).await;
+        let (session, mut ops) = open(server.port, "hunter2").await;
+        let session = session.unwrap();
+        assert_eq!(server.wait(|log| log.len() >= 3).await, setup());
+        let started = Instant::now();
+        timeout(WAIT, session.close()).await.expect("close hung");
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(250), "close took {took:?}");
+        assert_eq!(rest(&mut ops).await, []);
+        let log = server.wait(|log| log.last() == Some(&Seen::Gone)).await;
+        assert_eq!(log, [setup(), vec![Seen::Gone]].concat());
     }
 
     #[tokio::test]

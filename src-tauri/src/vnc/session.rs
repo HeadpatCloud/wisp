@@ -6,8 +6,8 @@ use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, Semaphore};
-use tokio::task::{AbortHandle, JoinSet};
+use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::task::JoinSet;
 
 use super::decode::Decoder;
 use super::handshake::{handshake, Login, Stream, TlsContext};
@@ -15,7 +15,7 @@ use super::proto::{
     client_cut_text, fb_update_request, key_event, latin1_decode, latin1_encode, pointer_event,
     set_encodings,
 };
-use super::{bounded, err, MAX_TEXT, PIXEL_FORMAT};
+use super::{err, MAX_TEXT, PIXEL_FORMAT};
 use crate::commands::ssh_cmds::KnownHostsState;
 use crate::error::{AppError, AppResult};
 use crate::remote::FrameOp;
@@ -27,7 +27,7 @@ pub struct Session {
     input: mpsc::Sender<Vec<u8>>,
     acks: Arc<Semaphore>,
     buttons: AtomicU8,
-    task: AbortHandle,
+    task: Mutex<JoinSet<()>>,
 }
 
 impl Session {
@@ -39,6 +39,19 @@ impl Session {
         encodings: &[i32],
         sink: impl Fn(FrameOp) + Send + 'static,
     ) -> AppResult<Session> {
+        let limit = Duration::from_secs(20);
+        Self::connect_within(host, port, login, known, encodings, sink, limit).await
+    }
+
+    async fn connect_within(
+        host: &str,
+        port: u16,
+        login: &Login<'_>,
+        known: &KnownHostsState,
+        encodings: &[i32],
+        sink: impl Fn(FrameOp) + Send + 'static,
+        limit: Duration,
+    ) -> AppResult<Session> {
         let opening = async {
             let tcp = TcpStream::connect((crate::net::normalize_host(host).as_str(), port)).await?;
             tcp.set_nodelay(true)?;
@@ -48,7 +61,7 @@ impl Session {
             SockRef::from(&tcp).set_tcp_keepalive(&keepalive)?;
             handshake(Box::new(tcp), login, &TlsContext { host, port, known }).await
         };
-        let (mut stream, init) = tokio::time::timeout(Duration::from_secs(20), opening)
+        let (mut stream, init) = tokio::time::timeout(limit, opening)
             .await
             .map_err(|_| err("connection timed out"))??;
         let decoder = Decoder::new(init.width, init.height)?;
@@ -62,7 +75,8 @@ impl Session {
 
         let (input, messages) = mpsc::channel(256);
         let acks = Arc::new(Semaphore::new(0));
-        let task = tokio::spawn(run(stream, decoder, input.clone(), messages, acks.clone(), sink));
+        let mut task = JoinSet::new();
+        task.spawn(run(stream, decoder, input.clone(), messages, acks.clone(), sink));
         Ok(Session {
             width: init.width,
             height: init.height,
@@ -70,7 +84,7 @@ impl Session {
             input,
             acks,
             buttons: AtomicU8::new(0),
-            task: task.abort_handle(),
+            task: Mutex::new(task),
         })
     }
 
@@ -95,7 +109,12 @@ impl Session {
     }
 
     pub async fn clipboard(&self, text: &str) -> AppResult<()> {
-        self.send(client_cut_text(&latin1_encode(text))).await
+        let text = latin1_encode(text);
+        // Servers drop a client that sends more, so a longer text is not synced.
+        if text.len() > MAX_TEXT {
+            return Ok(());
+        }
+        self.send(client_cut_text(&text)).await
     }
 
     // The view has applied everything up to one more `Sync`.
@@ -103,8 +122,23 @@ impl Session {
         self.acks.add_permits(1);
     }
 
-    pub fn close(&self) {
-        self.task.abort();
+    pub async fn close(&self) {
+        self.close_within(Duration::from_secs(1)).await
+    }
+
+    async fn close_within(&self, limit: Duration) {
+        // The empty message stops the writer; what was queued before it, key releases above all,
+        // still goes out first.
+        let written = async {
+            if self.input.send(Vec::new()).await.is_ok() {
+                self.input.closed().await;
+            }
+        };
+        tokio::select! {
+            _ = written => {}
+            _ = tokio::time::sleep(limit) => {}
+        }
+        self.task.lock().await.shutdown().await;
     }
 }
 
@@ -126,7 +160,8 @@ pub async fn run(
     let mut reader = BufReader::new(reader);
     let mut writing = JoinSet::new();
     writing.spawn(async move {
-        while let Some(message) = input.recv().await {
+        // An empty message is `close` asking to stop once everything before it is written.
+        while let Some(message) = input.recv().await.filter(|message| !message.is_empty()) {
             writer.write_all(&message).await?;
             writer.flush().await?;
         }
@@ -139,9 +174,10 @@ pub async fn run(
     let ended: AppResult<()> = async {
         loop {
             // A message is read to its end once its type is in: `Decoder::update` cannot be
-            // dropped halfway, so only the wait for the type byte is raced.
+            // dropped halfway, so only the wait for the type byte is raced. With two updates
+            // unacknowledged nothing more is read, and TCP holds a server that pushes them back.
             tokio::select! {
-                kind = reader.read_u8() => match kind? {
+                kind = reader.read_u8(), if unacked < 2 => match kind? {
                     0 => {
                         let mut forward = |op| {
                             full |= matches!(op, FrameOp::Resize { .. });
@@ -161,10 +197,18 @@ pub async fn run(
                     2 => {}
                     3 => {
                         reader.read_exact(&mut [0u8; 3]).await?;
-                        let len = bounded(reader.read_u32().await? as usize, MAX_TEXT)?;
-                        let mut text = vec![0u8; len];
-                        reader.read_exact(&mut text).await?;
-                        sink(FrameOp::Clipboard(latin1_decode(&text)));
+                        let len = reader.read_u32().await? as usize;
+                        if len > MAX_TEXT {
+                            let mut skipped = [0u8; 4096];
+                            for done in (0..len).step_by(skipped.len()) {
+                                let part = (len - done).min(skipped.len());
+                                reader.read_exact(&mut skipped[..part]).await?;
+                            }
+                        } else {
+                            let mut text = vec![0u8; len];
+                            reader.read_exact(&mut text).await?;
+                            sink(FrameOp::Clipboard(latin1_decode(&text)));
+                        }
                     }
                     other => {
                         return Err(err(format!("the server sent an unknown message ({other})")));
@@ -179,8 +223,11 @@ pub async fn run(
                     slot.send(fb_update_request(!full, 0, 0, w, h).to_vec());
                     (requested, full) = (true, false);
                 }
-                // The writer stops only when a write failed.
-                _ = writing.join_next() => return Ok(()),
+                // The writer ends with an error when a write failed, and without one when
+                // `close` asked it to stop.
+                Some(stopped) = writing.join_next() => {
+                    return Ok(stopped.map_err(std::io::Error::other)??);
+                }
             }
         }
     }
@@ -188,8 +235,10 @@ pub async fn run(
     // Nothing more can be sent once the view hears that the session is over.
     writing.shutdown().await;
     let reason = match ended {
+        // `close` ends this task too, and the view is told nothing.
+        Ok(()) => return,
         Err(AppError::Internal(text)) => text.trim_start_matches("vnc: ").to_string(),
-        _ => "network connection lost".to_string(),
+        Err(_) => "network connection lost".to_string(),
     };
     sink(FrameOp::Closed(reason));
 }
@@ -198,8 +247,8 @@ pub async fn run(
 mod tests {
     use std::future::Future;
     use std::pin::pin;
-    use std::sync::{Mutex, OnceLock};
-    use std::time::Duration;
+    use std::sync::OnceLock;
+    use std::time::Instant;
 
     use futures_util::FutureExt;
     use tokio::net::TcpListener;
@@ -248,14 +297,18 @@ mod tests {
         Seen::Key { down: true, keysym }
     }
 
+    fn known_hosts() -> KnownHostsState {
+        let dir = tempfile::tempdir().unwrap();
+        let hosts = KnownHosts::load(dir.path().join("known_hosts.json")).unwrap();
+        KnownHostsState(Arc::new(std::sync::Mutex::new(hosts)))
+    }
+
     async fn connect(
         port: u16,
         password: &str,
         sink: impl Fn(FrameOp) + Send + 'static,
     ) -> AppResult<Session> {
-        let dir = tempfile::tempdir().unwrap();
-        let hosts = KnownHosts::load(dir.path().join("known_hosts.json")).unwrap();
-        let known = KnownHostsState(Arc::new(Mutex::new(hosts)));
+        let known = known_hosts();
         let login = Login { username: "", password };
         let connecting = Session::connect("127.0.0.1", port, &login, &known, &ENCODINGS, sink);
         timeout(Duration::from_secs(60), connecting).await.expect("connect hung")
@@ -307,7 +360,7 @@ mod tests {
         session.ack();
         let log = server.wait(|log| log.len() >= 5).await;
         assert_eq!(log, [setup(), vec![Seen::Sent, NEXT]].concat());
-        session.close();
+        session.close().await;
         assert_eq!(rest(&mut ops).await, []);
     }
 
@@ -601,13 +654,169 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clipboard_text_over_a_mebibyte_ends_the_session() {
+    async fn server_clipboard_text_over_a_mebibyte_is_skipped() {
         let server = Server::start(script(Vec::new(), After::Hold)).await;
         let (session, mut ops) = open(server.port, "hunter2").await;
         let _session = session.unwrap();
-        server.send(vec![3, 0, 0, 0, 0, 0x10, 0, 1]);
-        let closed = FrameOp::Closed("declared length 1048577 exceeds 1048576".into());
-        assert_eq!(rest(&mut ops).await, [closed]);
+        server.send(cut_text(&vec![b'x'; MAX_TEXT]));
+        match next(&mut ops).await {
+            FrameOp::Clipboard(text) => assert_eq!(text.len(), MAX_TEXT),
+            other => panic!("expected the clipboard text, got {other:?}"),
+        }
+        server.send([cut_text(&vec![b'x'; MAX_TEXT + 1]), cut_text(b"after")].concat());
+        assert_eq!(next(&mut ops).await, FrameOp::Clipboard("after".into()));
+    }
+
+    #[tokio::test]
+    async fn a_connection_lost_inside_skipped_clipboard_text_ends_the_session() {
+        let mut server = Server::start(script(Vec::new(), After::Hold)).await;
+        let (session, mut ops) = open(server.port, "hunter2").await;
+        let _session = session.unwrap();
+        // Everything the client wrote is read first, so the server closes without a reset.
+        assert_eq!(server.wait(|log| log.len() >= 3).await, setup());
+        server.send(cut_text(&vec![b'x'; MAX_TEXT + 1])[..10_000].to_vec());
+        drop(server);
+        assert_eq!(rest(&mut ops).await, [FrameOp::Closed(LOST.into())]);
+    }
+
+    #[tokio::test]
+    async fn clipboard_text_over_a_mebibyte_is_not_sent() {
+        let mut server = Server::start(script(Vec::new(), After::Hold)).await;
+        let (session, _ops) = open(server.port, "hunter2").await;
+        let session = session.unwrap();
+        session.clipboard(&"é".repeat(MAX_TEXT + 1)).await.unwrap();
+        session.clipboard(&"é".repeat(MAX_TEXT)).await.unwrap();
+        let log = server.wait(|log| log.len() >= 4).await;
+        assert_eq!(log[..3], setup());
+        match &log[3..] {
+            [Seen::CutText(text)] => assert!(text.len() == MAX_TEXT && text[0] == 0xE9),
+            other => panic!("expected one text of a mebibyte, got {} messages", other.len()),
+        }
+    }
+
+    #[tokio::test]
+    async fn updates_pushed_without_acknowledgement_stop_after_two() {
+        let mut server = Server::start(script(Vec::new(), After::Hold)).await;
+        let (session, mut ops) = open(server.port, "hunter2").await;
+        let session = session.unwrap();
+        let mut log = setup();
+        assert_eq!(server.wait(|seen| seen.len() >= log.len()).await, log);
+        let place = |n: u32| ((n % 4) as u16, (n / 4 % 2) as u16);
+        server.send((0..10).flat_map(|n| dot(place(n).0, place(n).1)).collect());
+        log.push(Seen::Sent);
+        for n in 0..10 {
+            if n >= 2 {
+                log.push(key(n));
+                assert_eq!(log_now(&session, &mut server, n).await, log);
+                assert!(ops.try_recv().is_err(), "update {n} was read before an acknowledgement");
+                session.ack();
+            }
+            assert_eq!(next(&mut ops).await, drawn(place(n).0, place(n).1));
+            assert_eq!(next(&mut ops).await, FrameOp::Sync);
+        }
+        log.push(key(10));
+        assert_eq!(log_now(&session, &mut server, 10).await, log);
+        session.ack();
+        session.ack();
+        log.push(NEXT);
+        assert_eq!(server.wait(|seen| seen.len() >= log.len()).await, log);
+        assert!(ops.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn closing_while_pushed_updates_wait_tells_the_view_nothing() {
+        let mut server = Server::start(script(Vec::new(), After::Hold)).await;
+        let (session, mut ops) = open(server.port, "hunter2").await;
+        let session = session.unwrap();
+        assert_eq!(server.wait(|log| log.len() >= 3).await, setup());
+        server.send([dot(0, 0), dot(1, 0), dot(2, 0)].concat());
+        for x in 0..2 {
+            assert_eq!(next(&mut ops).await, drawn(x, 0));
+            assert_eq!(next(&mut ops).await, FrameOp::Sync);
+        }
+        timeout(WAIT, session.close()).await.expect("close hung");
+        assert!(ops.is_closed());
+        assert_eq!(rest(&mut ops).await, []);
+        let log = server.wait(|log| log.last() == Some(&Seen::Gone)).await;
+        assert_eq!(log, [setup(), vec![Seen::Sent, Seen::Gone]].concat());
+    }
+
+    #[tokio::test]
+    async fn keys_queued_before_close_still_reach_the_server() {
+        let mut server = Server::start(script(Vec::new(), After::Hold)).await;
+        let (session, mut ops) = open(server.port, "hunter2").await;
+        let session = session.unwrap();
+        session.key(true, 0xFFE1).await.unwrap();
+        session.key(false, 0xFFE1).await.unwrap();
+        timeout(WAIT, session.close()).await.expect("close hung");
+        assert!(ops.is_closed());
+        assert_eq!(rest(&mut ops).await, []);
+        let log = server.wait(|log| log.last() == Some(&Seen::Gone)).await;
+        let keys = [key(0xFFE1), Seen::Key { down: false, keysym: 0xFFE1 }, Seen::Gone];
+        assert_eq!(log, [setup(), keys.to_vec()].concat());
+        match session.key(true, 0x61).await {
+            Err(AppError::NotFound(what)) => assert_eq!(what, "vnc session closed"),
+            other => panic!("expected the closed error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dropped_session_disconnects() {
+        let mut server = Server::start(script(Vec::new(), After::Hold)).await;
+        let (session, mut ops) = open(server.port, "hunter2").await;
+        drop(session.unwrap());
+        let log = server.wait(|log| log.last() == Some(&Seen::Gone)).await;
+        assert_eq!(log, [setup(), vec![Seen::Gone]].concat());
+        assert_eq!(rest(&mut ops).await, []);
+    }
+
+    #[tokio::test]
+    async fn close_gives_a_stuck_writer_its_limit_and_no_more() {
+        let (client, mut server) = tokio::io::duplex(64);
+        let (input, messages) = mpsc::channel(256);
+        let acks = Arc::new(Semaphore::new(0));
+        let (sink, mut ops) = mpsc::unbounded_channel();
+        let decoder = Decoder::new(4, 2).unwrap();
+        let sink = move |op| sink.send(op).unwrap();
+        let mut task = JoinSet::new();
+        task.spawn(run(Box::new(client), decoder, input.clone(), messages, acks.clone(), sink));
+        let session = Session {
+            width: 4,
+            height: 2,
+            name: String::new(),
+            input,
+            acks,
+            buttons: AtomicU8::new(0),
+            task: Mutex::new(task),
+        };
+        // 160 bytes for a pipe that takes 64 and is not read.
+        for keysym in 0..20 {
+            session.key(true, keysym).await.unwrap();
+        }
+        let limit = Duration::from_millis(200);
+        let started = Instant::now();
+        timeout(WAIT, session.close_within(limit)).await.expect("close hung");
+        let took = started.elapsed();
+        assert!(took >= limit && took < limit * 5, "close took {took:?}");
+        assert!(ops.is_closed());
+        assert_eq!(rest(&mut ops).await, []);
+        let mut written = Vec::new();
+        let ended = timeout(WAIT, server.read_to_end(&mut written)).await;
+        ended.expect("the connection stayed open").unwrap();
+        let keys: Vec<u8> = (0..8).flat_map(|keysym| key_event(true, keysym)).collect();
+        assert_eq!(written, keys);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn nothing_reaches_the_view_once_close_has_returned() {
+        for round in 0..100 {
+            let server = Server::start(script(vec![dot(0, 0)], After::Hold)).await;
+            let (session, ops) = open(server.port, "hunter2").await;
+            let session = session.unwrap();
+            drop(server);
+            timeout(WAIT, session.close()).await.expect("close hung");
+            assert!(ops.is_closed(), "round {round}: the sink outlived close");
+        }
     }
 
     #[tokio::test]
@@ -669,7 +878,7 @@ mod tests {
         assert_eq!(rest(&mut ops).await, []);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_server_that_never_speaks_times_out() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -677,10 +886,17 @@ mod tests {
             let _silent = listener.accept().await;
             std::future::pending::<()>().await
         });
-        let started = tokio::time::Instant::now();
-        let (session, mut ops) = open(port, "").await;
+        let known = known_hosts();
+        let login = Login { username: "", password: "" };
+        let (sink, mut ops) = mpsc::unbounded_channel();
+        let sink = move |op| sink.send(op).unwrap();
+        let limit = Duration::from_millis(300);
+        let started = Instant::now();
+        let connecting =
+            Session::connect_within("127.0.0.1", port, &login, &known, &ENCODINGS, sink, limit);
+        let session = timeout(WAIT, connecting).await.expect("connect hung");
         assert!(refusal(session).ends_with("vnc: connection timed out"));
-        assert_eq!(started.elapsed(), Duration::from_secs(20));
+        assert!(started.elapsed() >= limit);
         assert_eq!(rest(&mut ops).await, []);
     }
 
@@ -694,7 +910,7 @@ mod tests {
             input,
             acks: Arc::new(Semaphore::new(0)),
             buttons: AtomicU8::new(0),
-            task: tokio::spawn(async {}).abort_handle(),
+            task: Mutex::new(JoinSet::new()),
         };
         // One poll outside tokio's cooperative budget, which makes the 129th send in a row wait
         // whether there is room or not.

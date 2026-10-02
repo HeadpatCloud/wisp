@@ -34,6 +34,8 @@ pub enum Seen {
     CutText(Vec<u8>),
     // Not from the client: the server wrote an update, or bytes the test gave it, at this point.
     Sent,
+    // The client has closed the connection.
+    Gone,
 }
 
 pub fn rect(x: u16, y: u16, w: u16, h: u16, encoding: i32, data: &[u8]) -> Vec<u8> {
@@ -110,7 +112,11 @@ pub async fn serve(
     loop {
         tokio::select! {
             kind = stream.read_u8() => {
-                let message = match kind? {
+                let Ok(kind) = kind else {
+                    seen.send_modify(|log| log.push(Seen::Gone));
+                    return Ok(());
+                };
+                let message = match kind {
                     0 => {
                         let mut body = [0u8; 19];
                         stream.read_exact(&mut body).await?;

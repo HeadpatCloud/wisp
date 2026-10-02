@@ -4,7 +4,7 @@ pub mod handshake;
 pub mod proto;
 pub mod session;
 #[cfg(test)]
-mod testserver;
+pub(crate) mod testserver;
 pub mod vencrypt;
 
 use crate::error::{AppError, AppResult};

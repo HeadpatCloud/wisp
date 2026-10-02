@@ -124,9 +124,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
             local_cmds::local_resize,
             local_cmds::local_close,
             vnc_cmds::vnc_open,
-            vnc_cmds::vnc_pointer,
-            vnc_cmds::vnc_key,
-            vnc_cmds::vnc_cut_text,
+            vnc_cmds::vnc_input,
             vnc_cmds::vnc_ack,
             vnc_cmds::vnc_close,
         ])

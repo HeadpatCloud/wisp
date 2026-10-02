@@ -142,7 +142,7 @@ impl Session {
     }
 }
 
-pub(crate) fn closed() -> AppError {
+fn closed() -> AppError {
     AppError::NotFound("vnc session closed".into())
 }
 

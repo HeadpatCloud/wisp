@@ -3,13 +3,12 @@
 
 use std::collections::HashSet;
 use std::io::Read;
+use std::net::TcpStream;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::io::AsyncReadExt;
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout, timeout_at};
 use wisp_lib::{AppError, FrameOp, KnownHosts, KnownHostsState, Login, Session, ENCODINGS};
@@ -135,7 +134,7 @@ fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).trim().to_string()
 }
 
-// Asks until the answer is the wanted one: what a server does with input shows a moment later.
+// What a server does with input shows inside a moment later.
 async fn settles<T: PartialEq + std::fmt::Debug>(what: &str, wanted: T, ask: impl Fn() -> T) {
     let started = Instant::now();
     loop {
@@ -148,7 +147,13 @@ async fn settles<T: PartialEq + std::fmt::Debug>(what: &str, wanted: T, ask: imp
     }
 }
 
-// Presses the keys in turn and lets them go in reverse.
+// x11vnc ignores a pointer event for the place its last client left the pointer at, also when
+// the pointer has been moved from inside since, as the guards do: a step to the side comes first.
+async fn point(session: &Session, x: u16, y: u16) {
+    session.pointer(0, x + 1, y).await.unwrap();
+    session.pointer(0, x, y).await.unwrap();
+}
+
 async fn chord(session: &Session, keysyms: &[u32]) {
     for keysym in keysyms {
         session.key(true, *keysym).await.unwrap();
@@ -158,7 +163,7 @@ async fn chord(session: &Session, keysyms: &[u32]) {
     }
 }
 
-// Puts back what a test changed inside a container, however the test ends.
+// A guard, so that a test that fails leaves the container as it found it too.
 struct Restore {
     server: Server,
     script: String,
@@ -174,6 +179,32 @@ impl Drop for Restore {
     }
 }
 
+// Brings a stopped server back however the test ends. A later run could not: it fails at its
+// first connect.
+struct Up(Server);
+
+impl Drop for Up {
+    fn drop(&mut self) {
+        let started = docker(&["start", &self.0.container()]).ok;
+        // Docker takes connections before the server does, and closes them without a banner.
+        let (waiting, mut banner) = (Instant::now(), [0u8; 12]);
+        while waiting.elapsed() < WAIT * 3 {
+            let greeting = TcpStream::connect((HOST, self.0.port)).and_then(|mut stream| {
+                stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                stream.read_exact(&mut banner)
+            });
+            if greeting.is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if !std::thread::panicking() {
+            assert!(started, "{}: not started", self.0.service);
+            assert_eq!(&banner, b"RFB 003.008\n", "{}", self.0.service);
+        }
+    }
+}
+
 type Ops = mpsc::UnboundedReceiver<FrameOp>;
 
 impl Server {
@@ -181,15 +212,14 @@ impl Server {
         format!("wisp-test-{}", self.service)
     }
 
-    // A shell command in the server's container, which has to succeed.
     fn inside(&self, script: &str) -> Vec<u8> {
         let ran = docker(&["exec", &self.container(), "sh", "-c", script]);
         assert!(ran.ok, "{}: `{script}` failed: {}", self.service, text(&ran.err));
         ran.out
     }
 
-    // Runs a program in the container's background. The guard ends it and removes its files.
     fn start(&self, name: &str, command: &str) -> Restore {
+        // exec, so that the pid the guard ends is the program's.
         let script = format!("echo $$ > /tmp/{name}.pid; exec {command}");
         let ran = docker(&["exec", "-d", &self.container(), "sh", "-c", &script]);
         assert!(ran.ok, "{}: `{command}` did not start: {}", self.service, text(&ran.err));
@@ -203,7 +233,7 @@ impl Server {
         text(&self.inside(&script)) == "1"
     }
 
-    // What the server has logged since the container was started.
+    // Since the start only: docker keeps the lines of earlier starts of a container.
     fn log(&self) -> String {
         let container = self.container();
         let started = docker(&["inspect", "-f", "{{.State.StartedAt}}", &container]);
@@ -220,7 +250,6 @@ impl Server {
         format!("SHA256:{}", digest.replace(':', "").to_lowercase())
     }
 
-    // Where the pointer is, as the X server inside sees it.
     fn pointer(&self) -> (u16, u16) {
         let tool = if self.service == "tightvnc" { "pointer" } else { "xdotool getmouselocation" };
         let printed = text(&self.inside(tool));
@@ -230,13 +259,22 @@ impl Server {
         x.zip(y).unwrap_or_else(|| panic!("{}: pointer position {printed:?}", self.service))
     }
 
-    // The screen as the X server inside has it, three bytes a pixel.
+    fn pointer_home(&self) -> Restore {
+        // xdotool segfaults on TightVNC's X server.
+        let script = if self.service == "tightvnc" {
+            "python3 -c 'from Xlib.display import Display; d = Display(); \
+             d.screen().root.warp_pointer(640, 400); d.sync()'"
+        } else {
+            "xdotool mousemove 640 400"
+        };
+        Restore { server: *self, script: script.into() }
+    }
+
     fn screenshot(&self) -> Ran {
         let script = "xwd -root -silent | convert xwd:- rgb:-";
         docker(&["exec", &self.container(), "sh", "-c", script])
     }
 
-    // A known-hosts file of the test's own, with the given certificate on record for the server.
     fn known(&self, pin: Option<&str>) -> (tempfile::TempDir, KnownHostsState) {
         let dir = tempfile::tempdir().unwrap();
         let mut hosts = KnownHosts::load(dir.path().join("known_hosts.json")).unwrap();
@@ -246,7 +284,6 @@ impl Server {
         (dir, KnownHostsState(Arc::new(Mutex::new(hosts))))
     }
 
-    // Known hosts that trust the certificate the container holds.
     fn trusted(&self) -> (tempfile::TempDir, KnownHostsState) {
         let pin = self.x509.then(|| self.fingerprint());
         self.known(pin.as_deref())
@@ -265,7 +302,6 @@ impl Server {
         (timeout(WAIT * 2, connecting).await.expect("connect hung"), ops)
     }
 
-    // The error of a login that has to fail, after which nothing may have reached the view.
     async fn refusal(&self, password: &str, known: &KnownHostsState) -> AppError {
         let (session, mut ops) = self.connect(password, known, &ENCODINGS).await;
         let error = session.err().unwrap_or_else(|| panic!("{}: logged in", self.service));
@@ -300,7 +336,6 @@ struct Cursor {
     rgba: Vec<u8>,
 }
 
-// A session and what a view has made of its operations.
 struct View {
     service: &'static str,
     session: Session,
@@ -354,7 +389,6 @@ impl View {
         }
     }
 
-    // Applies what the session hands over until `done` holds.
     async fn within(&mut self, limit: Duration, what: &str, done: impl Fn(&View) -> bool) {
         let end = tokio::time::Instant::now() + limit;
         while !done(self) {
@@ -368,7 +402,6 @@ impl View {
         self.within(WAIT, what, done).await
     }
 
-    // Applies what arrives in the given time.
     async fn idle(&mut self, time: Duration) {
         let limit = tokio::time::Instant::now() + time;
         while let Ok(Some(op)) = timeout_at(limit, self.ops.recv()).await {
@@ -380,9 +413,9 @@ impl View {
         self.drawn.iter().all(|drawn| *drawn)
     }
 
-    // Waits for the picture to be the screen as the X server inside has it, and returns how many
-    // pixels are not. Those can only be a pointer the server has drawn into the picture, which a
-    // screenshot never has, and only where `pointer` allows for one.
+    // Servers draw the pointer into the picture for a client that takes no cursor shape, and a
+    // screenshot from inside never has it: with `pointer` the pixels around it may differ, and
+    // their number is returned.
     async fn shows_screen(&mut self, server: &Server, pointer: bool) -> usize {
         let started = Instant::now();
         loop {
@@ -404,7 +437,6 @@ impl View {
         }
     }
 
-    // Ends the session the way closing the tab does, and returns how long that took.
     async fn close(mut self) -> Duration {
         let started = Instant::now();
         timeout(WAIT, self.session.close()).await.expect("close hung");
@@ -495,12 +527,26 @@ async fn a_certificate_is_unknown_until_trusted_and_a_mismatch_once_it_changes()
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn every_encoding_draws_the_picture_the_server_has() {
-    let all = [ZRLE, HEXTILE, RAW];
+    // The offer, and what the server logs for the encoding it then uses: TigerVNC when the
+    // client leaves, x11vnc and TightVNC when it arrives.
+    let all = [
+        (ZRLE, "EncodeManager:   ZRLE:", "Using ZRLE encoding"),
+        (HEXTILE, "EncodeManager:   Hextile:", "Using hextile encoding"),
+        (RAW, "EncodeManager:   Raw:", "Using raw encoding"),
+    ];
     for (server, offers) in
         [(VNCAUTH, &all[..]), (X11VNC, &all[..]), (TIGHTVNC, &all[1..]), (QEMU, &all[..])]
     {
         let mut first = None;
-        for encodings in offers {
+        for (encodings, tigervnc, others) in offers {
+            let line = match server.service {
+                "tigervnc-vncauth" => Some(tigervnc),
+                // QEMU does not log the encoding it uses.
+                "qemu" => None,
+                _ => Some(others),
+            };
+            let used = || line.map(|line| server.log().matches(line).count());
+            let before = used();
             let mut view = server.open(encodings).await;
             view.until("whole screen", View::whole).await;
             match &first {
@@ -514,11 +560,13 @@ async fn every_encoding_draws_the_picture_the_server_has() {
                 }
                 // QEMU's text cursor blinks, so there the pictures are the same every other moment.
                 Some(first) => {
-                    let what = format!("picture of {:?} with {encodings:?}", offers[0]);
+                    let what = format!("picture of {:?} with {encodings:?}", offers[0].0);
                     view.until(&what, |view| &view.picture == first).await;
                 }
             }
             view.close().await;
+            let after = before.map(|count| count + 1);
+            settles("the server's word of the encoding", after, used).await;
         }
     }
 }
@@ -529,11 +577,15 @@ async fn keys_arrive_in_an_xterm_as_they_were_typed() {
     for server in [X11VNC, VNCAUTH, X509PLAIN] {
         let mut view = server.open(&ENCODINGS).await;
         view.until("whole screen", View::whole).await;
+        let _pointer = server.pointer_home();
+        // x11vnc keeps a key down after the client that pressed it has gone.
+        let keys = "xdotool keyup a B 1 exclam eacute Return d Shift_L Control_L";
+        let _keys = Restore { server, script: keys.into() };
         let xterm = "xterm -T typed -geometry 80x4+40+600 -fn 10x20";
         let _xterm = server.start("typed", &format!("{xterm} -e sh -c 'cat > /tmp/typed.out'"));
         settles("the xterm", true, || server.shows_window("typed")).await;
         // Keys go to the window under the pointer.
-        view.session.pointer(0, 300, 660).await.unwrap();
+        point(&view.session, 300, 660).await;
         settles("the pointer", (300, 660), || server.pointer()).await;
 
         for keys in [&[0x61][..], &[SHIFT, 0x42], &[0x31], &[SHIFT, 0x21], &[0xE9], &[RETURN]] {
@@ -544,10 +596,8 @@ async fn keys_arrive_in_an_xterm_as_they_were_typed() {
 
         // Ctrl+D ends the cat and with it the xterm.
         chord(&view.session, &[CONTROL, 0x64]).await;
-        view.session.pointer(0, 640, 400).await.unwrap();
         view.close().await;
         settles("the xterm leaving", false, || server.shows_window("typed")).await;
-        settles("the pointer", (640, 400), || server.pointer()).await;
     }
 }
 
@@ -557,8 +607,9 @@ async fn the_pointer_goes_where_it_is_sent() {
     for server in [X11VNC, VNCAUTH, TIGHTVNC] {
         let mut view = server.open(&ENCODINGS).await;
         view.until("whole screen", View::whole).await;
+        let _pointer = server.pointer_home();
         for (x, y) in [(1000, 700), (640, 400)] {
-            view.session.pointer(0, x, y).await.unwrap();
+            point(&view.session, x, y).await;
             settles("the pointer", (x, y), || server.pointer()).await;
         }
         view.close().await;
@@ -571,10 +622,12 @@ async fn the_wheel_turns_as_buttons_four_and_five() {
     for server in [X11VNC, VNCAUTH] {
         let mut view = server.open(&ENCODINGS).await;
         view.until("whole screen", View::whole).await;
+        let _pointer = server.pointer_home();
         let _xev = server.start("xev", "xev -geometry 200x200+1000+100 > /tmp/xev.out 2>&1");
         settles("xev's window", true, || server.shows_window("Event Tester")).await;
 
-        for buttons in [0, 8, 0, 16, 0] {
+        point(&view.session, 1100, 200).await;
+        for buttons in [8, 0, 16, 0] {
             view.session.pointer(buttons, 1100, 200).await.unwrap();
         }
         let seen = "grep -A2 '^Button' /tmp/xev.out | grep -o '^Button[A-Za-z]*\\|button [0-9]'";
@@ -582,9 +635,6 @@ async fn the_wheel_turns_as_buttons_four_and_five() {
                       ButtonPress button 5 ButtonRelease button 5";
         let buttons = || text(&server.inside(&format!("{seen}; true"))).replace('\n', " ");
         settles("the wheel", wanted.to_string(), buttons).await;
-
-        view.session.pointer(0, 640, 400).await.unwrap();
-        settles("the pointer", (640, 400), || server.pointer()).await;
         view.close().await;
     }
 }
@@ -656,11 +706,12 @@ async fn the_cursor_shape_arrives_apart_from_the_picture() {
     for server in [X11VNC, VNCAUTH] {
         let mut view = server.open(&ENCODINGS).await;
         view.until("whole screen", View::whole).await;
+        let _pointer = server.pointer_home();
         // The X of the root window, then the I-beam of the xterm: where, size, hotspot and how
         // many of its pixels are opaque.
         let shapes = [((1000, 700), (16, 16), (7, 7), 176), ((640, 400), (9, 16), (4, 8), 86)];
         for ((x, y), size, hot, opaque) in shapes {
-            view.session.pointer(0, x, y).await.unwrap();
+            point(&view.session, x, y).await;
             let shaped = |view: &View| view.cursors.last().is_some_and(|last| last.size == size);
             view.until("cursor of the window under the pointer", shaped).await;
             let cursor = view.cursors.last().unwrap();
@@ -680,55 +731,33 @@ async fn a_stopped_server_ends_the_session() {
     for server in [TIGHTVNC, X509VNC] {
         let mut view = server.open(&ENCODINGS).await;
         view.until("whole screen", View::whole).await;
-        view.session.pointer(0, 640, 400).await.unwrap();
+        point(&view.session, 640, 400).await;
         settles("the pointer", (640, 400), || server.pointer()).await;
         let before = server.screenshot();
         assert!(before.ok, "{}: no screenshot", server.service);
 
+        let up = Up(server);
         let stopping = Instant::now();
         assert!(docker(&["stop", &server.container()]).ok, "{}: not stopped", server.service);
-        let ending = async {
-            while view.closed.is_none() {
-                match view.ops.recv().await {
-                    Some(op) => view.apply(op),
-                    None => break,
-                }
-            }
-        };
-        let ended = timeout(Duration::from_secs(60), ending).await;
+        let ended = |view: &View| view.closed.is_some();
+        view.within(Duration::from_secs(60), "end of the session", ended).await;
         let took = stopping.elapsed();
+        assert_eq!(view.closed.as_deref(), Some("network connection lost"), "{}", server.service);
+        println!("{}: closed {took:?} after the stop began", server.service);
 
-        assert!(docker(&["start", &server.container()]).ok, "{}: not started", server.service);
-        // Docker takes connections before the server does, and closes them without a banner.
-        let (starting, mut banner) = (Instant::now(), [0u8; 12]);
-        loop {
-            let greeting = async {
-                let mut stream = TcpStream::connect((HOST, server.port)).await?;
-                stream.read_exact(&mut banner).await
-            };
-            if matches!(timeout(Duration::from_secs(2), greeting).await, Ok(Ok(_))) {
-                break;
-            }
-            assert!(starting.elapsed() < WAIT * 3, "{}: no banner", server.service);
-            sleep(Duration::from_millis(100)).await;
-        }
-        assert_eq!(&banner, b"RFB 003.008\n", "{}", server.service);
+        drop(up);
         let as_before = || {
             let shot = server.screenshot();
             shot.ok && shot.out == before.out
         };
         settles("the screen as it was", true, as_before).await;
-
-        assert!(ended.is_ok(), "{}: the session outlived its server", server.service);
-        assert_eq!(view.closed.as_deref(), Some("network connection lost"), "{}", server.service);
-        println!("{}: closed {took:?} after the stop began", server.service);
         timeout(WAIT, view.session.close()).await.expect("close hung");
     }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn close_returns_within_about_a_second_and_the_server_sees_the_client_leave() {
+async fn close_ends_before_its_limit_and_the_server_sees_the_client_leave() {
     // What each server logs when a client leaves; QEMU logs nothing of its clients.
     let leaving = [
         (VNCAUTH, Some("Clean disconnection")),
@@ -744,7 +773,9 @@ async fn close_returns_within_about_a_second_and_the_server_sees_the_client_leav
         let before = left();
         let took = view.close().await;
         println!("{}: close took {took:?}", server.service);
-        assert!(took < Duration::from_millis(1500), "{}: close took {took:?}", server.service);
+        // The session stops waiting for the server after a second. Measured: about 1 ms, and
+        // once 182 ms on x11vnc.
+        assert!(took < Duration::from_millis(800), "{}: close took {took:?}", server.service);
         let after = before.map(|count| count + 1);
         settles("the server's word of the client leaving", after, left).await;
     }

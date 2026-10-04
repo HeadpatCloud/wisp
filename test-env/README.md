@@ -15,9 +15,23 @@ docker compose -f test-env/docker-compose.yml restart x11vnc
 The containers are named `wisp-test-<service>`. Nothing is mounted from the host; read things
 back with `docker exec` or `docker cp`.
 
-After a start or restart five servers send their banner at once. `x11vnc` needs about 1.5 s,
+After a start or restart six servers send their banner at once. `x11vnc` needs about 1.5 s,
 and until then Docker accepts the TCP connection and closes it without a banner. Wait for the
 banner, not for the port.
+
+## Live tests
+
+`src-tauri/tests/live_vnc.rs` drives the app's VNC session against these servers. A plain
+`cargo test` skips them. With the seven containers up, from the repository root:
+
+```bash
+docker compose -f test-env/docker-compose.yml up -d
+cargo test --manifest-path src-tauri/Cargo.toml --test live_vnc -- --ignored --test-threads=1
+```
+
+`--test-threads=1` is required: the tests share the servers, and they resize a screen, stop
+containers and move the one pointer each server has. A run takes about a minute, and some
+20 s more when `x11vnc` has just been started (its clipboard, see below).
 
 ## Servers
 
@@ -33,7 +47,8 @@ Password `wisptest` everywhere. `tigervnc-plain` wants user `wisp` and password 
 | `tightvnc` | `127.0.0.1:5905` | TightVNC 1.3.10 | 2 VncAuth, 16 Tight | 1280x800 | `root's wisp-test-tightvnc desktop (wisp-test-tightvnc:1)` |
 | `qemu` | `127.0.0.1:5906` | QEMU 10.0 | 2 VncAuth | 720x400 | `QEMU (wisp-test-qemu)` |
 
-The versions are whatever `debian:stable-slim` installs when the images are built.
+The Dockerfiles pin Debian 13 (`debian:trixie-slim`). The versions above and every measured
+fact in this file belong to that release, as it was on 2026-10-01 (Debian 13.7).
 
 All seven send `RFB 003.008\n` and a pixel format of 32 bpp, depth 24, little endian, true
 colour, max 255/255/255, shifts 16/8/0.
@@ -138,6 +153,15 @@ QEMU logs nothing.
 docker logs --since "$(docker inspect -f '{{.State.StartedAt}}' wisp-test-x11vnc)" wisp-test-x11vnc
 ```
 
+Keys held down. Pointer events carry the modifier state, so move the pointer while `xev`
+listens on the root window: `state 0x0` is none, `0x1` Shift, `0x4` Control.
+
+```bash
+docker exec wisp-test-x11vnc sh -c 'xev -root -event mouse > /tmp/state & sleep 1
+  xdotool mousemove 700 500 mousemove 640 400; sleep 1; kill $!
+  grep -o "state 0x[0-9a-f]*" /tmp/state; rm /tmp/state'
+```
+
 Processes (the images have no `ps`):
 
 ```bash
@@ -198,7 +222,13 @@ x11vnc
   moves the pointer the cursor is the one TigerVNC sends for the same place.
 - No lockout seen after 8 wrong passwords in a row.
 - A key a client leaves pressed stays pressed when that client has gone. After one left
-  Control down, the next client's `a` and `B` arrived as `\x01\x02`. A restart clears it.
+  Control down, the next client's `a` and `B` arrived as `\x01\x02`. `xdotool keyup Control_L`
+  from inside lets it go (measured with Shift: state `0x1` before, `0x0` after), and so does
+  a restart.
+- A pointer event for the place the last client left the pointer at is ignored, also when
+  the pointer has been moved from inside since: after a client's 500,500 and
+  `xdotool mousemove 640 400`, the next client's 500,500 left it at 640,400, and 501,500
+  moved it. TigerVNC and TightVNC moved it both times.
 
 TightVNC
 - The X server has no XKEYBOARD, RandR or XFIXES. `xdotool` segfaults on every command, which

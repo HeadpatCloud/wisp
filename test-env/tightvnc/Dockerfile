@@ -1,4 +1,4 @@
-FROM debian:stable-slim
+FROM debian:trixie-slim
 
 # python3-xlib: xdotool segfaults on this X server (no XKEYBOARD), pointer.py replaces
 # xdotool getmouselocation

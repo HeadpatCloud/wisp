@@ -12,7 +12,7 @@ import {
 } from 'lucide-react'
 import type { ReactNode, PointerEvent as ReactPointerEvent } from 'react'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { Group, Profile, S3Profile, SftpProfile, ShellInfo } from '@/bindings'
+import type { Group, Profile, S3Profile, SftpProfile, ShellInfo, VncProfile } from '@/bindings'
 import {
   ContextMenu,
   ContextMenuContent,
@@ -33,6 +33,7 @@ import { duplicateProfile, reorderGroups, reorderProfiles } from '@/lib/profiles
 import { useProfileStore } from '@/stores/profileStore'
 import { useS3ProfileStore } from '@/stores/s3ProfileStore'
 import { useSftpProfileStore } from '@/stores/sftpProfileStore'
+import { useVncProfileStore } from '@/stores/vncProfileStore'
 import { ProfileIcon } from './ProfileIcon'
 
 const COLLAPSED_KEY = 'sidebar-collapsed'
@@ -79,6 +80,9 @@ interface ProfileTreeProps {
   onActivateProfile: (profile: Profile) => void
   onNewProfile: () => void
   onNewVnc: () => void
+  onNewVncProfile: () => void
+  onActivateVnc: (profile: VncProfile) => void
+  onEditVnc: (profile: VncProfile) => void
   onNewFtp: () => void
   onNewS3: () => void
   onActivateS3: (profile: S3Profile) => void
@@ -99,6 +103,9 @@ export function ProfileTree({
   onActivateProfile,
   onNewProfile,
   onNewVnc,
+  onNewVncProfile,
+  onActivateVnc,
+  onEditVnc,
   onNewFtp,
   onNewS3,
   onActivateS3,
@@ -120,6 +127,8 @@ export function ProfileTree({
   const removeS3 = useS3ProfileStore((s) => s.remove)
   const sftpProfiles = useSftpProfileStore((s) => s.profiles)
   const removeSftpProfile = useSftpProfileStore((s) => s.remove)
+  const vncProfiles = useVncProfileStore((s) => s.profiles)
+  const removeVnc = useVncProfileStore((s) => s.remove)
   const removeProfile = useProfileStore((s) => s.removeProfile)
   const removeGroup = useProfileStore((s) => s.removeGroup)
   const saveProfile = useProfileStore((s) => s.saveProfile)
@@ -260,6 +269,9 @@ export function ProfileTree({
             <DropdownMenuItem onSelect={onNewFtp}>
               <Network /> FTP / FTPS
             </DropdownMenuItem>
+            <DropdownMenuItem onSelect={onNewVncProfile}>
+              <Monitor /> VNC profile
+            </DropdownMenuItem>
             <DropdownMenuItem onSelect={onNewVnc}>
               <Monitor /> VNC connection
             </DropdownMenuItem>
@@ -305,7 +317,8 @@ export function ProfileTree({
         {groups.length === 0 &&
           profiles.length === 0 &&
           s3Profiles.length === 0 &&
-          sftpProfiles.length === 0 && (
+          sftpProfiles.length === 0 &&
+          vncProfiles.length === 0 && (
             <div className="px-2 py-6 text-center text-muted-foreground text-xs">
               No hosts yet. Use + to add a profile, or Import from ~/.ssh/config.
             </div>
@@ -423,6 +436,29 @@ export function ProfileTree({
                     <span className="ml-auto truncate text-muted-foreground text-xs">
                       {p.endpoint}
                     </span>
+                  </button>
+                </Row>
+              ))}
+          </div>
+        )}
+        {vncProfiles.length > 0 && (
+          <div className="mt-2">
+            <div className="px-2 py-1 font-medium text-muted-foreground text-xs">VNC</div>
+            {vncProfiles
+              .filter((p) => {
+                const q = query.trim().toLowerCase()
+                return !q || p.name.toLowerCase().includes(q) || p.host.toLowerCase().includes(q)
+              })
+              .map((p) => (
+                <Row key={p.id} onEdit={() => onEditVnc(p)} onDelete={() => removeVnc(p.id)}>
+                  <button
+                    type="button"
+                    onDoubleClick={() => onActivateVnc(p)}
+                    className="flex w-full select-none items-center gap-1.5 rounded border-2 border-transparent px-1.5 py-1 text-sm hover:bg-muted"
+                  >
+                    <Monitor className="size-4 text-muted-foreground" />
+                    <span className="truncate">{p.name}</span>
+                    <span className="ml-auto truncate text-muted-foreground text-xs">{p.host}</span>
                   </button>
                 </Row>
               ))}

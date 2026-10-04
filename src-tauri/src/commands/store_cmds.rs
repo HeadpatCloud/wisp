@@ -5,6 +5,7 @@ use tauri::{AppHandle, Manager, State};
 use crate::error::{AppError, AppResult};
 use crate::store::model::{
     Group, IconRef, Profile, ProfileKey, ProfileStore, S3Profile, Settings, SftpProfile,
+    VncProfile,
 };
 use crate::store::{is_icon_path, Store};
 use crate::transfer::apply::remove_unreferenced_keys;
@@ -19,6 +20,7 @@ fn icon_in_use(data: &ProfileStore, path: &str) -> bool {
         || data.profiles.iter().any(|p| same(&p.icon))
         || data.sftp_profiles.iter().any(|p| same(&p.icon))
         || data.s3_profiles.iter().any(|p| same(&p.icon))
+        || data.vnc_profiles.iter().any(|p| same(&p.icon))
 }
 
 fn remove_custom_icon(app: &AppHandle, icon: &IconRef, data: &ProfileStore) {
@@ -177,6 +179,34 @@ pub fn delete_sftp_profile(
     Ok(())
 }
 
+#[tauri::command]
+#[specta::specta]
+pub fn list_vnc_profiles(store: State<'_, Mutex<Store>>) -> AppResult<Vec<VncProfile>> {
+    Ok(store.lock().map_err(|_| poisoned())?.vnc_profiles())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn upsert_vnc_profile(store: State<'_, Mutex<Store>>, profile: VncProfile) -> AppResult<()> {
+    store.lock().map_err(|_| poisoned())?.upsert_vnc_profile(profile)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn delete_vnc_profile(
+    app: AppHandle,
+    store: State<'_, Mutex<Store>>,
+    id: String,
+) -> AppResult<()> {
+    let mut s = store.lock().map_err(|_| poisoned())?;
+    let icon = s.vnc_profiles().into_iter().find(|p| p.id == id).map(|p| p.icon);
+    s.delete_vnc_profile(&id)?;
+    if let Some(icon) = icon {
+        remove_custom_icon(&app, &icon, &s.snapshot());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,13 +233,17 @@ mod tests {
                 "id": "s", "name": "s", "endpoint": "e", "port": null, "region": "r",
                 "useTls": true, "pathStyle": false, "accessKeyId": "AK", "secretId": null,
                 "bucket": null, "icon": custom(4), "order": 0
+            }],
+            "vncProfiles": [{
+                "id": "v", "name": "v", "host": "h", "port": 5900, "username": null,
+                "secretId": null, "icon": custom(5), "order": 0
             }]
         }))
         .unwrap();
-        for n in 1..=4 {
+        for n in 1..=5 {
             assert!(icon_in_use(&data, &path(n)), "{n}");
         }
-        assert!(!icon_in_use(&data, &path(5)));
+        assert!(!icon_in_use(&data, &path(6)));
         assert!(!icon_in_use(&ProfileStore::default(), &path(1)));
     }
 }

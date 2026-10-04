@@ -6,7 +6,10 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
-use model::{AuthMethod, Group, Profile, ProfileKey, ProfileStore, S3Profile, SftpProfile, Settings};
+use model::{
+    AuthMethod, Group, Profile, ProfileKey, ProfileStore, S3Profile, SftpProfile, Settings,
+    VncProfile,
+};
 
 pub struct Store {
     dir: PathBuf,
@@ -174,6 +177,27 @@ impl Store {
         }
         self.persist_profiles()
     }
+
+    pub fn vnc_profiles(&self) -> Vec<VncProfile> {
+        self.data.vnc_profiles.clone()
+    }
+
+    pub fn upsert_vnc_profile(&mut self, profile: VncProfile) -> AppResult<()> {
+        match self.data.vnc_profiles.iter_mut().find(|p| p.id == profile.id) {
+            Some(existing) => *existing = profile,
+            None => self.data.vnc_profiles.push(profile),
+        }
+        self.persist_profiles()
+    }
+
+    pub fn delete_vnc_profile(&mut self, id: &str) -> AppResult<()> {
+        let before = self.data.vnc_profiles.len();
+        self.data.vnc_profiles.retain(|p| p.id != id);
+        if self.data.vnc_profiles.len() == before {
+            return Err(AppError::NotFound(format!("vnc profile {id}")));
+        }
+        self.persist_profiles()
+    }
 }
 
 #[cfg(test)]
@@ -332,6 +356,41 @@ mod tests {
         assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().sftp_profiles().len(), 1);
         store.delete_sftp_profile("s1").unwrap();
         assert!(store.sftp_profiles().is_empty());
+    }
+
+    #[test]
+    fn vnc_profiles_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        let mut desk = VncProfile {
+            id: "v1".into(),
+            name: "desk".into(),
+            host: "h".into(),
+            port: 5900,
+            username: Some("faye".into()),
+            secret_id: Some("vault-1".into()),
+            icon: IconRef::default(),
+            order: 0,
+        };
+        store.upsert_vnc_profile(desk.clone()).unwrap();
+        desk.host = "changed".into();
+        store.upsert_vnc_profile(desk.clone()).unwrap();
+        assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().vnc_profiles(), [desk]);
+
+        store.delete_vnc_profile("v1").unwrap();
+        assert!(Store::load(dir.path().to_path_buf()).unwrap().vnc_profiles().is_empty());
+        assert!(matches!(store.delete_vnc_profile("v1"), Err(AppError::NotFound(_))));
+    }
+
+    #[test]
+    fn profiles_file_from_before_vnc_profiles_loads_with_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("profiles.json"),
+            r#"{"version":1,"groups":[],"profiles":[],"sftpProfiles":[],"s3Profiles":[]}"#,
+        )
+        .unwrap();
+        assert!(Store::load(dir.path().to_path_buf()).unwrap().vnc_profiles().is_empty());
     }
 
     #[test]

@@ -3,7 +3,8 @@ import userEvent from '@testing-library/user-event'
 import { beforeEach, expect, test, vi } from 'vitest'
 import { useProfileStore } from '@/stores/profileStore'
 import { useS3ProfileStore } from '@/stores/s3ProfileStore'
-import { useSessionStore } from '@/stores/sessionStore'
+import { tabSecretIds, useSessionStore } from '@/stores/sessionStore'
+import { useVncProfileStore } from '@/stores/vncProfileStore'
 import { CommandPalette } from './CommandPalette'
 
 const profile = (id: string, name: string, host: string) =>
@@ -30,6 +31,7 @@ beforeEach(() => {
     loaded: true,
   } as never)
   useS3ProfileStore.setState({ profiles: [], loaded: true } as never)
+  useVncProfileStore.setState({ profiles: [], loaded: true })
   useSessionStore.setState({ tabs: [], sessions: {}, activeTabId: null })
 })
 
@@ -67,4 +69,51 @@ test('arrow keys move the highlight before running', async () => {
 
   const st = useSessionStore.getState()
   expect(st.tabs[0].kind).toBe('sftp')
+})
+
+const desk = {
+  id: 'vnc-1',
+  name: 'desk',
+  host: '10.0.0.5',
+  port: 5901,
+  username: 'faye',
+  secretId: 'vault-1',
+  icon: { kind: 'builtin' as const, name: 'server' },
+  order: 0,
+}
+
+test('a saved VNC profile is listed under Connect with its address', () => {
+  useVncProfileStore.setState({ profiles: [desk] })
+  render(<CommandPalette open onOpenChange={vi.fn()} />)
+  const row = screen.getByText('VNC: desk').closest('button')
+  expect(row).toHaveTextContent('10.0.0.5:5901')
+  expect(row).toHaveTextContent('Connect')
+})
+
+test('running a VNC profile opens a new tab that holds the profile id and no secret', async () => {
+  useVncProfileStore.setState({ profiles: [desk] })
+  const onOpenChange = vi.fn()
+  const user = userEvent.setup()
+  render(<CommandPalette open onOpenChange={onOpenChange} />)
+  await user.type(screen.getByPlaceholderText('Search profiles and actions…'), 'vnc: desk')
+  await user.keyboard('{Enter}')
+
+  const { tabs, activeTabId } = useSessionStore.getState()
+  expect(tabs).toEqual([
+    {
+      id: activeTabId,
+      kind: 'vnc',
+      title: 'desk',
+      host: '10.0.0.5',
+      port: 5901,
+      username: 'faye',
+      secretId: null,
+      profileId: 'vnc-1',
+    },
+  ])
+  expect(tabSecretIds(tabs[0])).toEqual([])
+  expect(onOpenChange).toHaveBeenCalledWith(false)
+
+  await user.click(screen.getByText('VNC: desk'))
+  expect(useSessionStore.getState().tabs).toHaveLength(2)
 })

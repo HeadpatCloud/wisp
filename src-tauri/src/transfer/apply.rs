@@ -775,7 +775,7 @@ pub fn remove_unreferenced_keys(keys_dir: &Path, previous: &[ProfileKey], data: 
 mod tests {
     use super::*;
     use crate::store::model::{
-        AuthMethod, Group, IconRef, Profile, ProfileKey, S3Profile, SftpProfile,
+        AuthMethod, Group, IconRef, Profile, ProfileKey, S3Profile, SftpProfile, VncProfile,
     };
     use crate::transfer::bundle::KeyFile;
     use crate::transfer::plan::plan;
@@ -841,6 +841,7 @@ mod tests {
             profiles,
             sftp_profiles: vec![],
             s3_profiles: vec![],
+            vnc_profiles: vec![],
         }
     }
 
@@ -1338,6 +1339,34 @@ mod tests {
         let p = &store.s3_profiles()[0];
         assert_eq!(v.get_secret(p.secret_id.as_deref().unwrap()).unwrap().as_slice(), b"sk");
         assert_eq!(S3Profile { secret_id: inc.secret_id.clone(), ..p.clone() }, inc);
+    }
+
+    // Bundles do not carry VNC profiles, so an import has to leave them as they are.
+    #[test]
+    fn import_leaves_vnc_profiles_as_they_were() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        let mut v = vault(dir.path());
+        let desk = VncProfile {
+            id: "v1".into(),
+            name: "desk".into(),
+            host: "10.0.0.5".into(),
+            port: 5901,
+            username: Some("faye".into()),
+            secret_id: Some(v.set_secret(b"pw").unwrap()),
+            icon: IconRef::Custom { path: "icons/6f1c2a9e-8d0b-4c57-9a3e-2b7d5e41f0c8.png".into() },
+            order: 3,
+        };
+        store.upsert_vnc_profile(desk.clone()).unwrap();
+
+        let payload = Payload { profiles: vec![profile("n", "new", "h9")], ..Default::default() };
+        let staged = run(&store.snapshot(), &payload, &[accept("ssh:n", &[])]).unwrap();
+        let summary = execute(&mut store, &mut v, &dir.path().join("keys"), staged).unwrap();
+        assert_eq!(summary, ApplySummary { added: 1, updated: 0 });
+        assert_eq!(store.profiles().len(), 1);
+        assert_eq!(store.vnc_profiles(), [desk.clone()]);
+        assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().vnc_profiles(), [desk.clone()]);
+        assert_eq!(v.get_secret(desk.secret_id.as_deref().unwrap()).unwrap().as_slice(), b"pw");
     }
 
     #[test]

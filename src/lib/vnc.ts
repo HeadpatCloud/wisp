@@ -19,6 +19,7 @@ export function vncDriver(target: {
   port: number
   username: string | null
   secretId: string | null
+  profileId: string | null
 }): RemoteDriver {
   // The backend runs every call as a task of its own, so input keeps its order only when one
   // call per session is under way at a time.
@@ -100,6 +101,7 @@ export function vncDriver(target: {
         target.port,
         target.username,
         target.secretId,
+        target.profileId,
         channel,
       )
       if (res.status === 'error') {

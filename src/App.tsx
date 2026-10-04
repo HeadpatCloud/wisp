@@ -1,7 +1,13 @@
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { Settings } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { events, type S3Profile, type SftpProfile, type ShellInfo } from '@/bindings'
+import {
+  events,
+  type S3Profile,
+  type SftpProfile,
+  type ShellInfo,
+  type VncProfile,
+} from '@/bindings'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -13,6 +19,7 @@ import { FtpConnectionView } from '@/features/ftp/FtpConnectionView'
 import { CommandPalette } from '@/features/palette/CommandPalette'
 import { ProfileTree } from '@/features/profiles/ProfileTree'
 import { RemoteDesktopView } from '@/features/remote/RemoteDesktopView'
+import { VncProfileDialog } from '@/features/remote/VncProfileDialog'
 import { S3ConnectionView } from '@/features/s3/S3ConnectionView'
 import { S3ProfileDialog } from '@/features/s3/S3ProfileDialog'
 import { LocalTerminalView } from '@/features/sessions/LocalTerminalView'
@@ -50,6 +57,7 @@ import {
 import { useSettingsStore } from '@/stores/settingsStore'
 import { useSftpProfileStore } from '@/stores/sftpProfileStore'
 import { useTunnelStore } from '@/stores/tunnelStore'
+import { useVncProfileStore } from '@/stores/vncProfileStore'
 
 function cycleTab(delta: number) {
   const st = useSessionStore.getState()
@@ -74,11 +82,11 @@ function nudgeZoom(delta: number, reset = false) {
 }
 
 function VncTabView({ tab, active }: { tab: VncTab; active: boolean }) {
-  const { host, port, username, secretId } = tab
+  const { host, port, username, secretId, profileId } = tab
   // The view reconnects whenever it is given another driver object.
   const driver = useMemo(
-    () => vncDriver({ host, port, username, secretId }),
-    [host, port, username, secretId],
+    () => vncDriver({ host, port, username, secretId, profileId }),
+    [host, port, username, secretId, profileId],
   )
   return <RemoteDesktopView tabId={tab.id} driver={driver} active={active} />
 }
@@ -99,6 +107,7 @@ export default function App() {
   const loadSettings = useSettingsStore((s) => s.load)
   const loadS3 = useS3ProfileStore((s) => s.load)
   const loadSftpProfiles = useSftpProfileStore((s) => s.load)
+  const loadVncProfiles = useVncProfileStore((s) => s.load)
   const themeValue = useSettingsStore((s) => s.settings.theme)
   const settingsHotkeys = useSettingsStore((s) => s.settings.hotkeys ?? {})
   const [vncDialogOpen, setVncDialogOpen] = useState(false)
@@ -108,6 +117,8 @@ export default function App() {
   const [s3Editing, setS3Editing] = useState<S3Profile | null>(null)
   const [sftpProfileDialogOpen, setSftpProfileDialogOpen] = useState(false)
   const [sftpEditing, setSftpEditing] = useState<SftpProfile | null>(null)
+  const [vncProfileDialogOpen, setVncProfileDialogOpen] = useState(false)
+  const [vncEditing, setVncEditing] = useState<VncProfile | null>(null)
   const [shells, setShells] = useState<ShellInfo[]>([])
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [vaultReady, setVaultReady] = useState(false)
@@ -195,6 +206,9 @@ export default function App() {
     loadSftpProfiles().catch(console.error)
   }, [loadSftpProfiles])
   useEffect(() => {
+    loadVncProfiles().catch(console.error)
+  }, [loadVncProfiles])
+  useEffect(() => {
     return watchSystemTheme(() =>
       themeValue === 'light' || themeValue === 'dark' ? themeValue : 'system',
     )
@@ -278,6 +292,11 @@ export default function App() {
         onOpenChange={setSftpProfileDialogOpen}
         editing={sftpEditing}
       />
+      <VncProfileDialog
+        open={vncProfileDialogOpen}
+        onOpenChange={setVncProfileDialogOpen}
+        editing={vncEditing}
+      />
       <AppShell
         sidebar={
           <div className="flex h-full flex-col">
@@ -343,6 +362,24 @@ export default function App() {
                   openView({ kind: 'profile-editor', profileId: null }, 'New profile')
                 }
                 onNewVnc={() => setVncDialogOpen(true)}
+                onNewVncProfile={() => {
+                  setVncEditing(null)
+                  setVncProfileDialogOpen(true)
+                }}
+                onActivateVnc={(p) =>
+                  openVnc({
+                    host: p.host,
+                    port: p.port,
+                    username: p.username,
+                    secretId: null,
+                    profileId: p.id,
+                    title: p.name,
+                  })
+                }
+                onEditVnc={(p) => {
+                  setVncEditing(p)
+                  setVncProfileDialogOpen(true)
+                }}
                 onNewFtp={() => setFtpDialogOpen(true)}
                 onNewS3={() => {
                   setS3Editing(null)

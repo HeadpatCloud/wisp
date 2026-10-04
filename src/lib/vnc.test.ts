@@ -32,7 +32,7 @@ const RECT = [1, 0, 1, 0, 2, 0, 1, 0, 1, 9, 8, 7, 255]
 const UNREADABLE = { kind: 'closed', reason: 'The server sent data this app could not read.' }
 const OK = { status: 'ok', data: null }
 const opened = { id: 'v1', width: 4, height: 2, name: 'desk' }
-const target = { host: 'h', port: 5901, username: 'faye', secretId: 's1' }
+const target = { host: 'h', port: 5901, username: 'faye', secretId: 's1', profileId: null }
 const press = (keysym: number): VncInput => ({ kind: 'key', down: true, keysym })
 const release = (keysym: number): VncInput => ({ kind: 'key', down: false, keysym })
 const pointer = (buttons: number, x: number, y: number): VncInput => ({
@@ -101,13 +101,38 @@ beforeEach(() => {
 test('open connects to the target and forwards a decoded rect', async () => {
   const { session, frames, send } = await open()
   expect(session).toEqual(opened)
-  expect(m.vncOpen).toHaveBeenCalledWith('h', 5901, 'faye', 's1', m.channels[0])
+  expect(m.vncOpen).toHaveBeenCalledWith('h', 5901, 'faye', 's1', null, m.channels[0])
   send(buf(...RECT))
   expect(frames).toHaveLength(1)
   const [frame] = frames
   if (frame.kind !== 'rect') throw new Error(`forwarded ${frame.kind}`)
   expect([frame.x, frame.y, frame.w, frame.h]).toEqual([1, 2, 1, 1])
   expect(Array.from(frame.rgba)).toEqual([9, 8, 7, 255])
+})
+
+test('every open of a profile tab sends the profile id and no secret id', async () => {
+  const driver = vncDriver({
+    host: 'h',
+    port: 5901,
+    username: 'faye',
+    secretId: null,
+    profileId: 'vnc-1',
+  })
+  await driver.open(() => {})
+  await driver.close('v1')
+  await driver.open(() => {})
+  expect(m.vncOpen.mock.calls).toEqual([
+    ['h', 5901, 'faye', null, 'vnc-1', m.channels[0]],
+    ['h', 5901, 'faye', null, 'vnc-1', m.channels[1]],
+  ])
+})
+
+test('a profile that no longer exists is reported without the vnc prefix', async () => {
+  const rejected = await rejection({
+    kind: 'notFound',
+    message: 'vnc: this profile no longer exists',
+  })
+  expect(rejected).toEqual({ kind: 'notFound', message: 'this profile no longer exists' })
 })
 
 test('a number-array message is decoded like an ArrayBuffer', async () => {

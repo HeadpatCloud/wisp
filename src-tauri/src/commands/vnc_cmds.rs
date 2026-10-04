@@ -11,6 +11,8 @@ use zeroize::Zeroizing;
 use crate::commands::ssh_cmds::KnownHostsState;
 use crate::error::{AppError, AppResult};
 use crate::remote::{FrameBytes, FrameOp};
+use crate::store::model::VncProfile;
+use crate::store::Store;
 use crate::vnc::decode::ENCODINGS;
 use crate::vnc::handshake::Login;
 use crate::vnc::session::Session;
@@ -35,9 +37,28 @@ pub enum VncInput {
 #[derive(Default)]
 pub struct VncSessions(pub TokioMutex<HashMap<String, Arc<Session>>>);
 
+// Host, port, username and the vault id of the password.
+type Target = (String, u16, Option<String>, Option<String>);
+
+// A saved profile is read at every connect and never copied into the tab: saving a new password
+// gives the profile another vault id, and a copy in an open or restored tab would be a dead one.
+fn resolve_target(
+    profiles: &[VncProfile],
+    profile_id: Option<&str>,
+    given: Target,
+) -> AppResult<Target> {
+    let Some(id) = profile_id else { return Ok(given) };
+    let p = profiles
+        .iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| AppError::NotFound("vnc: this profile no longer exists".into()))?;
+    Ok((p.host.clone(), p.port, p.username.clone(), p.secret_id.clone()))
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn vnc_open(
+    store: State<'_, std::sync::Mutex<Store>>,
     vault: State<'_, std::sync::Mutex<crate::vault::Vault>>,
     known: State<'_, KnownHostsState>,
     vncs: State<'_, VncSessions>,
@@ -45,8 +66,13 @@ pub async fn vnc_open(
     port: u16,
     username: Option<String>,
     secret_id: Option<String>,
+    profile_id: Option<String>,
     on_frame: Channel<FrameBytes>,
 ) -> AppResult<VncOpened> {
+    let profiles =
+        store.lock().map_err(|_| AppError::Internal("store lock poisoned".into()))?.vnc_profiles();
+    let (host, port, username, secret_id) =
+        resolve_target(&profiles, profile_id.as_deref(), (host, port, username, secret_id))?;
     // The password lives in the vault; the caller only ever holds a reference to it.
     let password = match &secret_id {
         Some(id) => crate::commands::ssh_cmds::secret_string(&vault, id)?,
@@ -169,6 +195,48 @@ mod tests {
             VncInput::Pointer { buttons: 0, x: 10, y: 20 },
             VncInput::Key { down: false, keysym: 0xFFE1 },
         ]
+    }
+
+    fn desk() -> VncProfile {
+        VncProfile {
+            id: "v1".into(),
+            name: "desk".into(),
+            host: "10.0.0.5".into(),
+            port: 5901,
+            username: Some("faye".into()),
+            secret_id: Some("vault-new".into()),
+            icon: Default::default(),
+            order: 0,
+        }
+    }
+
+    fn given() -> Target {
+        ("shown".into(), 5900, Some("old".into()), Some("vault-old".into()))
+    }
+
+    #[test]
+    fn a_profile_id_connects_with_what_the_profile_holds_now() {
+        let target = resolve_target(&[desk()], Some("v1"), given()).unwrap();
+        let held = ("10.0.0.5".into(), 5901, Some("faye".into()), Some("vault-new".into()));
+        assert_eq!(target, held);
+
+        let bare = VncProfile { username: None, secret_id: None, ..desk() };
+        let target = resolve_target(&[bare], Some("v1"), given()).unwrap();
+        assert_eq!(target, ("10.0.0.5".into(), 5901, None, None));
+    }
+
+    #[test]
+    fn a_profile_id_that_is_gone_is_not_found() {
+        let missing = resolve_target(&[desk()], Some("gone"), given());
+        assert!(matches!(
+            missing,
+            Err(AppError::NotFound(m)) if m == "vnc: this profile no longer exists"
+        ));
+    }
+
+    #[test]
+    fn without_a_profile_id_the_arguments_are_used() {
+        assert_eq!(resolve_target(&[desk()], None, given()).unwrap(), given());
     }
 
     #[tokio::test]

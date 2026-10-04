@@ -6,6 +6,7 @@ import { cn } from '@/lib/utils'
 import { useProfileStore } from '@/stores/profileStore'
 import { useS3ProfileStore } from '@/stores/s3ProfileStore'
 import { useSessionStore } from '@/stores/sessionStore'
+import { useVncProfileStore } from '@/stores/vncProfileStore'
 
 interface Item {
   id: string
@@ -40,6 +41,7 @@ export function CommandPalette({
 }) {
   const profiles = useProfileStore((s) => s.profiles)
   const s3Profiles = useS3ProfileStore((s) => s.profiles)
+  const vncProfiles = useVncProfileStore((s) => s.profiles)
   const [query, setQuery] = useState('')
   const [active, setActive] = useState(0)
   const listRef = useRef<HTMLDivElement>(null)
@@ -87,6 +89,23 @@ export function CommandPalette({
         run: () => st.openS3(p.id, p.bucket, p.name),
       })
     }
+    for (const p of vncProfiles) {
+      out.push({
+        id: `vnc:${p.id}`,
+        label: `VNC: ${p.name}`,
+        hint: `${p.host}:${p.port}`,
+        group: 'Connect',
+        run: () =>
+          st.openVnc({
+            host: p.host,
+            port: p.port,
+            username: p.username,
+            secretId: null,
+            profileId: p.id,
+            title: p.name,
+          }),
+      })
+    }
     out.push(
       {
         id: 'act:local',
@@ -120,7 +139,7 @@ export function CommandPalette({
       },
     )
     return out
-  }, [profiles, s3Profiles])
+  }, [profiles, s3Profiles, vncProfiles])
 
   const q = query.trim().toLowerCase()
   const results = useMemo(() => {

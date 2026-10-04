@@ -4,6 +4,16 @@ import { beforeEach, expect, test, vi } from 'vitest'
 const remote = vi.hoisted(() => ({
   props: [] as { tabId: string; driver: unknown; active: boolean }[],
 }))
+const desk = vi.hoisted(() => ({
+  id: 'vnc-1',
+  name: 'desk',
+  host: '10.0.0.5',
+  port: 5901,
+  username: 'faye',
+  secretId: 'vault-desk',
+  icon: { kind: 'builtin' as const, name: 'server' },
+  order: 0,
+}))
 vi.mock('@/bindings', () => ({
   events: {
     tunnelStatus: { listen: vi.fn().mockResolvedValue(() => undefined) },
@@ -46,10 +56,26 @@ vi.mock('@/stores/settingsStore', () => ({
   ),
 }))
 vi.mock('@/features/profiles/ProfileTree', () => ({
-  ProfileTree: ({ onNewVnc }: { onNewVnc: () => void }) => (
-    <button type="button" data-testid="profile-tree" onClick={onNewVnc}>
-      New VNC
-    </button>
+  ProfileTree: (props: {
+    onNewVnc: () => void
+    onNewVncProfile: () => void
+    onActivateVnc: (profile: typeof desk) => void
+    onEditVnc: (profile: typeof desk) => void
+  }) => (
+    <div data-testid="profile-tree">
+      <button type="button" onClick={props.onNewVnc}>
+        New VNC
+      </button>
+      <button type="button" onClick={props.onNewVncProfile}>
+        Add VNC profile
+      </button>
+      <button type="button" onClick={() => props.onActivateVnc(desk)}>
+        Open desk
+      </button>
+      <button type="button" onClick={() => props.onEditVnc(desk)}>
+        Edit desk
+      </button>
+    </div>
   ),
 }))
 vi.mock('@/features/sessions/TabBar', () => ({
@@ -71,10 +97,13 @@ vi.mock('@/features/welcome/WelcomePage', () => ({
   WelcomePage: () => <div data-testid="welcome-page" />,
 }))
 
-import { setSecret } from '@/lib/vault'
+import { deleteSecret, setSecret } from '@/lib/vault'
 import { vncDriver } from '@/lib/vnc'
-import { useSessionStore } from '@/stores/sessionStore'
+import { tabSecretIds, useSessionStore } from '@/stores/sessionStore'
+import { useVncProfileStore } from '@/stores/vncProfileStore'
 import App from './App'
+
+const loadVncProfiles = vi.fn()
 
 const tab1 = {
   id: 'tab-1',
@@ -94,6 +123,8 @@ const tab2 = {
 beforeEach(() => {
   vi.clearAllMocks()
   remote.props.length = 0
+  loadVncProfiles.mockResolvedValue(undefined)
+  useVncProfileStore.setState({ profiles: [desk], loaded: true, load: loadVncProfiles })
   useSessionStore.setState({
     tabs: [tab1, tab2],
     sessions: {
@@ -237,7 +268,7 @@ test('re-rendering the app keeps the driver of a VNC tab', () => {
   expect(remote.props.length).toBeGreaterThan(1)
   for (const props of remote.props) expect(props.driver).toBe(driver)
   expect(vi.mocked(vncDriver).mock.calls).toEqual([
-    [{ host: 'h', port: 5900, username: 'alice', secretId: 's1' }],
+    [{ host: 'h', port: 5900, username: 'alice', secretId: 's1', profileId: null }],
   ])
 })
 
@@ -254,6 +285,24 @@ test('a VNC tab whose username changed gets a new driver', () => {
     port: 5900,
     username: 'alice',
     secretId: 's1',
+    profileId: null,
+  })
+})
+
+test('a VNC tab whose profile changed gets a new driver', () => {
+  useSessionStore.setState({ tabs: [vncTab], activeTabId: 'tab-vnc' })
+  render(<App />)
+  const { driver } = remote.props[0]
+  act(() => {
+    useSessionStore.setState({ tabs: [{ ...vncTab, profileId: 'vnc-1' }] })
+  })
+  expect(remote.props.at(-1)?.driver).not.toBe(driver)
+  expect(vncDriver).toHaveBeenLastCalledWith({
+    host: 'h',
+    port: 5900,
+    username: null,
+    secretId: 's1',
+    profileId: 'vnc-1',
   })
 })
 
@@ -304,4 +353,82 @@ test.each(['', '   '])('the VNC dialog opens a tab without a username for "%s"',
   expect(setSecret).not.toHaveBeenCalled()
   expect(tabs).toHaveLength(1)
   expect(tabs[0]).toMatchObject({ kind: 'vnc', username: null, secretId: null, profileId: null })
+})
+
+test('closing a quick-connect VNC tab deletes its password', async () => {
+  const tabs = await connectVnc('', 'hunter2')
+  act(() => {
+    useSessionStore.getState().removeTab(tabs[0].id)
+  })
+  expect(deleteSecret).toHaveBeenCalledWith('vault-id')
+})
+
+test('the saved VNC profiles are loaded at start', () => {
+  render(<App />)
+  expect(loadVncProfiles).toHaveBeenCalledTimes(1)
+})
+
+function openDesk() {
+  useSessionStore.setState({ tabs: [], sessions: {}, activeTabId: null })
+  const { rerender } = render(<App />)
+  fireEvent.click(screen.getByRole('button', { name: 'Open desk' }))
+  return { tabs: useSessionStore.getState().tabs, rerender }
+}
+
+const deskTarget = {
+  host: '10.0.0.5',
+  port: 5901,
+  username: 'faye',
+  secretId: null,
+  profileId: 'vnc-1',
+}
+
+test('opening a saved VNC profile opens a tab with the profile id and without its secret', () => {
+  const { tabs } = openDesk()
+  expect(tabs).toEqual([{ id: tabs[0].id, kind: 'vnc', title: 'desk', ...deskTarget }])
+  expect(tabSecretIds(tabs[0])).toEqual([])
+  expect(vi.mocked(vncDriver).mock.calls).toEqual([[deskTarget]])
+})
+
+test('opening a saved VNC profile again opens another tab', () => {
+  openDesk()
+  fireEvent.click(screen.getByRole('button', { name: 'Open desk' }))
+  const { tabs } = useSessionStore.getState()
+  expect(tabs).toHaveLength(2)
+  expect(tabs[1]).toMatchObject({ kind: 'vnc', ...deskTarget })
+  expect(tabs[1].id).not.toBe(tabs[0].id)
+})
+
+test('closing a tab of a saved VNC profile deletes no password', () => {
+  const { tabs } = openDesk()
+  act(() => {
+    useSessionStore.getState().removeTab(tabs[0].id)
+  })
+  expect(useSessionStore.getState().tabs).toHaveLength(0)
+  expect(deleteSecret).not.toHaveBeenCalled()
+})
+
+test('a profile tab keeps its driver when the password of the profile is replaced', () => {
+  const { rerender } = openDesk()
+  const { driver } = remote.props[0]
+  act(() => {
+    useVncProfileStore.setState({ profiles: [{ ...desk, secretId: 'vault-replaced' }] })
+  })
+  rerender(<App />)
+  expect(remote.props.length).toBeGreaterThan(1)
+  for (const props of remote.props) expect(props.driver).toBe(driver)
+  expect(vi.mocked(vncDriver).mock.calls).toEqual([[deskTarget]])
+})
+
+test('the tree opens the VNC profile dialog for a saved profile and for a new one', () => {
+  render(<App />)
+  fireEvent.click(screen.getByRole('button', { name: 'Edit desk' }))
+  expect(screen.getByText('Edit VNC profile')).toBeInTheDocument()
+  expect(screen.getByLabelText('Host')).toHaveValue('10.0.0.5')
+  fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+  expect(screen.queryByText('Edit VNC profile')).not.toBeInTheDocument()
+
+  fireEvent.click(screen.getByRole('button', { name: 'Add VNC profile' }))
+  expect(screen.getByText('New VNC profile')).toBeInTheDocument()
+  expect(screen.getByLabelText('Host')).toHaveValue('')
 })

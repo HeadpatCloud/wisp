@@ -97,6 +97,21 @@ pub struct S3Profile {
     pub order: u32,
 }
 
+// A saved VNC connection. The password is a secret_id into the vault, like the others.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct VncProfile {
+    pub id: String,
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub secret_id: Option<String>,
+    #[serde(default)]
+    pub icon: IconRef,
+    pub order: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct Group {
@@ -232,6 +247,8 @@ pub struct ProfileStore {
     pub profiles: Vec<Profile>,
     #[serde(default)]
     pub s3_profiles: Vec<S3Profile>,
+    #[serde(default)]
+    pub vnc_profiles: Vec<VncProfile>,
 }
 
 impl ProfileStore {
@@ -290,5 +307,35 @@ mod tests {
         let p: Profile = serde_json::from_str(minimal).unwrap();
         assert_eq!(p.icon, IconRef::default());
         assert!(p.tunnels.is_empty());
+    }
+
+    #[test]
+    fn vnc_profiles_are_stored_camel_case() {
+        let store = ProfileStore {
+            vnc_profiles: vec![VncProfile {
+                id: "v1".into(),
+                name: "desk".into(),
+                host: "10.0.0.5".into(),
+                port: 5901,
+                username: None,
+                secret_id: Some("vault-1".into()),
+                icon: IconRef::default(),
+                order: 0,
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&store).unwrap();
+        assert_eq!(json["vncProfiles"][0]["secretId"], "vault-1");
+        assert_eq!(json["vncProfiles"][0]["username"], serde_json::Value::Null);
+        assert_eq!(serde_json::from_value::<ProfileStore>(json).unwrap(), store);
+    }
+
+    #[test]
+    fn vnc_profile_tolerates_a_missing_icon() {
+        let minimal = r#"{"id":"v1","name":"n","host":"h","port":5900,"username":"u",
+            "secretId":null,"order":0}"#;
+        let p: VncProfile = serde_json::from_str(minimal).unwrap();
+        assert_eq!(p.icon, IconRef::default());
+        assert_eq!(p.username.as_deref(), Some("u"));
     }
 }

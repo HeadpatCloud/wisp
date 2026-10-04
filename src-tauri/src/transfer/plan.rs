@@ -768,6 +768,7 @@ mod tests {
             profiles,
             sftp_profiles: vec![],
             s3_profiles: vec![],
+            vnc_profiles: vec![],
         }
     }
 

@@ -140,12 +140,12 @@ async fn answer_challenge(
 }
 
 // Runs VeNCrypt 0.2 up to and including the login, inside TLS for the X509 subtypes;
-// SecurityResult is the caller's.
+// SecurityResult is the caller's. Returns with the stream whether the login was a Plain one.
 pub async fn negotiate(
     mut stream: Box<dyn Stream>,
     login: &Login<'_>,
     tls: &TlsContext<'_>,
-) -> AppResult<Box<dyn Stream>> {
+) -> AppResult<(Box<dyn Stream>, bool)> {
     let (major, minor) = (stream.read_u8().await?, stream.read_u8().await?);
     if (major, minor) < (0, 2) {
         return Err(err(format!("unsupported VeNCrypt version {major}.{minor}")));
@@ -174,7 +174,7 @@ pub async fn negotiate(
         if subtype == VNC_PASSWORD {
             answer_challenge(&mut stream, login.password).await?;
         }
-        return Ok(stream);
+        return Ok((stream, false));
     }
 
     let name = ServerName::try_from(crate::net::normalize_host(tls.host))
@@ -223,7 +223,7 @@ pub async fn negotiate(
         _ => {}
     }
 
-    Ok(Box::new(stream))
+    Ok((Box::new(stream), subtype == X509_PLAIN))
 }
 
 #[cfg(test)]
@@ -382,7 +382,7 @@ mod tests {
             let entered = if rfb {
                 handshake(client, &login, &tls).await.map(|(stream, init)| (stream, Some(init)))
             } else {
-                negotiate(client, &login, &tls).await.map(|stream| (stream, None))
+                negotiate(client, &login, &tls).await.map(|(stream, _)| (stream, None))
             };
             let (result, left) = match entered {
                 Ok((mut stream, init)) => {
@@ -624,6 +624,27 @@ mod tests {
         assert!(outcome.result.is_ok(), "{:?}", outcome.result.as_ref().err());
         assert_eq!(outcome.seen.plain, CHOSE_X509PLAIN);
         assert_eq!(outcome.seen.secured.unwrap(), b"\0\0\0\0\0\0\0\x02pw");
+    }
+
+    #[tokio::test]
+    async fn handshake_x509plain_refusal_without_a_username_asks_for_one() {
+        let failure = || Write(b"\0\0\0\x01\0\0\0\x15Authentication failed".to_vec());
+        let pin = fingerprint(&certificate());
+        let logins = [
+            (262, "", vec![Read(10), failure()], "; this server also asks for a user name"),
+            (262, "user", vec![Read(14), failure()], ""),
+            (261, "", vec![Write(vec![7; 16]), Read(16), failure()], ""),
+        ];
+        for (subtype, username, secured, hint) in logins {
+            let server = rfb("RFB 003.008\n", &[19], x509(&[subtype], secured));
+            let login = Login { username, password: "pw" };
+            let outcome = connect(server, login, "127.0.0.1", Some(&pin), true).await;
+            assert_eq!(
+                refusal(&outcome),
+                format!("internal error: vnc: Authentication failed{hint}"),
+                "{subtype} {username:?}",
+            );
+        }
     }
 
     #[tokio::test]

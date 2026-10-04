@@ -36,6 +36,8 @@ pub enum Version {
 
 pub(super) const NEEDS_PASSWORD: &str = "this server needs a password";
 const NEEDS_USERNAME: &str = "this server needs a username";
+const UNWANTED_PASSWORD: &str =
+    "this server does not ask for a password; remove the password to connect";
 const REFUSED: &str = "the server refused the connection";
 
 pub fn security_name(t: u8) -> String {
@@ -83,6 +85,9 @@ pub fn choose_security(
     if !has_username && offered.contains(&30) {
         return Err(NEEDS_USERNAME.into());
     }
+    if has_password && !offered.is_empty() && offered.iter().all(|t| *t == 1) {
+        return Err(UNWANTED_PASSWORD.into());
+    }
     Err(offers_only(offered))
 }
 
@@ -102,9 +107,9 @@ async fn read_reason(stream: &mut Box<dyn Stream>) -> AppResult<Option<String>> 
     if let Err(e) = stream.read_exact(&mut reason).await {
         return cut_off(e);
     }
-    // QEMU ends its reason with a NUL.
+    // QEMU ends its reason with a NUL. The view shows the reason, so it is kept short.
     let reason: String =
-        String::from_utf8_lossy(&reason).chars().filter(|c| !c.is_control()).collect();
+        String::from_utf8_lossy(&reason).chars().filter(|c| !c.is_control()).take(200).collect();
     Ok((!reason.is_empty()).then_some(reason))
 }
 
@@ -170,6 +175,10 @@ pub async fn handshake(
         Err(reason) if reason == NEEDS_PASSWORD || reason == NEEDS_USERNAME => {
             return Err(err(reason));
         }
+        // Only when nothing else is on offer: otherwise the refusal names what is.
+        Err(reason) if reason == UNWANTED_PASSWORD && usable == offered => {
+            return Err(err(reason));
+        }
         Err(_) => return Err(err(offers_only(&offered))),
     };
     // VeNCrypt asks this itself once it knows whether its login runs inside TLS.
@@ -187,8 +196,9 @@ pub async fn handshake(
         stream.write_all(&vnc_auth_response(login.password, &challenge)).await?;
         stream.flush().await?;
     }
+    let mut plain = false;
     if security == 19 {
-        stream = super::vencrypt::negotiate(stream, login, tls).await?;
+        (stream, plain) = super::vencrypt::negotiate(stream, login, tls).await?;
     }
     if security == 30 {
         super::ard::login(&mut stream, login).await?;
@@ -204,12 +214,17 @@ pub async fn handshake(
             Version::V3_8 => read_reason(&mut stream).await?,
             _ => None,
         };
-        return Err(err(match (reason, result) {
+        let mut refusal: String = match (reason, result) {
             (Some(reason), _) => reason,
             (None, 2) => "too many attempts".into(),
             (None, _) if has_password => "wrong password".into(),
             (None, _) => REFUSED.into(),
-        }));
+        };
+        // Servers do not say that it was the user name that was missing.
+        if plain && login.username.is_empty() {
+            refusal.push_str("; this server also asks for a user name");
+        }
+        return Err(err(refusal));
     }
 
     stream.write_all(&[1]).await?; // ClientInit: shared
@@ -420,8 +435,13 @@ mod tests {
 
     #[test]
     fn a_password_never_falls_back_to_no_login() {
-        let refused = choose_security(&[1], true, true);
-        assert_eq!(refused, Err("the server offers only: None".into()));
+        for offered in [&[1][..], &[1, 1]] {
+            assert_eq!(
+                choose_security(offered, true, true),
+                Err("this server does not ask for a password; remove the password to connect"
+                    .into()),
+            );
+        }
         let refused = choose_security(&[5, 16], true, false).unwrap_err();
         assert!(refused.contains("RealVNC RA2") && refused.contains("Tight"), "{refused}");
         assert_eq!(
@@ -507,6 +527,21 @@ mod tests {
         script.push(Write(reason("\0\0")));
         let outcome = play(script, "hunter2").await;
         assert!(refusal(&outcome).ends_with("vnc: the server refused the connection"));
+    }
+
+    #[tokio::test]
+    async fn a_long_failure_reason_is_cut_to_200_characters() {
+        let long = "\0é".repeat(MAX_TEXT / 3);
+        let mut script = challenging("RFB 003.008\n");
+        script.push(Write([&[0, 0, 0, 1][..], &reason(&long)].concat()));
+        let cut = format!("internal error: vnc: {}", "é".repeat(200));
+        let refused = refusal(&play(script, "hunter2").await);
+        assert!(refused == cut, "{} characters", refused.chars().count());
+
+        let mut script = offering("RFB 003.008\n", &[]);
+        script.push(Write(reason(&long)));
+        let refused = refusal(&play(script, "hunter2").await);
+        assert!(refused == cut, "{} characters", refused.chars().count());
     }
 
     #[tokio::test]
@@ -821,7 +856,9 @@ mod tests {
     async fn v33_server_choice_goes_through_the_same_selection() {
         let none = vec![Write(b"RFB 003.003\n".into()), Read(12), Write(vec![0, 0, 0, 1])];
         let outcome = play(none, "hunter2").await;
-        assert!(refusal(&outcome).contains("the server offers only: None"));
+        assert!(refusal(&outcome).ends_with(
+            "vnc: this server does not ask for a password; remove the password to connect"
+        ));
         assert_eq!(outcome.sent, b"RFB 003.003\n");
 
         let password = vec![Write(b"RFB 003.003\n".into()), Read(12), Write(vec![0, 0, 0, 2])];
@@ -965,6 +1002,20 @@ mod tests {
         let outcome = play(offering("RFB 003.008\n", &[16, 2]), "").await;
         assert!(refusal(&outcome).contains("this server needs a password"));
         assert_eq!(outcome.sent, b"RFB 003.008\n");
+    }
+
+    #[tokio::test]
+    async fn a_password_for_a_server_that_asks_for_none_is_refused_with_the_way_out() {
+        for banner in ["RFB 003.007\n", "RFB 003.008\n"] {
+            let outcome = play(offering(banner, &[1]), "hunter2").await;
+            assert_eq!(
+                refusal(&outcome),
+                "internal error: vnc: this server does not ask for a password; \
+                 remove the password to connect",
+                "{banner:?}",
+            );
+            assert_eq!(outcome.sent, banner.as_bytes(), "{banner:?}");
+        }
     }
 
     #[tokio::test]

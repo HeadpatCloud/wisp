@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 use sha2::{Digest, Sha256};
 
 use crate::commands::ssh_cmds::KnownHostsState;
@@ -25,7 +27,16 @@ fn lookup(
     let prefix = match scheme {
         Scheme::Vnc => "vnc/",
     };
-    let host = format!("{prefix}{}", crate::net::normalize_host(host));
+    // One key for every spelling of a host: a pin must not depend on how the host was typed.
+    let host = crate::net::normalize_host(host);
+    let host = match host.parse::<IpAddr>() {
+        Ok(address) => address.to_string(),
+        Err(_) => {
+            let name = host.to_ascii_lowercase();
+            name.strip_suffix('.').unwrap_or(&name).to_string()
+        }
+    };
+    let host = format!("{prefix}{host}");
     let verdict = {
         let kh = known
             .0
@@ -213,6 +224,75 @@ mod tests {
         assert!(!has_certificate_pin(&known, Scheme::Vnc, "::1", 5901).unwrap());
         known.0.lock().unwrap().record("vnc/::1", 5900, UNENCRYPTED).unwrap();
         assert!(!has_certificate_pin(&known, Scheme::Vnc, "::1", 5900).unwrap());
+    }
+
+    // What accepting the certificate in the dialog does: it records the host the error names.
+    fn accept(known: &KnownHostsState, host: &str, cert_der: &[u8]) {
+        match check(known, Scheme::Vnc, host, 5900, cert_der) {
+            Err(AppError::HostKeyUnknown { host, port, fingerprint }) => {
+                known.0.lock().unwrap().record(&host, port, &fingerprint).unwrap();
+            }
+            other => panic!("expected HostKeyUnknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pin_holds_for_every_spelling_of_a_host_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let known = known(&dir);
+        accept(&known, "desk.lan", b"cert");
+        for spelling in ["desk.lan", "Desk.lan", "DESK.LAN.", "desk.lan."] {
+            match check_unencrypted(&known, Scheme::Vnc, spelling, 5900) {
+                Err(AppError::HostKeyMismatch { host, stored, .. }) => {
+                    assert_eq!(host, "vnc/desk.lan", "{spelling}");
+                    assert_eq!(stored, fingerprint(b"cert"), "{spelling}");
+                }
+                other => panic!("{spelling}: expected HostKeyMismatch, got {other:?}"),
+            }
+            let pinned = has_certificate_pin(&known, Scheme::Vnc, spelling, 5900).unwrap();
+            assert!(pinned, "{spelling}");
+        }
+    }
+
+    #[test]
+    fn a_pin_holds_for_every_spelling_of_an_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let known = known(&dir);
+        accept(&known, "::1", b"cert");
+        for spelling in ["::1", "0:0:0:0:0:0:0:1", "[::1]", "[0:0:0:0:0:0:0:1]"] {
+            assert!(
+                matches!(
+                    check_unencrypted(&known, Scheme::Vnc, spelling, 5900),
+                    Err(AppError::HostKeyMismatch { host, .. }) if host == "vnc/::1"
+                ),
+                "{spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_certificate_recorded_under_one_spelling_is_trusted_under_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let known = known(&dir);
+        accept(&known, "Desk.LAN.", b"cert");
+        accept(&known, "[0:0:0:0:0:0:0:1]", b"cert");
+        for spelling in ["desk.lan", "DESK.lan", "desk.lan.", "::1", "[::1]", "0::1"] {
+            assert!(check(&known, Scheme::Vnc, spelling, 5900, b"cert").is_ok(), "{spelling}");
+        }
+    }
+
+    #[test]
+    fn localhost_and_its_address_stay_different_hosts() {
+        let dir = tempfile::tempdir().unwrap();
+        let known = known(&dir);
+        accept(&known, "localhost", b"cert");
+        assert!(check_unencrypted(&known, Scheme::Vnc, "127.0.0.1", 5900).is_ok());
+        assert!(!has_certificate_pin(&known, Scheme::Vnc, "127.0.0.1", 5900).unwrap());
+        assert!(matches!(
+            check(&known, Scheme::Vnc, "127.0.0.1", 5900, b"cert"),
+            Err(AppError::HostKeyUnknown { host, .. }) if host == "vnc/127.0.0.1"
+        ));
+        assert!(has_certificate_pin(&known, Scheme::Vnc, "LOCALHOST", 5900).unwrap());
     }
 
     #[test]

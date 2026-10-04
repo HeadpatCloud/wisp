@@ -1,0 +1,72 @@
+name: wisp-test
+
+services:
+  tigervnc-x509:
+    build:
+      context: .
+      dockerfile: tigervnc/Dockerfile
+    container_name: wisp-test-tigervnc-x509
+    init: true
+    command: ["-desktop", "wisp-test-tigervnc-x509", "-SecurityTypes", "X509Vnc"]
+    ports:
+      - "127.0.0.1:5901:5900"
+
+  tigervnc-vncauth:
+    build:
+      context: .
+      dockerfile: tigervnc/Dockerfile
+    container_name: wisp-test-tigervnc-vncauth
+    init: true
+    command: ["-desktop", "wisp-test-tigervnc-vncauth", "-SecurityTypes", "VncAuth"]
+    ports:
+      - "127.0.0.1:5902:5900"
+
+  tigervnc-plain:
+    build:
+      context: .
+      dockerfile: tigervnc/Dockerfile
+    container_name: wisp-test-tigervnc-plain
+    init: true
+    command: ["-desktop", "wisp-test-tigervnc-plain", "-SecurityTypes", "X509Plain"]
+    ports:
+      - "127.0.0.1:5903:5900"
+
+  # TigerVNC's out-of-the-box security settings: anonymous TLS or plain VNC password
+  tigervnc-default:
+    build:
+      context: .
+      dockerfile: tigervnc/Dockerfile
+    container_name: wisp-test-tigervnc-default
+    init: true
+    command: ["-desktop", "wisp-test-tigervnc-default", "-SecurityTypes", "TLSVnc,VncAuth"]
+    ports:
+      - "127.0.0.1:5907:5900"
+
+  x11vnc:
+    build:
+      context: .
+      dockerfile: x11vnc/Dockerfile
+    container_name: wisp-test-x11vnc
+    init: true
+    ports:
+      - "127.0.0.1:5904:5900"
+
+  tightvnc:
+    build:
+      context: .
+      dockerfile: tightvnc/Dockerfile
+    container_name: wisp-test-tightvnc
+    # Xtightvnc puts the hostname into the desktop name it sends
+    hostname: wisp-test-tightvnc
+    init: true
+    ports:
+      - "127.0.0.1:5905:5900"
+
+  qemu:
+    build:
+      context: .
+      dockerfile: qemu/Dockerfile
+    container_name: wisp-test-qemu
+    init: true
+    ports:
+      - "127.0.0.1:5906:5900"

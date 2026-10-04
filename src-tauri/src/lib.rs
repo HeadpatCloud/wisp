@@ -12,6 +12,15 @@ mod tunnel;
 mod vault;
 mod vnc;
 
+// Public for the live tests in tests/live_vnc.rs.
+pub use commands::ssh_cmds::KnownHostsState;
+pub use error::AppError;
+pub use remote::FrameOp;
+pub use ssh::known_hosts::KnownHosts;
+pub use vnc::decode::ENCODINGS;
+pub use vnc::handshake::Login;
+pub use vnc::session::Session;
+
 use std::sync::{Arc, Mutex};
 
 use commands::ftp_cmds;
@@ -26,9 +35,7 @@ use commands::transfer_cmds;
 use commands::tunnel_cmds;
 use commands::vault_cmds;
 use commands::vnc_cmds;
-use error::AppError;
 use error::AppResult;
-use ssh::known_hosts::KnownHosts;
 use vault::Vault;
 use specta_typescript::Typescript;
 use tauri::Manager;

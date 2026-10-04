@@ -1,0 +1,2 @@
+# without this twm waits for a click to place every window that has no position
+RandomPlacement

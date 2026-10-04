@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::error::{AppError, AppResult};
-use crate::store::model::{Group, Profile, S3Profile, SftpProfile};
+use crate::store::model::{Group, Profile, S3Profile, SftpProfile, VncProfile};
 use crate::vault::crypto;
 use crate::vault::model::KdfParams;
 
@@ -30,6 +30,8 @@ pub struct Payload {
     pub sftp_profiles: Vec<SftpProfile>,
     #[serde(default)]
     pub s3_profiles: Vec<S3Profile>,
+    #[serde(default)]
+    pub vnc_profiles: Vec<VncProfile>,
     // Keyed by the exporting machine's secret id and key path, which the profiles still reference.
     #[serde(default)]
     pub secrets: BTreeMap<String, Zeroizing<String>>,
@@ -111,6 +113,7 @@ fn checked(payload: Payload) -> AppResult<Opened> {
         && unique(payload.profiles.iter().map(|p| &p.id).collect())
         && unique(payload.sftp_profiles.iter().map(|p| &p.id).collect())
         && unique(payload.s3_profiles.iter().map(|p| &p.id).collect())
+        && unique(payload.vnc_profiles.iter().map(|p| &p.id).collect())
     {
         Ok(Opened::Payload(payload))
     } else {
@@ -181,6 +184,19 @@ mod tests {
             jump_host_id: None,
             tunnels: vec![],
             appearance: None,
+        }
+    }
+
+    fn vnc(id: &str) -> VncProfile {
+        VncProfile {
+            id: id.into(),
+            name: "desk".into(),
+            host: "10.0.0.5".into(),
+            port: 5901,
+            username: Some("faye".into()),
+            secret_id: Some("vnc-1".into()),
+            icon: IconRef::default(),
+            order: 0,
         }
     }
 
@@ -311,6 +327,49 @@ mod tests {
     }
 
     #[test]
+    fn vnc_profiles_round_trip_in_a_version_two_file() {
+        let plain = Payload { vnc_profiles: vec![vnc("v1")], ..Default::default() };
+        let mut sealed = plain.clone();
+        sealed.secrets.insert("vnc-1".into(), Zeroizing::new("hunter2".into()));
+        for (payload, password) in [(&plain, None), (&sealed, Some("pw"))] {
+            let bytes = write(payload, password).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["version"], 2);
+            assert!(matches!(
+                read(&bytes, password).unwrap(),
+                Opened::Payload(back) if &back == payload
+            ));
+        }
+        let value: serde_json::Value =
+            serde_json::from_slice(&write(&plain, None).unwrap()).unwrap();
+        assert_eq!(value["payload"]["vncProfiles"][0]["id"], "v1");
+    }
+
+    #[test]
+    fn version_two_files_from_before_vnc_profiles_still_read() {
+        let old = serde_json::json!({
+            "groups": [], "profiles": [profile("p1")], "sftpProfiles": [], "s3Profiles": [],
+            "secrets": {}, "keyFiles": {}
+        });
+        let kdf = KdfParams { m_cost: 8, t_cost: 1, p_cost: 1 };
+        let salt = crypto::random_bytes::<16>().unwrap();
+        let key = crypto::derive_key(b"pw", &salt, Some(kdf.tuple())).unwrap();
+        let (nonce, ciphertext) = crypto::seal(&key, old.to_string().as_bytes()).unwrap();
+        let sealed = serde_json::json!({
+            "version": 2, "encrypted": true, "kdf": kdf, "salt": STANDARD.encode(salt),
+            "nonce": STANDARD.encode(nonce), "ciphertext": STANDARD.encode(ciphertext)
+        });
+        let plain = serde_json::json!({ "version": 2, "encrypted": false, "payload": old });
+        for (file, password) in [(plain, None), (sealed, Some("pw"))] {
+            let Opened::Payload(p) = read(file.to_string().as_bytes(), password).unwrap() else {
+                panic!()
+            };
+            assert_eq!(p.profiles.len(), 1);
+            assert!(p.vnc_profiles.is_empty());
+        }
+    }
+
+    #[test]
     fn unknown_version_and_foreign_json_are_import_errors() {
         assert!(matches!(read(br#"{"version":3}"#, None), Err(AppError::Import(_))));
         assert!(matches!(read(br#"{"hello":1}"#, None), Err(AppError::Import(_))));
@@ -343,7 +402,11 @@ mod tests {
         let groups = Payload { groups: vec![group.clone(), group], ..Default::default() };
         let profiles =
             Payload { profiles: vec![profile("p1"), profile("p1")], ..Default::default() };
-        for (payload, password) in [(&groups, None), (&profiles, None), (&profiles, Some("pw"))] {
+        let vnc_profiles =
+            Payload { vnc_profiles: vec![vnc("v1"), vnc("v1")], ..Default::default() };
+        for (payload, password) in
+            [(&groups, None), (&profiles, None), (&profiles, Some("pw")), (&vnc_profiles, None)]
+        {
             let bytes = write(payload, password).unwrap();
             assert!(matches!(read(&bytes, password), Err(AppError::Import(_))));
         }

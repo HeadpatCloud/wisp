@@ -3,7 +3,9 @@ import userEvent from '@testing-library/user-event'
 import { StrictMode } from 'react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
-vi.mock('@/bindings', () => ({}))
+const listVncProfiles = vi.hoisted(() => vi.fn())
+
+vi.mock('@/bindings', () => ({ commands: { listVncProfiles } }))
 vi.mock('@/lib/transfer', () => ({
   readBundle: vi.fn(),
   validateImport: vi.fn().mockResolvedValue([]),
@@ -11,7 +13,7 @@ vi.mock('@/lib/transfer', () => ({
   discardImport: vi.fn().mockResolvedValue(undefined),
 }))
 
-import type { ImportReview, ItemProblem } from '@/bindings'
+import type { ImportReview, ItemProblem, VncProfile } from '@/bindings'
 import {
   applyImport,
   discardImport,
@@ -23,6 +25,7 @@ import { useProfileStore } from '@/stores/profileStore'
 import { useS3ProfileStore } from '@/stores/s3ProfileStore'
 import { useSessionStore } from '@/stores/sessionStore'
 import { useSftpProfileStore } from '@/stores/sftpProfileStore'
+import { useVncProfileStore } from '@/stores/vncProfileStore'
 import { ImportReviewPage } from './ImportReviewPage'
 
 const review: ImportReview = {
@@ -73,6 +76,7 @@ beforeEach(() => {
   useProfileStore.setState({ load } as never)
   useSftpProfileStore.setState({ load } as never)
   useS3ProfileStore.setState({ load } as never)
+  useVncProfileStore.setState({ load } as never)
   useSessionStore.setState({ removeTab } as never)
 })
 
@@ -110,7 +114,68 @@ test('field toggles, apply payload, reload and summary', async () => {
     { key: 'ssh:n', accept: true, asNew: false, fields: [] },
   ])
   expect(await screen.findByText('Imported: 1 added, 1 updated.')).toBeInTheDocument()
-  expect(load).toHaveBeenCalledTimes(3)
+  expect(load).toHaveBeenCalledTimes(4)
+})
+
+test('a VNC profile is labelled VNC in the list and in its details', async () => {
+  vi.mocked(readBundle).mockResolvedValue({
+    kind: 'review',
+    review: {
+      ...review,
+      items: [
+        {
+          key: 'vnc:m',
+          kind: 'vnc',
+          name: 'desk',
+          status: 'conflict',
+          matched: { id: 'pc', name: 'tower' },
+          fields: [
+            { field: 'password', label: 'Password', local: '••••', incoming: '•••• (different)' },
+          ],
+          notes: [],
+          notesAsNew: [],
+        },
+        { ...review.items[1], key: 'vnc:n', kind: 'vnc', name: 'lab' },
+      ],
+    },
+  })
+  const user = userEvent.setup()
+  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  expect(await screen.findByText('Matches your VNC "tower"')).toBeInTheDocument()
+  expect(screen.getAllByText('VNC')).toHaveLength(2)
+  await user.click(screen.getByRole('button', { name: 'lab' }))
+  expect(screen.getByText('New VNC')).toBeInTheDocument()
+})
+
+test('an imported VNC profile is in the VNC store once the import is applied', async () => {
+  const desk: VncProfile = {
+    id: 'v',
+    name: 'desk',
+    host: 'h',
+    port: 5900,
+    username: null,
+    secretId: null,
+    icon: { kind: 'builtin', name: 'server' },
+    order: 0,
+  }
+  vi.mocked(readBundle).mockResolvedValue({
+    kind: 'review',
+    review: { ...review, items: [{ ...review.items[1], key: 'vnc:v', kind: 'vnc', name: 'desk' }] },
+  })
+  vi.mocked(applyImport).mockResolvedValueOnce({ added: 1, updated: 0 })
+  listVncProfiles.mockResolvedValueOnce({ status: 'ok', data: [desk] })
+  useVncProfileStore.setState(useVncProfileStore.getInitialState())
+  const user = userEvent.setup()
+  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  const apply = await screen.findByRole('button', { name: 'Apply' })
+  expect(useVncProfileStore.getState().profiles).toEqual([])
+  await user.click(apply)
+  expect(applyImport).toHaveBeenCalledWith('r1', [
+    { key: 'vnc:v', accept: true, asNew: false, fields: [] },
+  ])
+  expect(await screen.findByText('Imported: 1 added, 0 updated.')).toBeInTheDocument()
+  await waitFor(() => expect(useVncProfileStore.getState().profiles).toEqual([desk]))
+  expect(listVncProfiles).toHaveBeenCalledTimes(1)
 })
 
 test('the first changed profile is selected even when a new one comes first', async () => {
@@ -338,7 +403,7 @@ test('a failed profile reload still shows the import summary', async () => {
   expect(
     await screen.findByText('The profile list could not be refreshed: io: denied'),
   ).toBeInTheDocument()
-  expect(load).toHaveBeenCalledTimes(3)
+  expect(load).toHaveBeenCalledTimes(4)
   expect(screen.queryByRole('button', { name: 'Apply' })).not.toBeInTheDocument()
   unmount()
   expect(discardImport).not.toHaveBeenCalled()

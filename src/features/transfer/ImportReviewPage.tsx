@@ -16,6 +16,7 @@ import { useProfileStore } from '@/stores/profileStore'
 import { useS3ProfileStore } from '@/stores/s3ProfileStore'
 import { useSessionStore } from '@/stores/sessionStore'
 import { useSftpProfileStore } from '@/stores/sftpProfileStore'
+import { useVncProfileStore } from '@/stores/vncProfileStore'
 import {
   type Decisions,
   initialDecisions,
@@ -28,7 +29,13 @@ import {
 } from './review'
 import { TriCheckbox } from './TriCheckbox'
 
-const KIND: Record<ItemKind, string> = { group: 'Group', ssh: 'SSH', sftp: 'SFTP', s3: 'S3' }
+const KIND: Record<ItemKind, string> = {
+  group: 'Group',
+  ssh: 'SSH',
+  sftp: 'SFTP',
+  s3: 'S3',
+  vnc: 'VNC',
+}
 
 function errorText(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
@@ -39,6 +46,7 @@ export function ImportReviewPage({ tabId, path }: { tabId: string; path: string 
   const reloadProfiles = useProfileStore((s) => s.load)
   const reloadSftp = useSftpProfileStore((s) => s.load)
   const reloadS3 = useS3ProfileStore((s) => s.load)
+  const reloadVnc = useVncProfileStore((s) => s.load)
   const [stage, setStage] = useState<'loading' | 'password' | 'review' | 'done'>('loading')
   const [password, setPassword] = useState('')
   const [wrongPassword, setWrongPassword] = useState(false)
@@ -134,7 +142,7 @@ export function ImportReviewPage({ tabId, path }: { tabId: string; path: string 
       reviewIdRef.current = null
       setSummary(result)
       setStage('done')
-      await Promise.all([reloadProfiles(), reloadSftp(), reloadS3()])
+      await Promise.all([reloadProfiles(), reloadSftp(), reloadS3(), reloadVnc()])
     } catch (e) {
       failedRef.current = decisions
       setError(errorText(e))

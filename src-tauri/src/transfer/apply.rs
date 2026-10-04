@@ -66,6 +66,7 @@ impl<'a> Stager<'a> {
             ItemKind::Ssh => self.data.profiles.iter().any(|p| p.id == id),
             ItemKind::Sftp => self.data.sftp_profiles.iter().any(|p| p.id == id),
             ItemKind::S3 => self.data.s3_profiles.iter().any(|p| p.id == id),
+            ItemKind::Vnc => self.data.vnc_profiles.iter().any(|p| p.id == id),
         };
         match self.plan.matches.get(&key) {
             Some(local) if !(accept && as_new) => Some(local.clone()),
@@ -521,6 +522,63 @@ pub fn stage(
         }
     }
 
+    for inc in &payload.vnc_profiles {
+        let key = ItemKind::Vnc.key(&inc.id);
+        let (accept, as_new, fields) = s.decision(&key);
+        if !accept {
+            continue;
+        }
+        match plan.matches.get(&key).filter(|_| !as_new).cloned() {
+            Some(local_id) => {
+                if fields.is_empty() {
+                    continue;
+                }
+                let mut next = s
+                    .data
+                    .vnc_profiles
+                    .iter()
+                    .find(|x| x.id == local_id)
+                    .cloned()
+                    .expect("matched vnc profile exists");
+                for f in &fields {
+                    match *f {
+                        field::NAME => next.name = inc.name.clone(),
+                        field::HOST => next.host = inc.host.clone(),
+                        field::PORT => next.port = inc.port,
+                        field::USERNAME => next.username = inc.username.clone(),
+                        field::ICON => next.icon = inc.icon.clone(),
+                        field::PASSWORD => {
+                            s.replaced.extend(next.secret_id.take());
+                            next.secret_id = s.secret(inc.secret_id.as_deref());
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(slot) = s.data.vnc_profiles.iter_mut().find(|x| x.id == local_id) {
+                    *slot = next;
+                }
+                s.summary.updated += 1;
+                s.touched.push((key, local_id));
+            }
+            None => {
+                let id =
+                    s.final_id(ItemKind::Vnc, &inc.id).expect("accepted vnc profile has an id");
+                let secret_id = s.secret(inc.secret_id.as_deref());
+                let order = s.data.vnc_profiles.iter().map(|x| x.order + 1).max().unwrap_or(0);
+                let icon = s.icon(&inc.icon);
+                s.data.vnc_profiles.push(crate::store::model::VncProfile {
+                    id: id.clone(),
+                    secret_id,
+                    icon,
+                    order,
+                    ..inc.clone()
+                });
+                s.summary.added += 1;
+                s.touched.push((key, id));
+            }
+        }
+    }
+
     let touched = std::mem::take(&mut s.touched);
     let mut found: Vec<(String, String)> = Vec::new();
     for (key, id) in &touched {
@@ -670,6 +728,9 @@ fn substitute(data: &mut ProfileStore, secrets: &[String], keys: &[String]) {
         }
     }
     for p in data.s3_profiles.iter_mut() {
+        fix(&mut p.secret_id);
+    }
+    for p in data.vnc_profiles.iter_mut() {
         fix(&mut p.secret_id);
     }
 }
@@ -829,6 +890,19 @@ mod tests {
             access_key_id: "AK".into(),
             secret_id: None,
             bucket: None,
+            icon: IconRef::default(),
+            order: 0,
+        }
+    }
+
+    fn vnc(id: &str, name: &str, host: &str) -> VncProfile {
+        VncProfile {
+            id: id.into(),
+            name: name.into(),
+            host: host.into(),
+            port: 5900,
+            username: None,
+            secret_id: None,
             icon: IconRef::default(),
             order: 0,
         }
@@ -1341,7 +1415,7 @@ mod tests {
         assert_eq!(S3Profile { secret_id: inc.secret_id.clone(), ..p.clone() }, inc);
     }
 
-    // Bundles do not carry VNC profiles, so an import has to leave them as they are.
+    // This bundle carries no VNC profiles, so the import has to leave them as they are.
     #[test]
     fn import_leaves_vnc_profiles_as_they_were() {
         let dir = tempfile::tempdir().unwrap();
@@ -1367,6 +1441,173 @@ mod tests {
         assert_eq!(store.vnc_profiles(), [desk.clone()]);
         assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().vnc_profiles(), [desk.clone()]);
         assert_eq!(v.get_secret(desk.secret_id.as_deref().unwrap()).unwrap().as_slice(), b"pw");
+    }
+
+    #[test]
+    fn new_vnc_profile_is_written_with_its_secret() {
+        let inc = VncProfile {
+            username: Some("faye".into()),
+            secret_id: Some("mac-pw".into()),
+            ..vnc("v", "desk", "h9")
+        };
+        let mut payload = Payload { vnc_profiles: vec![inc.clone()], ..Default::default() };
+        payload.secrets.insert("mac-pw".into(), Zeroizing::new("pw".into()));
+        let local = ProfileStore {
+            vnc_profiles: vec![VncProfile { order: 3, ..vnc("x", "other", "h1") }],
+            ..store_of(vec![])
+        };
+        let staged = run(&local, &payload, &[accept("vnc:v", &[])]).unwrap();
+        assert_eq!(staged.summary, ApplySummary { added: 1, updated: 0 });
+        assert_eq!(staged.data.vnc_profiles[1].secret_id, Some(format!("{SECRET_PREFIX}0")));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        let mut v = vault(dir.path());
+        execute(&mut store, &mut v, &dir.path().join("keys"), staged).unwrap();
+        assert_eq!(store.vnc_profiles()[0], local.vnc_profiles[0]);
+        let p = &store.vnc_profiles()[1];
+        assert_eq!(v.get_secret(p.secret_id.as_deref().unwrap()).unwrap().as_slice(), b"pw");
+        assert_eq!(p.order, 4);
+        assert_eq!(VncProfile { secret_id: inc.secret_id.clone(), order: 0, ..p.clone() }, inc);
+        let reloaded = Store::load(dir.path().to_path_buf()).unwrap();
+        assert_eq!(reloaded.vnc_profiles(), store.vnc_profiles());
+    }
+
+    #[test]
+    fn new_vnc_profile_drops_a_password_and_icon_the_bundle_does_not_bring() {
+        let inc = VncProfile {
+            secret_id: Some("mac-pw".into()),
+            icon: IconRef::Custom { path: "icons/6f1c2a9e-8d0b-4c57-9a3e-2b7d5e41f0c8.png".into() },
+            ..vnc("v", "desk", "h9")
+        };
+        let payload = Payload { vnc_profiles: vec![inc], ..Default::default() };
+        let staged = run(&store_of(vec![]), &payload, &[accept("vnc:v", &[])]).unwrap();
+        let p = &staged.data.vnc_profiles[0];
+        assert_eq!((p.id.as_str(), &p.secret_id, &p.icon), ("v", &None, &IconRef::default()));
+        assert!(staged.secrets.is_empty());
+    }
+
+    #[test]
+    fn matched_vnc_profile_takes_only_the_accepted_fields() {
+        let pc = VncProfile { secret_id: Some("old".into()), ..vnc("pc", "desk", "h1") };
+        let mac = VncProfile {
+            name: "desk (mac)".into(),
+            host: "h2".into(),
+            port: 5901,
+            username: Some("faye".into()),
+            secret_id: Some("mac-pw".into()),
+            icon: IconRef::Builtin { name: "monitor".into() },
+            ..pc.clone()
+        };
+        let mut payload = Payload { vnc_profiles: vec![mac.clone()], ..Default::default() };
+        payload.secrets.insert("mac-pw".into(), Zeroizing::new("new".into()));
+        let local = ProfileStore { vnc_profiles: vec![pc.clone()], ..store_of(vec![]) };
+
+        let staged = run(&local, &payload, &[accept("vnc:pc", &["port", "username"])]).unwrap();
+        let some = VncProfile { port: 5901, username: Some("faye".into()), ..pc };
+        assert_eq!(staged.data.vnc_profiles, [some]);
+        assert!(staged.secrets.is_empty() && staged.replaced_secrets.is_empty());
+        assert_eq!(staged.summary, ApplySummary { added: 0, updated: 1 });
+
+        let every = ["name", "host", "port", "username", "icon", "password"];
+        let staged = run(&local, &payload, &[accept("vnc:pc", &every)]).unwrap();
+        let all = VncProfile { secret_id: Some(format!("{SECRET_PREFIX}0")), ..mac };
+        assert_eq!(staged.data.vnc_profiles, [all]);
+        assert_eq!(staged.secrets[0].as_str(), "new");
+        assert_eq!(staged.replaced_secrets, ["old"]);
+        assert_eq!(staged.summary, ApplySummary { added: 0, updated: 1 });
+    }
+
+    #[test]
+    fn declined_vnc_profiles_leave_everything_untouched() {
+        let pc = VncProfile { secret_id: Some("old".into()), ..vnc("pc", "desk", "h1") };
+        let mac = VncProfile { port: 5901, secret_id: Some("mac-pw".into()), ..pc.clone() };
+        let mut payload =
+            Payload { vnc_profiles: vec![mac, vnc("n", "new", "h9")], ..Default::default() };
+        payload.secrets.insert("mac-pw".into(), Zeroizing::new("new".into()));
+        let local = ProfileStore { vnc_profiles: vec![pc], ..store_of(vec![]) };
+        let decline = |key: &str| ItemDecision {
+            key: key.into(),
+            accept: false,
+            as_new: false,
+            fields: vec!["port".into(), "password".into()],
+        };
+        for decisions in [
+            vec![],
+            vec![decline("vnc:pc"), decline("vnc:n")],
+            vec![accept("vnc:pc", &[])],
+        ] {
+            let staged = run(&local, &payload, &decisions).unwrap();
+            assert_eq!(staged.data, local);
+            assert!(staged.secrets.is_empty() && staged.replaced_secrets.is_empty());
+            assert_eq!(staged.summary, ApplySummary { added: 0, updated: 0 });
+        }
+    }
+
+    #[test]
+    fn vnc_profile_added_as_new_gets_its_own_id() {
+        let pc = vnc("pc", "desk", "h1");
+        let local = ProfileStore { vnc_profiles: vec![pc.clone()], ..store_of(vec![]) };
+        let inc = VncProfile { port: 5901, ..pc.clone() };
+        let payload = Payload { vnc_profiles: vec![inc], ..Default::default() };
+        let d = ItemDecision { key: "vnc:pc".into(), accept: true, as_new: true, fields: vec![] };
+        let staged = run(&local, &payload, &[d]).unwrap();
+        assert_eq!(staged.data.vnc_profiles.len(), 2);
+        assert_eq!(staged.data.vnc_profiles[0], pc);
+        let added = &staged.data.vnc_profiles[1];
+        assert_ne!(added.id, "pc");
+        assert_eq!((added.port, added.order), (5901, 1));
+        assert_eq!(staged.summary, ApplySummary { added: 1, updated: 0 });
+    }
+
+    // A stored VNC profile whose password is in the vault, and an import that replaces that
+    // password and adds a second profile with a password of its own.
+    fn vnc_import(dir: &std::path::Path) -> (Store, Vault, String, Staged) {
+        let mut store = Store::load(dir.to_path_buf()).unwrap();
+        let mut v = vault(dir);
+        let old = v.set_secret(b"old").unwrap();
+        let pc = VncProfile { secret_id: Some(old.clone()), ..vnc("pc", "desk", "h1") };
+        store.upsert_vnc_profile(pc).unwrap();
+        let mac = VncProfile { secret_id: Some("mac-pw".into()), ..vnc("mac", "desk", "h1") };
+        let lab = VncProfile { secret_id: Some("lab-pw".into()), ..vnc("lab", "lab", "h2") };
+        let mut payload = Payload { vnc_profiles: vec![mac, lab], ..Default::default() };
+        payload.secrets.insert("mac-pw".into(), Zeroizing::new("new".into()));
+        payload.secrets.insert("lab-pw".into(), Zeroizing::new("lab".into()));
+        let decisions = [accept("vnc:mac", &["password"]), accept("vnc:lab", &[])];
+        let staged = run(&store.snapshot(), &payload, &decisions).unwrap();
+        (store, v, old, staged)
+    }
+
+    #[test]
+    fn vnc_import_stores_the_new_passwords_and_deletes_the_replaced_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, mut v, old, staged) = vnc_import(dir.path());
+        let summary = execute(&mut store, &mut v, &dir.path().join("keys"), staged).unwrap();
+        assert_eq!(summary, ApplySummary { added: 1, updated: 1 });
+        let profiles = store.vnc_profiles();
+        let ids: Vec<_> = profiles.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["pc", "lab"]);
+        let secret =
+            |p: &VncProfile| v.get_secret(p.secret_id.as_deref().unwrap()).unwrap().to_vec();
+        assert_eq!(secret(&profiles[0]), b"new");
+        assert_eq!(secret(&profiles[1]), b"lab");
+        assert!(!v.has_secret(&old));
+        assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().vnc_profiles(), profiles);
+    }
+
+    #[test]
+    fn failed_vnc_import_leaves_the_store_and_the_vault_as_they_were() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, mut v, old, staged) = vnc_import(dir.path());
+        assert_eq!(staged.secrets.len(), 2);
+        assert_eq!(staged.replaced_secrets, [old.clone()]);
+        let on_disk = |name: &str| std::fs::read(dir.path().join(name)).unwrap();
+        let before = (store.snapshot(), on_disk("profiles.json"), on_disk("vault.enc"));
+        // A directory where the temp file should be makes the store write fail.
+        std::fs::create_dir(dir.path().join("profiles.json.tmp")).unwrap();
+        assert!(execute(&mut store, &mut v, &dir.path().join("keys"), staged).is_err());
+        assert_eq!((store.snapshot(), on_disk("profiles.json"), on_disk("vault.enc")), before);
+        assert_eq!(v.get_secret(&old).unwrap().as_slice(), b"old");
     }
 
     #[test]

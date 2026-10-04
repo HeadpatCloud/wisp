@@ -9,6 +9,7 @@ import { useProfileStore } from '@/stores/profileStore'
 import { useS3ProfileStore } from '@/stores/s3ProfileStore'
 import { useSessionStore } from '@/stores/sessionStore'
 import { useSftpProfileStore } from '@/stores/sftpProfileStore'
+import { useVncProfileStore } from '@/stores/vncProfileStore'
 import type { Tri } from './review'
 import { TriCheckbox } from './TriCheckbox'
 
@@ -33,6 +34,7 @@ export function ExportPage({ tabId }: { tabId: string }) {
   const profiles = useProfileStore((s) => s.profiles)
   const sftp = useSftpProfileStore((s) => s.profiles)
   const s3 = useS3ProfileStore((s) => s.profiles)
+  const vnc = useVncProfileStore((s) => s.profiles)
   const removeTab = useSessionStore((s) => s.removeTab)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [includeSecrets, setIncludeSecrets] = useState(false)
@@ -73,6 +75,7 @@ export function ExportPage({ tabId }: { tabId: string }) {
             profileIds: ids('ssh:'),
             sftpIds: ids('sftp:'),
             s3Ids: ids('s3:'),
+            vncIds: ids('vnc:'),
           },
           { includeSecrets, includeKeys },
           needsPassword ? password : null,
@@ -143,6 +146,7 @@ export function ExportPage({ tabId }: { tabId: string }) {
     ...profiles.map((p) => `ssh:${p.id}`),
     ...sftp.map((p) => `sftp:${p.id}`),
     ...s3.map((p) => `s3:${p.id}`),
+    ...vnc.map((p) => `vnc:${p.id}`),
   ]
 
   if (summary) {
@@ -212,6 +216,12 @@ export function ExportPage({ tabId }: { tabId: string }) {
           <section>
             <h3 className="mb-1 font-semibold">S3</h3>
             <ul className="space-y-1">{flat('s3:', s3)}</ul>
+          </section>
+        )}
+        {vnc.length > 0 && (
+          <section>
+            <h3 className="mb-1 font-semibold">VNC</h3>
+            <ul className="space-y-1">{flat('vnc:', vnc)}</ul>
           </section>
         )}
         <section className="space-y-2 border-border border-t pt-4">

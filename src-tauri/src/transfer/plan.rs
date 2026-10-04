@@ -8,7 +8,7 @@ use super::bundle::Payload;
 use super::{Env, FieldDiff, ItemKind, ItemStatus, LocalMatch, ReviewItem};
 use crate::store::model::{
     AuthMethod, Group, IconRef, Profile, ProfileAppearance, ProfileKey, ProfileStore, S3Profile,
-    SftpProfile, Tunnel, TunnelKind,
+    SftpProfile, Tunnel, TunnelKind, VncProfile,
 };
 use crate::store::normalize_keys;
 
@@ -566,6 +566,36 @@ impl Collector<'_> {
         );
         fields
     }
+
+    fn vnc_fields(
+        &self,
+        l: &VncProfile,
+        inc: &VncProfile,
+        env: &dyn Env,
+        notes: &mut Vec<String>,
+    ) -> Vec<FieldDiff> {
+        let mut fields = vec![];
+        push(&mut fields, field::NAME, "Name", l.name.clone(), inc.name.clone());
+        push(&mut fields, field::HOST, "Host", l.host.clone(), inc.host.clone());
+        push(&mut fields, field::PORT, "Port", l.port.to_string(), inc.port.to_string());
+        push(
+            &mut fields,
+            field::USERNAME,
+            "Username",
+            text(l.username.as_deref()),
+            text(inc.username.as_deref()),
+        );
+        icon_field(&l.icon, &inc.icon, env, &mut fields, notes);
+        password_field(
+            "Password",
+            l.secret_id.as_deref(),
+            inc.secret_id.as_deref(),
+            self.payload,
+            env,
+            &mut fields,
+        );
+        fields
+    }
 }
 
 // Where an incoming group reference lands locally: the matched group, a group arriving in the
@@ -730,13 +760,39 @@ pub fn plan(local: &ProfileStore, payload: &Payload, env: &dyn Env) -> Plan {
         }
     }
 
+    let (found, _) = match_items(
+        &local.vnc_profiles,
+        &payload.vnc_profiles,
+        |l| (l.id.as_str(), l.name.as_str()),
+        |p| (p.id.as_str(), p.name.as_str()),
+        |l, p, _| {
+            l.host.eq_ignore_ascii_case(&p.host)
+                && l.port == p.port
+                && l.username.as_deref().unwrap_or("") == p.username.as_deref().unwrap_or("")
+        },
+    );
+    for (inc, found) in payload.vnc_profiles.iter().zip(found) {
+        let key = ItemKind::Vnc.key(&inc.id);
+        let as_new = vec![];
+        match found {
+            Some(l) => {
+                let mut notes = vec![];
+                let fields = c.vnc_fields(l, inc, env, &mut notes);
+                c.matched(key, ItemKind::Vnc, &inc.name, (&l.id, &l.name), fields, (notes, as_new));
+            }
+            None => c.added(key, ItemKind::Vnc, &inc.name, as_new),
+        }
+    }
+
     Plan { items: c.items, unchanged: c.unchanged, matches: c.matches }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::model::{AuthMethod, Group, IconRef, Profile, ProfileKey, SftpProfile};
+    use crate::store::model::{
+        AuthMethod, Group, IconRef, Profile, ProfileKey, SftpProfile, VncProfile,
+    };
     use crate::transfer::bundle::KeyFile;
     use crate::transfer::MapEnv;
     use zeroize::Zeroizing;
@@ -774,6 +830,27 @@ mod tests {
 
     fn incoming(profiles: Vec<Profile>) -> Payload {
         Payload { profiles, ..Default::default() }
+    }
+
+    fn vnc(id: &str, name: &str, host: &str) -> VncProfile {
+        VncProfile {
+            id: id.into(),
+            name: name.into(),
+            host: host.into(),
+            port: 5900,
+            username: None,
+            secret_id: None,
+            icon: IconRef::default(),
+            order: 0,
+        }
+    }
+
+    fn local_vnc(vnc_profiles: Vec<VncProfile>) -> ProfileStore {
+        ProfileStore { vnc_profiles, ..local(vec![]) }
+    }
+
+    fn incoming_vnc(vnc_profiles: Vec<VncProfile>) -> Payload {
+        Payload { vnc_profiles, ..Default::default() }
     }
 
     #[test]
@@ -1088,5 +1165,168 @@ mod tests {
             p.items[0].notes_as_new,
             ["Its jump host isn't in the export; it will connect directly"]
         );
+    }
+
+    #[test]
+    fn vnc_profile_is_new_until_it_is_here_and_then_unchanged() {
+        let desk = VncProfile { username: Some("faye".into()), ..vnc("v1", "desk", "h1") };
+        let payload = incoming_vnc(vec![desk.clone()]);
+
+        let p = plan(&local_vnc(vec![]), &payload, &MapEnv::default());
+        assert_eq!(p.unchanged, 0);
+        assert_eq!(p.items.len(), 1);
+        let item = &p.items[0];
+        assert_eq!(
+            (item.key.as_str(), item.kind, item.name.as_str(), item.status),
+            ("vnc:v1", ItemKind::Vnc, "desk", ItemStatus::New)
+        );
+        assert!(item.matched.is_none() && item.fields.is_empty());
+        assert!(item.notes.is_empty() && item.notes_as_new.is_empty());
+
+        let p = plan(&local_vnc(vec![desk]), &payload, &MapEnv::default());
+        assert!(p.items.is_empty());
+        assert_eq!(p.unchanged, 1);
+        assert_eq!(p.matches.get("vnc:v1").map(String::as_str), Some("v1"));
+    }
+
+    #[test]
+    fn changed_vnc_profile_lists_its_fields_in_order() {
+        let pc = VncProfile { secret_id: Some("local-sec".into()), ..vnc("v1", "desk", "h1") };
+        let mac = VncProfile {
+            name: "desk (mac)".into(),
+            host: "h2".into(),
+            port: 5901,
+            username: Some("faye".into()),
+            secret_id: Some("mac-sec".into()),
+            icon: IconRef::Builtin { name: "monitor".into() },
+            ..pc.clone()
+        };
+        let mut payload = incoming_vnc(vec![mac]);
+        payload.secrets.insert("mac-sec".into(), Zeroizing::new("other".into()));
+        let mut env = MapEnv::default();
+        env.secrets.insert("local-sec".into(), b"mine".to_vec());
+
+        let p = plan(&local_vnc(vec![pc]), &payload, &env);
+        let item = &p.items[0];
+        assert_eq!((item.kind, item.status), (ItemKind::Vnc, ItemStatus::Conflict));
+        assert_eq!(item.matched, Some(LocalMatch { id: "v1".into(), name: "desk".into() }));
+        let rows: Vec<_> = item
+            .fields
+            .iter()
+            .map(|f| (f.field.as_str(), f.label.as_str(), f.local.as_str(), f.incoming.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("name", "Name", "desk", "desk (mac)"),
+                ("host", "Host", "h1", "h2"),
+                ("port", "Port", "5900", "5901"),
+                ("username", "Username", "(none)", "faye"),
+                ("icon", "Icon", "server", "monitor"),
+                ("password", "Password", "••••", "•••• (different)"),
+            ]
+        );
+    }
+
+    #[test]
+    fn vnc_password_row_only_when_bundle_carries_a_different_one() {
+        let mut pc = vnc("pc", "desk", "h1");
+        let mut payload = incoming_vnc(vec![pc.clone()]);
+        let mut env = MapEnv::default();
+        env.secrets.insert("local-sec".into(), b"same".to_vec());
+        let unchanged = |pc: &VncProfile, payload: &Payload| {
+            let p = plan(&local_vnc(vec![pc.clone()]), payload, &env);
+            p.items.is_empty() && p.unchanged == 1
+        };
+
+        assert!(unchanged(&pc, &payload), "neither side has a password");
+        pc.secret_id = Some("local-sec".into());
+        assert!(unchanged(&pc, &payload), "only this machine has one");
+        payload.vnc_profiles[0].secret_id = Some("mac-sec".into());
+        assert!(unchanged(&pc, &payload), "exported without passwords");
+        payload.secrets.insert("mac-sec".into(), Zeroizing::new("same".into()));
+        assert!(unchanged(&pc, &payload), "the same password");
+
+        payload.secrets.insert("mac-sec".into(), Zeroizing::new("other".into()));
+        let p = plan(&local_vnc(vec![pc.clone()]), &payload, &env);
+        let row = &p.items[0].fields[0];
+        assert_eq!(row.field, "password");
+        assert_eq!((row.local.as_str(), row.incoming.as_str()), ("••••", "•••• (different)"));
+
+        pc.secret_id = None;
+        let p = plan(&local_vnc(vec![pc]), &payload, &env);
+        let row = &p.items[0].fields[0];
+        assert_eq!((row.local.as_str(), row.incoming.as_str()), ("(none)", "••••"));
+    }
+
+    #[test]
+    fn vnc_profile_with_another_id_matches_on_the_same_server() {
+        let l = local_vnc(vec![
+            VncProfile { username: Some(String::new()), ..vnc("pc", "desk", "Desk.Lan") },
+            VncProfile { username: Some("Faye".into()), ..vnc("pc2", "tower", "tower.lan") },
+        ]);
+        let mac = vnc("mac", "desk (mac)", "desk.lan");
+
+        let p = plan(&l, &incoming_vnc(vec![mac.clone()]), &MapEnv::default());
+        assert_eq!(p.matches.get("vnc:mac").map(String::as_str), Some("pc"));
+        assert_eq!(p.items[0].matched.as_ref().unwrap().id, "pc");
+        let fields: Vec<_> = p.items[0].fields.iter().map(|f| f.field.as_str()).collect();
+        assert_eq!(fields, ["name", "host"]);
+
+        for other in [
+            VncProfile { port: 5901, ..mac.clone() },
+            VncProfile { username: Some("faye".into()), ..mac.clone() },
+            VncProfile { host: "desk2.lan".into(), ..mac.clone() },
+            VncProfile { username: Some("faye".into()), ..vnc("mac2", "tower", "tower.lan") },
+        ] {
+            let p = plan(&l, &incoming_vnc(vec![other.clone()]), &MapEnv::default());
+            assert_eq!(p.items[0].status, ItemStatus::New, "{other:?}");
+            assert!(p.matches.is_empty(), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn vnc_profile_matches_by_id_first_then_by_name_on_a_shared_server() {
+        let l = local_vnc(vec![vnc("x", "desk", "h1")]);
+        let moved = incoming_vnc(vec![vnc("a", "desk", "h1"), vnc("x", "desk", "h2")]);
+        let p = plan(&l, &moved, &MapEnv::default());
+        assert_eq!(p.matches.get("vnc:x").map(String::as_str), Some("x"));
+        assert_eq!(p.matches.get("vnc:a"), None);
+        let items: Vec<_> = p.items.iter().map(|i| (i.key.as_str(), i.status)).collect();
+        assert_eq!(items, [("vnc:a", ItemStatus::New), ("vnc:x", ItemStatus::Conflict)]);
+
+        let l = local_vnc(vec![vnc("a", "test", "h1"), vnc("b", "prod", "h1")]);
+        let p = plan(&l, &incoming_vnc(vec![vnc("x", "prod", "h1")]), &MapEnv::default());
+        assert_eq!(p.matches.get("vnc:x").map(String::as_str), Some("b"));
+        assert_eq!(p.unchanged, 1);
+        let p = plan(&l, &incoming_vnc(vec![vnc("x", "staging", "h1")]), &MapEnv::default());
+        assert_eq!(p.items[0].status, ItemStatus::New);
+    }
+
+    #[test]
+    fn vnc_custom_icon_is_offered_only_when_it_is_on_this_machine() {
+        let path = "icons/6f1c2a9e-8d0b-4c57-9a3e-2b7d5e41f0c8.png";
+        let pc = vnc("v1", "desk", "h1");
+        let mac = VncProfile {
+            name: "desk (mac)".into(),
+            icon: IconRef::Custom { path: path.into() },
+            ..pc.clone()
+        };
+        let (l, payload) = (local_vnc(vec![pc]), incoming_vnc(vec![mac]));
+
+        let p = plan(&l, &payload, &MapEnv::default());
+        let fields: Vec<_> = p.items[0].fields.iter().map(|f| f.field.as_str()).collect();
+        assert_eq!(fields, ["name"]);
+        assert_eq!(p.items[0].notes, ["Kept your icon; the custom image isn't on this machine"]);
+
+        let mut env = MapEnv::default();
+        env.icons.insert(path.into());
+        let p = plan(&l, &payload, &env);
+        let row = &p.items[0].fields[1];
+        assert_eq!(
+            (row.field.as_str(), row.local.as_str(), row.incoming.as_str()),
+            ("icon", "server", "custom image")
+        );
+        assert!(p.items[0].notes.is_empty());
     }
 }

@@ -98,6 +98,7 @@ pub struct ExportSelection {
     pub profile_ids: Vec<String>,
     pub sftp_ids: Vec<String>,
     pub s3_ids: Vec<String>,
+    pub vnc_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Type)]
@@ -123,6 +124,7 @@ pub enum ItemKind {
     Ssh,
     Sftp,
     S3,
+    Vnc,
 }
 
 impl ItemKind {
@@ -132,6 +134,7 @@ impl ItemKind {
             ItemKind::Ssh => "ssh",
             ItemKind::Sftp => "sftp",
             ItemKind::S3 => "s3",
+            ItemKind::Vnc => "vnc",
         };
         format!("{prefix}:{id}")
     }

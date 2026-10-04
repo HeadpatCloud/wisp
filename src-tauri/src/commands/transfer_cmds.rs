@@ -68,7 +68,8 @@ pub fn transfer_export(
     Ok(ExportSummary {
         profiles: (payload.profiles.len()
             + payload.sftp_profiles.len()
-            + payload.s3_profiles.len()) as u32,
+            + payload.s3_profiles.len()
+            + payload.vnc_profiles.len()) as u32,
         secrets: payload.secrets.len() as u32,
         key_files: payload.key_files.len() as u32,
         warnings,

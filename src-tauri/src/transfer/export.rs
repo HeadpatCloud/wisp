@@ -69,6 +69,7 @@ pub fn build(
 
     let sftp_ids: HashSet<&str> = sel.sftp_ids.iter().map(String::as_str).collect();
     let s3_ids: HashSet<&str> = sel.s3_ids.iter().map(String::as_str).collect();
+    let vnc_ids: HashSet<&str> = sel.vnc_ids.iter().map(String::as_str).collect();
     let mut payload = Payload {
         groups: data.groups.iter().filter(|g| group_ids.contains(g.id.as_str())).cloned().collect(),
         profiles: data
@@ -89,6 +90,12 @@ pub fn build(
             .filter(|p| s3_ids.contains(p.id.as_str()))
             .cloned()
             .collect(),
+        vnc_profiles: data
+            .vnc_profiles
+            .iter()
+            .filter(|p| vnc_ids.contains(p.id.as_str()))
+            .cloned()
+            .collect(),
         ..Default::default()
     };
 
@@ -100,6 +107,9 @@ pub fn build(
         owners.push((&p.name, p.secret_id.as_deref(), &p.keys));
     }
     for p in &payload.s3_profiles {
+        owners.push((&p.name, p.secret_id.as_deref(), &[]));
+    }
+    for p in &payload.vnc_profiles {
         owners.push((&p.name, p.secret_id.as_deref(), &[]));
     }
 
@@ -139,7 +149,7 @@ pub fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::model::{AuthMethod, Group, IconRef, Profile, ProfileKey};
+    use crate::store::model::{AuthMethod, Group, IconRef, Profile, ProfileKey, VncProfile};
     use crate::transfer::MapEnv;
 
     fn group(id: &str, parent: Option<&str>) -> Group {
@@ -186,6 +196,19 @@ mod tests {
             sftp_profiles: vec![],
             s3_profiles: vec![],
             vnc_profiles: vec![],
+        }
+    }
+
+    fn vnc(id: &str, secret: Option<&str>) -> VncProfile {
+        VncProfile {
+            id: id.into(),
+            name: id.into(),
+            host: "h".into(),
+            port: 5900,
+            username: None,
+            secret_id: secret.map(Into::into),
+            icon: IconRef::default(),
+            order: 0,
         }
     }
 
@@ -270,5 +293,39 @@ mod tests {
         let (payload, _) = build(&store(), &MapEnv::default(), &sel, &ExportOptions::default());
         assert_eq!(payload.groups.len(), 1);
         assert!(payload.profiles.is_empty());
+    }
+
+    #[test]
+    fn selected_vnc_profile_is_exported_with_its_password_only_when_asked() {
+        let mut data = store();
+        data.vnc_profiles = vec![vnc("desk", Some("vnc-pw")), vnc("lab", None)];
+        let sel = ExportSelection { vnc_ids: vec!["desk".into()], ..Default::default() };
+        let mut env = MapEnv::default();
+        env.secrets.insert("vnc-pw".into(), b"pass".to_vec());
+
+        let (plain, warnings) = build(&data, &env, &sel, &ExportOptions::default());
+        assert_eq!(plain.vnc_profiles, [data.vnc_profiles[0].clone()]);
+        assert!(plain.groups.is_empty() && plain.profiles.is_empty());
+        assert!(plain.secrets.is_empty() && warnings.is_empty());
+
+        let opts = ExportOptions { include_secrets: true, include_keys: true };
+        let (full, warnings) = build(&data, &env, &sel, &opts);
+        assert_eq!(full.vnc_profiles, plain.vnc_profiles);
+        assert_eq!(full.secrets.len(), 1);
+        assert_eq!(full.secrets.get("vnc-pw").map(|v| v.as_str()), Some("pass"));
+        assert!(full.key_files.is_empty() && warnings.is_empty());
+    }
+
+    #[test]
+    fn unreadable_vnc_password_becomes_a_warning() {
+        let mut data = store();
+        data.vnc_profiles = vec![vnc("desk", Some("vnc-pw")), vnc("lab", None)];
+        let sel =
+            ExportSelection { vnc_ids: vec!["desk".into(), "lab".into()], ..Default::default() };
+        let opts = ExportOptions { include_secrets: true, include_keys: false };
+        let (payload, warnings) = build(&data, &MapEnv::default(), &sel, &opts);
+        assert_eq!(payload.vnc_profiles.len(), 2);
+        assert!(payload.secrets.is_empty());
+        assert_eq!(warnings, ["Couldn't read a saved password for \"desk\""]);
     }
 }

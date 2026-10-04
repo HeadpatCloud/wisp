@@ -66,7 +66,7 @@ test('a save the backend refuses rejects and keeps the list', async () => {
   expect(useVncProfileStore.getState().profiles).toEqual([desk])
 })
 
-test('remove deletes the secret, then the profile, then reloads the list', async () => {
+test('remove deletes the profile, then its secret, then reloads the list', async () => {
   useVncProfileStore.setState({ profiles: [desk], loaded: true })
   const order: string[] = []
   m.deleteSecret.mockImplementation(async (id: string) => {
@@ -82,7 +82,7 @@ test('remove deletes the secret, then the profile, then reloads the list', async
     return { status: 'ok', data: [] }
   })
   await useVncProfileStore.getState().remove('vnc-1')
-  expect(order).toEqual(['secret vault-1', 'profile vnc-1', 'list'])
+  expect(order).toEqual(['profile vnc-1', 'secret vault-1', 'list'])
   expect(useVncProfileStore.getState().profiles).toEqual([])
 })
 
@@ -94,12 +94,13 @@ test.each([
       throw new Error('ipc')
     },
   ],
-])('a secret that %s does not keep the profile from being removed', async (_how, outcome) => {
+])('a secret that %s does not fail the removal', async (_how, outcome) => {
   useVncProfileStore.setState({ profiles: [desk], loaded: true })
   m.deleteSecret.mockImplementation(async () => outcome())
   await useVncProfileStore.getState().remove('vnc-1')
   expect(m.deleteSecret).toHaveBeenCalledWith('vault-1')
   expect(m.deleteVncProfile).toHaveBeenCalledWith('vnc-1')
+  expect(m.listVncProfiles).toHaveBeenCalledTimes(1)
   expect(useVncProfileStore.getState().profiles).toEqual([])
 })
 
@@ -110,13 +111,24 @@ test('removing a profile without a password touches no secret', async () => {
   expect(m.deleteVncProfile).toHaveBeenCalledWith('vnc-1')
 })
 
-test('a profile the backend cannot delete rejects', async () => {
+test.each([
+  [
+    'the backend cannot delete',
+    'io: disk full',
+    () => ({ status: 'error', error: { kind: 'io', message: 'disk full' } }),
+  ],
+  [
+    'cannot be reached',
+    'ipc',
+    () => {
+      throw new Error('ipc')
+    },
+  ],
+])('a profile that %s rejects and keeps its secret', async (_how, message, outcome) => {
   useVncProfileStore.setState({ profiles: [desk], loaded: true })
-  m.deleteVncProfile.mockResolvedValue({
-    status: 'error',
-    error: { kind: 'notFound', message: 'vnc profile vnc-1' },
-  })
-  await expect(useVncProfileStore.getState().remove('vnc-1')).rejects.toThrow(
-    'notFound: vnc profile vnc-1',
-  )
+  m.deleteVncProfile.mockImplementation(async () => outcome())
+  await expect(useVncProfileStore.getState().remove('vnc-1')).rejects.toThrow(message)
+  expect(m.deleteSecret).not.toHaveBeenCalled()
+  expect(m.listVncProfiles).not.toHaveBeenCalled()
+  expect(useVncProfileStore.getState().profiles).toEqual([desk])
 })

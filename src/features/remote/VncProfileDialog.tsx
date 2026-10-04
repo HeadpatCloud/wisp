@@ -30,6 +30,7 @@ export function VncProfileDialog({
   const [password, setPassword] = useState('')
   const [removePassword, setRemovePassword] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [saving, setSaving] = useState(false)
 
   // Filled on open and emptied on close, so a password never stays behind in the hidden dialog.
   useEffect(() => {
@@ -50,6 +51,8 @@ export function VncProfileDialog({
 
   const submit = async () => {
     setError(null)
+    // Save is disabled meanwhile: a second run would store another secret and another profile.
+    setSaving(true)
     let created: string | null = null
     try {
       if (password) created = await setSecret(password)
@@ -67,11 +70,13 @@ export function VncProfileDialog({
       // The profile still has its old password, so only the entry made for this save goes.
       if (created) await deleteSecret(created).catch(() => {})
       setError(e instanceof Error ? e.message : String(e))
+      setSaving(false)
       return
     }
     // Not before the save: a save that fails must leave the profile its password. Best effort,
     // because the profile no longer points at this entry whether or not it could be deleted.
     if (savedSecret && (created || removePassword)) await deleteSecret(savedSecret).catch(() => {})
+    setSaving(false)
     onOpenChange(false)
   }
 
@@ -146,7 +151,7 @@ export function VncProfileDialog({
           <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
             Cancel
           </Button>
-          <Button type="button" disabled={!target || !portValid} onClick={submit}>
+          <Button type="button" disabled={!target || !portValid || saving} onClick={submit}>
             Save
           </Button>
         </DialogFooter>

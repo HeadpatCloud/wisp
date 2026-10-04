@@ -289,6 +289,31 @@ test('a password the vault refuses is reported and nothing is saved', async () =
   expect(deleteSecret).not.toHaveBeenCalled()
 })
 
+test('Save does nothing more while a save is still running', async () => {
+  let finish = () => {}
+  save.mockImplementation(
+    (p: VncProfile) =>
+      new Promise<void>((resolve) => {
+        calls.push(`save ${p.secretId}`)
+        finish = resolve
+      }),
+  )
+  const onOpenChange = vi.fn()
+  render(<VncProfileDialog open onOpenChange={onOpenChange} editing={null} />)
+  fireEvent.change(field('Host'), { target: { value: 'mac' } })
+  fireEvent.change(field('Password'), { target: { value: 'hunter2' } })
+  fireEvent.click(saveButton())
+  fireEvent.click(saveButton())
+  await waitFor(() => expect(save).toHaveBeenCalled())
+  expect(saveButton()).toBeDisabled()
+  fireEvent.click(saveButton())
+
+  finish()
+  await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false))
+  expect(calls).toEqual(['setSecret', 'save vault-new'])
+  expect(saveButton()).toBeEnabled()
+})
+
 test.each<[string, (user: UserEvent) => Promise<void>]>([
   ['Save', (user) => user.click(saveButton())],
   ['Cancel', (user) => user.click(screen.getByRole('button', { name: 'Cancel' }))],

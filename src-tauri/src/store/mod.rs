@@ -182,21 +182,29 @@ impl Store {
         self.data.vnc_profiles.clone()
     }
 
+    // A copy is changed and written, and swapped in only on success. Changed in place, a write
+    // that fails would leave memory ahead of the file: the profile would then use a password the
+    // caller has already taken back, and the next save of anything would write that out.
     pub fn upsert_vnc_profile(&mut self, profile: VncProfile) -> AppResult<()> {
-        match self.data.vnc_profiles.iter_mut().find(|p| p.id == profile.id) {
+        let mut data = self.data.clone();
+        match data.vnc_profiles.iter_mut().find(|p| p.id == profile.id) {
             Some(existing) => *existing = profile,
-            None => self.data.vnc_profiles.push(profile),
+            None => data.vnc_profiles.push(profile),
         }
-        self.persist_profiles()
+        io::write_json_atomic(&self.dir.join("profiles.json"), &data)?;
+        self.data = data;
+        Ok(())
     }
 
     pub fn delete_vnc_profile(&mut self, id: &str) -> AppResult<()> {
-        let before = self.data.vnc_profiles.len();
-        self.data.vnc_profiles.retain(|p| p.id != id);
-        if self.data.vnc_profiles.len() == before {
+        let mut data = self.data.clone();
+        data.vnc_profiles.retain(|p| p.id != id);
+        if data.vnc_profiles.len() == self.data.vnc_profiles.len() {
             return Err(AppError::NotFound(format!("vnc profile {id}")));
         }
-        self.persist_profiles()
+        io::write_json_atomic(&self.dir.join("profiles.json"), &data)?;
+        self.data = data;
+        Ok(())
     }
 }
 
@@ -358,20 +366,24 @@ mod tests {
         assert!(store.sftp_profiles().is_empty());
     }
 
-    #[test]
-    fn vnc_profiles_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        let mut desk = VncProfile {
-            id: "v1".into(),
-            name: "desk".into(),
+    fn vnc(id: &str) -> VncProfile {
+        VncProfile {
+            id: id.into(),
+            name: id.into(),
             host: "h".into(),
             port: 5900,
             username: Some("faye".into()),
             secret_id: Some("vault-1".into()),
             icon: IconRef::default(),
             order: 0,
-        };
+        }
+    }
+
+    #[test]
+    fn vnc_profiles_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        let mut desk = vnc("v1");
         store.upsert_vnc_profile(desk.clone()).unwrap();
         desk.host = "changed".into();
         store.upsert_vnc_profile(desk.clone()).unwrap();
@@ -382,15 +394,56 @@ mod tests {
         assert!(matches!(store.delete_vnc_profile("v1"), Err(AppError::NotFound(_))));
     }
 
+    // A store holding one VNC profile, and the directory that stands where the temp file of a
+    // store write should be, so that every write fails until it is removed.
+    fn store_with_blocked_writes(dir: &std::path::Path) -> (Store, VncProfile, PathBuf) {
+        let mut store = Store::load(dir.to_path_buf()).unwrap();
+        let desk = vnc("v1");
+        store.upsert_vnc_profile(desk.clone()).unwrap();
+        let blocker = dir.join("profiles.json.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+        (store, desk, blocker)
+    }
+
+    #[test]
+    fn vnc_upsert_that_cannot_be_written_leaves_the_profiles_as_they_were() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, desk, blocker) = store_with_blocked_writes(dir.path());
+        let edited = VncProfile { secret_id: Some("vault-2".into()), ..desk.clone() };
+        assert!(matches!(store.upsert_vnc_profile(edited), Err(AppError::Io(_))));
+        assert!(matches!(store.upsert_vnc_profile(vnc("v2")), Err(AppError::Io(_))));
+        assert_eq!(store.vnc_profiles(), [desk.clone()]);
+
+        std::fs::remove_dir(blocker).unwrap();
+        store.upsert_group(group("g1")).unwrap();
+        assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().vnc_profiles(), [desk]);
+    }
+
+    #[test]
+    fn vnc_delete_that_cannot_be_written_keeps_the_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, desk, blocker) = store_with_blocked_writes(dir.path());
+        assert!(matches!(store.delete_vnc_profile("v1"), Err(AppError::Io(_))));
+        assert_eq!(store.vnc_profiles(), [desk.clone()]);
+
+        std::fs::remove_dir(blocker).unwrap();
+        store.upsert_group(group("g1")).unwrap();
+        assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().vnc_profiles(), [desk]);
+    }
+
     #[test]
     fn profiles_file_from_before_vnc_profiles_loads_with_none() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("profiles.json"),
-            r#"{"version":1,"groups":[],"profiles":[],"sftpProfiles":[],"s3Profiles":[]}"#,
+            r#"{"version":1,"groups":[{"id":"g1","name":"g1","parentId":null,"order":0}],
+                "profiles":[],"sftpProfiles":[],"s3Profiles":[]}"#,
         )
         .unwrap();
-        assert!(Store::load(dir.path().to_path_buf()).unwrap().vnc_profiles().is_empty());
+        let store = Store::load(dir.path().to_path_buf()).unwrap();
+        // A file that does not parse loads as an empty store, so the group shows it was read.
+        assert_eq!(store.groups(), [group("g1")]);
+        assert!(store.vnc_profiles().is_empty());
     }
 
     #[test]

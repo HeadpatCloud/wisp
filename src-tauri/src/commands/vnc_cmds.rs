@@ -42,17 +42,18 @@ type Target = (String, u16, Option<String>, Option<String>);
 
 // A saved profile is read at every connect and never copied into the tab: saving a new password
 // gives the profile another vault id, and a copy in an open or restored tab would be a dead one.
+// The store is read only for a profile, so a quick connect does not wait on its lock.
 fn resolve_target(
-    profiles: &[VncProfile],
+    saved: impl FnOnce() -> AppResult<Vec<VncProfile>>,
     profile_id: Option<&str>,
     given: Target,
 ) -> AppResult<Target> {
     let Some(id) = profile_id else { return Ok(given) };
-    let p = profiles
-        .iter()
+    let p = saved()?
+        .into_iter()
         .find(|p| p.id == id)
         .ok_or_else(|| AppError::NotFound("vnc: this profile no longer exists".into()))?;
-    Ok((p.host.clone(), p.port, p.username.clone(), p.secret_id.clone()))
+    Ok((p.host, p.port, p.username, p.secret_id))
 }
 
 #[tauri::command]
@@ -69,10 +70,12 @@ pub async fn vnc_open(
     profile_id: Option<String>,
     on_frame: Channel<FrameBytes>,
 ) -> AppResult<VncOpened> {
-    let profiles =
-        store.lock().map_err(|_| AppError::Internal("store lock poisoned".into()))?.vnc_profiles();
+    let saved = || -> AppResult<Vec<VncProfile>> {
+        let store = store.lock().map_err(|_| AppError::Internal("store lock poisoned".into()))?;
+        Ok(store.vnc_profiles())
+    };
     let (host, port, username, secret_id) =
-        resolve_target(&profiles, profile_id.as_deref(), (host, port, username, secret_id))?;
+        resolve_target(saved, profile_id.as_deref(), (host, port, username, secret_id))?;
     // The password lives in the vault; the caller only ever holds a reference to it.
     let password = match &secret_id {
         Some(id) => crate::commands::ssh_cmds::secret_string(&vault, id)?,
@@ -214,20 +217,24 @@ mod tests {
         ("shown".into(), 5900, Some("old".into()), Some("vault-old".into()))
     }
 
+    fn unreadable() -> AppResult<Vec<VncProfile>> {
+        Err(AppError::Internal("store lock poisoned".into()))
+    }
+
     #[test]
     fn a_profile_id_connects_with_what_the_profile_holds_now() {
-        let target = resolve_target(&[desk()], Some("v1"), given()).unwrap();
+        let target = resolve_target(|| Ok(vec![desk()]), Some("v1"), given()).unwrap();
         let held = ("10.0.0.5".into(), 5901, Some("faye".into()), Some("vault-new".into()));
         assert_eq!(target, held);
 
         let bare = VncProfile { username: None, secret_id: None, ..desk() };
-        let target = resolve_target(&[bare], Some("v1"), given()).unwrap();
+        let target = resolve_target(|| Ok(vec![bare]), Some("v1"), given()).unwrap();
         assert_eq!(target, ("10.0.0.5".into(), 5901, None, None));
     }
 
     #[test]
     fn a_profile_id_that_is_gone_is_not_found() {
-        let missing = resolve_target(&[desk()], Some("gone"), given());
+        let missing = resolve_target(|| Ok(vec![desk()]), Some("gone"), given());
         assert!(matches!(
             missing,
             Err(AppError::NotFound(m)) if m == "vnc: this profile no longer exists"
@@ -235,8 +242,19 @@ mod tests {
     }
 
     #[test]
+    fn a_profile_id_reports_a_store_that_cannot_be_read() {
+        let failed = resolve_target(unreadable, Some("v1"), given());
+        assert!(matches!(failed, Err(AppError::Internal(m)) if m == "store lock poisoned"));
+    }
+
+    #[test]
     fn without_a_profile_id_the_arguments_are_used() {
-        assert_eq!(resolve_target(&[desk()], None, given()).unwrap(), given());
+        assert_eq!(resolve_target(|| Ok(vec![desk()]), None, given()).unwrap(), given());
+    }
+
+    #[test]
+    fn without_a_profile_id_the_store_is_not_read() {
+        assert_eq!(resolve_target(unreadable, None, given()).unwrap(), given());
     }
 
     #[tokio::test]

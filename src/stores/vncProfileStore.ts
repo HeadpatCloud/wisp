@@ -22,9 +22,10 @@ export const useVncProfileStore = create<VncProfileState>()((set, get) => ({
   },
   remove: async (id) => {
     const target = get().profiles.find((p) => p.id === id)
-    // Best effort: a secret that's already gone must not block deleting the profile.
-    if (target?.secretId) await commands.deleteSecret(target.secretId).catch(() => {})
     unwrap(await commands.deleteVncProfile(id))
+    // Only once the profile is gone: one that could not be deleted still needs its password.
+    // Best effort, a secret left behind in the vault does no harm.
+    if (target?.secretId) await commands.deleteSecret(target.secretId).catch(() => {})
     set({ profiles: unwrap(await commands.listVncProfiles()) })
   },
 }))

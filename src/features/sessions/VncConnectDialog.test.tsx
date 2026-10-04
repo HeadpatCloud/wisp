@@ -1,8 +1,12 @@
 import { fireEvent, render, screen } from '@testing-library/react'
 import userEvent, { type UserEvent } from '@testing-library/user-event'
 import { useState } from 'react'
-import { expect, test, vi } from 'vitest'
+import { afterEach, expect, test, vi } from 'vitest'
 import { VncConnectDialog } from './VncConnectDialog'
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
 
 function Reopenable({ onConnect }: { onConnect: () => void }) {
   const [open, setOpen] = useState(true)
@@ -79,4 +83,31 @@ test.each<[string, (user: UserEvent) => Promise<void>]>([
   await user.type(screen.getByLabelText('Host'), 'pc')
   await user.click(screen.getByRole('button', { name: 'Connect' }))
   expect(onConnect).toHaveBeenLastCalledWith('pc', 5900, '', '')
+})
+
+test('the password is gone while the closed dialog is still fading out', async () => {
+  const computed = window.getComputedStyle.bind(window)
+  // An exit animation keeps the content mounted after the dialog has closed.
+  vi.stubGlobal('getComputedStyle', (el: Element, pseudo?: string) => {
+    const styles = computed(el, pseudo)
+    if (!el.getAttribute('data-slot')?.startsWith('dialog-')) return styles
+    return new Proxy(styles, {
+      get(target, prop) {
+        if (prop === 'animationName') {
+          return el.getAttribute('data-state') === 'open' ? 'enter' : 'exit'
+        }
+        const value = Reflect.get(target, prop)
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+  })
+  const user = userEvent.setup()
+  render(<Reopenable onConnect={vi.fn()} />)
+  await user.type(screen.getByLabelText('Password'), 'hunter2')
+  await user.click(screen.getByRole('button', { name: 'Cancel' }))
+  expect(document.querySelector('[data-slot="dialog-content"]')).toHaveAttribute(
+    'data-state',
+    'closed',
+  )
+  expect(screen.getByLabelText('Password')).toHaveValue('')
 })

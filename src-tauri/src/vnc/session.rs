@@ -209,7 +209,11 @@ pub async fn run(
                         } else {
                             let mut text = vec![0u8; len];
                             reader.read_exact(&mut text).await?;
-                            sink(FrameOp::Clipboard(latin1_decode(&text)));
+                            // x11vnc sends an empty text on some first connections, and the view
+                            // would write it over the local clipboard.
+                            if !text.is_empty() {
+                                sink(FrameOp::Clipboard(latin1_decode(&text)));
+                            }
                         }
                     }
                     other => {
@@ -572,6 +576,15 @@ mod tests {
         let _session = session.unwrap();
         let colours = [&[1, 0, 0, 5, 0, 2][..], &[9; 12]].concat();
         server.send([colours, vec![2], cut_text(b"after")].concat());
+        assert_eq!(next(&mut ops).await, FrameOp::Clipboard("after".into()));
+    }
+
+    #[tokio::test]
+    async fn empty_clipboard_text_is_skipped() {
+        let server = Server::start(script(Vec::new(), After::Hold)).await;
+        let (session, mut ops) = open(server.port, "hunter2").await;
+        let _session = session.unwrap();
+        server.send([cut_text(b""), cut_text(b"after")].concat());
         assert_eq!(next(&mut ops).await, FrameOp::Clipboard("after".into()));
     }
 

@@ -88,7 +88,6 @@ const QEMU: Server = Server {
     size: (720, 400),
     name: "QEMU (wisp-test-qemu)",
     colours: 2,
-    refusal: "Authentication failed\0",
     ..VNCAUTH
 };
 const ALL: [Server; 7] = [X509VNC, VNCAUTH, X509PLAIN, X11VNC, TIGHTVNC, QEMU, DEFAULT];

@@ -102,7 +102,9 @@ async fn read_reason(stream: &mut Box<dyn Stream>) -> AppResult<Option<String>> 
     if let Err(e) = stream.read_exact(&mut reason).await {
         return cut_off(e);
     }
-    let reason = String::from_utf8_lossy(&reason).into_owned();
+    // QEMU ends its reason with a NUL.
+    let reason: String =
+        String::from_utf8_lossy(&reason).chars().filter(|c| !c.is_control()).collect();
     Ok((!reason.is_empty()).then_some(reason))
 }
 
@@ -483,6 +485,28 @@ mod tests {
         let outcome = play(script, "hunter2").await;
         assert!(refusal(&outcome).contains("Too many attempts"));
         assert_eq!(outcome.sent, answered("RFB 003.008\n"));
+    }
+
+    #[tokio::test]
+    async fn v38_failure_reason_loses_its_control_characters() {
+        let mut script = challenging("RFB 003.008\n");
+        script.push(Write([&[0, 0, 0, 1][..], &reason("Authentication failed\0")].concat()));
+        let outcome = play(script, "hunter2").await;
+        assert!(refusal(&outcome).ends_with("vnc: Authentication failed"));
+        assert_eq!(outcome.sent, answered("RFB 003.008\n"));
+    }
+
+    #[tokio::test]
+    async fn a_reason_of_control_characters_only_counts_as_no_reason() {
+        let mut script = challenging("RFB 003.008\n");
+        script.push(Write([&[0, 0, 0, 1][..], &reason("\0\0")].concat()));
+        let outcome = play(script, "hunter2").await;
+        assert!(refusal(&outcome).ends_with("vnc: wrong password"));
+
+        let mut script = offering("RFB 003.008\n", &[]);
+        script.push(Write(reason("\0\0")));
+        let outcome = play(script, "hunter2").await;
+        assert!(refusal(&outcome).ends_with("vnc: the server refused the connection"));
     }
 
     #[tokio::test]

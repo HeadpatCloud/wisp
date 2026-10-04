@@ -1,4 +1,5 @@
 import { act, fireEvent, render, renderHook, screen } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import { suspendHotkeys, useHotkeys } from '@/lib/hotkeys'
 import type { RemoteDriver, RemoteSession } from '@/lib/remoteDriver'
@@ -194,6 +195,24 @@ function outsideButton() {
   const button = document.createElement('button')
   document.body.appendChild(button)
   return button
+}
+
+// An exit animation keeps a dialog's content mounted after it has closed.
+function keepClosingDialogs() {
+  const computed = window.getComputedStyle.bind(window)
+  vi.stubGlobal('getComputedStyle', (el: Element, pseudo?: string) => {
+    const styles = computed(el, pseudo)
+    if (!el.getAttribute('data-slot')?.startsWith('dialog-')) return styles
+    return new Proxy(styles, {
+      get(target, prop) {
+        if (prop === 'animationName') {
+          return el.getAttribute('data-state') === 'open' ? 'enter' : 'exit'
+        }
+        const value = Reflect.get(target, prop)
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+  })
 }
 
 function runFrames() {
@@ -440,6 +459,30 @@ test('rejecting an unknown certificate shows Certificate rejected.', async () =>
   expect(view.driver.open).toHaveBeenCalledTimes(1)
   expect(screen.getByRole('button', { name: 'Reconnect' })).toBeInTheDocument()
   expect(screen.getByRole('button', { name: 'Close tab' })).toBeInTheDocument()
+})
+
+test('Reject on the closing certificate dialog does not end the attempt that Trust started', async () => {
+  keepClosingDialogs()
+  const view = start()
+  await view.fail({
+    kind: 'hostKeyUnknown',
+    message: { host: 'vnc/h', port: 5900, fingerprint: 'SHA256:ab' },
+  })
+  await act(async () => {
+    fireEvent.click(screen.getByRole('button', { name: 'Trust' }))
+  })
+  expect(view.driver.open).toHaveBeenCalledTimes(2)
+  expect(document.querySelector('[data-slot="dialog-content"]')).toHaveAttribute(
+    'data-state',
+    'closed',
+  )
+
+  fireEvent.click(screen.getByRole('button', { name: 'Reject' }))
+
+  expect(screen.queryByText('Certificate rejected.')).toBeNull()
+  expect(screen.getByText('Connecting…')).toBeInTheDocument()
+  await view.open()
+  expect(view.canvas.parentElement).not.toHaveClass('hidden')
 })
 
 test('a changed certificate is trusted with the offered fingerprint', async () => {
@@ -1428,6 +1471,50 @@ test('Ctrl+Alt+Del sends the three keys down and up in reverse', async () => {
     ['s1', false, 0xffe9],
     ['s1', false, 0xffe3],
   ])
+})
+
+test('Ctrl+Alt+Del gives the keyboard back to the canvas', async () => {
+  const user = userEvent.setup()
+  const view = await connect()
+  displayAt(view.canvas, 0, 0, 200, 100)
+  await user.click(view.canvas)
+  await user.click(screen.getByRole('button', { name: 'Ctrl+Alt+Del' }))
+  expect(view.canvas).toHaveFocus()
+  expect(view.driver.key).toHaveBeenCalledTimes(6)
+  view.driver.key.mockClear()
+
+  await user.keyboard('a{Enter}')
+
+  expect(keys(view.driver)).toEqual([
+    [true, 0x61],
+    [false, 0x61],
+    [true, 0xff0d],
+    [false, 0xff0d],
+  ])
+})
+
+test('Fullscreen gives the keyboard back to the canvas', async () => {
+  const user = userEvent.setup()
+  const view = await connect()
+  displayAt(view.canvas, 0, 0, 200, 100)
+  await user.click(view.canvas)
+  await user.click(screen.getByRole('button', { name: 'Fullscreen' }))
+  expect(view.canvas).toHaveFocus()
+
+  await user.keyboard('a{Enter}')
+
+  expect(keys(view.driver)).toEqual([
+    [true, 0x61],
+    [false, 0x61],
+    [true, 0xff0d],
+    [false, 0xff0d],
+  ])
+  expect(requestFullscreen).toHaveBeenCalledTimes(1)
+
+  setFullscreen(view.container.firstElementChild)
+  await user.click(screen.getByRole('button', { name: 'Exit fullscreen' }))
+  expect(view.canvas).toHaveFocus()
+  expect(exitFullscreen).toHaveBeenCalledTimes(1)
 })
 
 test('Disconnect closes the session and shows Disconnected.', async () => {

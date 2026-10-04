@@ -386,6 +386,7 @@ export function RemoteDesktopView({
     if (!live) return
     for (const keysym of [0xffe3, 0xffe9, 0xffff]) driver.key(live.id, true, keysym)
     for (const keysym of [0xffff, 0xffe9, 0xffe3]) driver.key(live.id, false, keysym)
+    canvasRef.current?.focus()
   }
 
   // The closing certificate dialog would otherwise still hold focus when the overlay appears.
@@ -433,6 +434,7 @@ export function RemoteDesktopView({
                 : containerRef.current?.requestFullscreen()
               // The browser refused; there is nothing to show.
               change?.catch(() => {})
+              canvasRef.current?.focus()
             }}
             className="rounded px-2 py-1 text-xs hover:bg-muted"
           >
@@ -522,6 +524,7 @@ export function RemoteDesktopView({
           connectRef.current()
         }}
         onReject={() => {
+          if (state.status !== 'trust') return
           leaveDialog()
           setState({ status: 'failed', error: 'Certificate rejected.' })
         }}

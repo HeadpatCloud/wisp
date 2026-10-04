@@ -170,8 +170,8 @@ pub async fn run(
         writer.shutdown().await
     });
 
-    // `unacked` counts the updates the view has not acknowledged, `requested` says an update is
-    // on its way, and `full` that the next request is for the whole screen.
+    // `unacked` counts the updates and clipboard texts the view has not acknowledged, `requested`
+    // says an update is on its way, and `full` that the next request is for the whole screen.
     let (mut unacked, mut requested, mut full) = (0u32, true, false);
     let ended: AppResult<()> = async {
         loop {
@@ -209,10 +209,15 @@ pub async fn run(
                         } else {
                             let mut text = vec![0u8; len];
                             reader.read_exact(&mut text).await?;
+                            text.retain(|byte| *byte != 0);
                             // x11vnc sends an empty text on some first connections, and the view
                             // would write it over the local clipboard.
                             if !text.is_empty() {
                                 sink(FrameOp::Clipboard(latin1_decode(&text)));
+                                // Acknowledged like an update, or a server could push texts
+                                // faster than the view takes them.
+                                sink(FrameOp::Sync);
+                                unacked += 1;
                             }
                         }
                     }
@@ -533,6 +538,8 @@ mod tests {
 
         server.send(cut_text(b"hi"));
         assert_eq!(next(&mut ops).await, FrameOp::Clipboard("hi".into()));
+        assert_eq!(next(&mut ops).await, FrameOp::Sync);
+        session.ack();
         drop(server);
         assert_eq!(rest(&mut ops).await, [FrameOp::Closed(LOST.into())]);
     }
@@ -585,6 +592,15 @@ mod tests {
         let (session, mut ops) = open(server.port, "hunter2").await;
         let _session = session.unwrap();
         server.send([cut_text(b""), cut_text(b"after")].concat());
+        assert_eq!(next(&mut ops).await, FrameOp::Clipboard("after".into()));
+    }
+
+    #[tokio::test]
+    async fn nul_bytes_are_dropped_from_clipboard_text() {
+        let server = Server::start(script(Vec::new(), After::Hold)).await;
+        let (session, mut ops) = open(server.port, "hunter2").await;
+        let _session = session.unwrap();
+        server.send([cut_text(&[0, 0]), cut_text(b"af\0ter")].concat());
         assert_eq!(next(&mut ops).await, FrameOp::Clipboard("after".into()));
     }
 
@@ -691,6 +707,7 @@ mod tests {
             FrameOp::Clipboard(text) => assert_eq!(text.len(), MAX_TEXT),
             other => panic!("expected the clipboard text, got {other:?}"),
         }
+        assert_eq!(next(&mut ops).await, FrameOp::Sync);
         server.send([cut_text(&vec![b'x'; MAX_TEXT + 1]), cut_text(b"after")].concat());
         assert_eq!(next(&mut ops).await, FrameOp::Clipboard("after".into()));
     }
@@ -748,6 +765,28 @@ mod tests {
         session.ack();
         log.push(NEXT);
         assert_eq!(server.wait(|seen| seen.len() >= log.len()).await, log);
+        assert!(ops.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn clipboard_texts_pushed_without_acknowledgement_stop_after_two() {
+        let mut server = Server::start(script(Vec::new(), After::Hold)).await;
+        let (session, mut ops) = open(server.port, "hunter2").await;
+        let session = session.unwrap();
+        let mut log = setup();
+        assert_eq!(server.wait(|seen| seen.len() >= log.len()).await, log);
+        server.send((b'0'..=b'9').flat_map(|digit| cut_text(&[digit])).collect());
+        log.push(Seen::Sent);
+        for n in 0..10 {
+            if n >= 2 {
+                log.push(key(n));
+                assert_eq!(log_now(&session, &mut server, n).await, log);
+                assert!(ops.try_recv().is_err(), "text {n} was read before an acknowledgement");
+                session.ack();
+            }
+            assert_eq!(next(&mut ops).await, FrameOp::Clipboard(n.to_string()));
+            assert_eq!(next(&mut ops).await, FrameOp::Sync);
+        }
         assert!(ops.try_recv().is_err());
     }
 

@@ -334,6 +334,9 @@ impl Decoder {
         // resize does not start the count again, or alternating sizes would lift the limit.
         let mut drawn = 0;
         let mut largest = self.width as usize * self.height as usize;
+        // Cursor shapes are not on the screen and have a count of their own: the pixels of one
+        // of the largest size.
+        let mut shaped = 0;
         for _ in 0..u16::from_be_bytes([head[1], head[2]]) {
             let mut rect = [0u8; 12];
             r.read_exact(&mut rect).await?;
@@ -397,7 +400,13 @@ impl Decoder {
                         }
                     }
                 }
-                -239 => sink(cursor(r, x, y, w, h).await?),
+                -239 => {
+                    shaped += w as usize * h as usize;
+                    if shaped > MAX_CURSOR * MAX_CURSOR {
+                        return Err(invalid());
+                    }
+                    sink(cursor(r, x, y, w, h).await?);
+                }
                 other => return Err(err(format!("unsupported encoding {other}"))),
             }
         }
@@ -1099,6 +1108,25 @@ mod tests {
         let data = vec![0xFF; 1024 * 4 + 128];
         let bytes = update(&[rect(0, 0, 1024, 1, -239, &data)]);
         assert!(decode(&mut sized(4, 4), &bytes).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_update_holds_one_full_size_cursor_and_no_more() {
+        let full = rect(0, 0, 1024, 1024, -239, &vec![0xFF; 1024 * 1024 * 4 + 128 * 1024]);
+        let ops = decode(&mut sized(4, 4), &update(&[full.clone()])).await.unwrap();
+        assert_eq!(ops.len(), 1);
+
+        let (ops, result) = decode_some(&mut sized(4, 4), &update(&[full.clone(), full])).await;
+        assert!(matches!(result, Err(AppError::Internal(m)) if m.ends_with("invalid update")));
+        assert_eq!(ops.len(), 1);
+
+        // 16 cursors of 256 x 256 have the pixels of a full-size one; the next is refused unread.
+        let quarter = rect(0, 0, 256, 256, -239, &vec![0xFF; 256 * 256 * 4 + 32 * 256]);
+        let mut rects = vec![quarter; 16];
+        let ops = decode(&mut sized(4, 4), &update(&rects)).await.unwrap();
+        assert_eq!(ops.len(), 16);
+        rects.push(rect(0, 0, 1, 1, -239, &[]));
+        assert_invalid(&mut sized(4, 4), &update(&rects)).await;
     }
 
     #[tokio::test]

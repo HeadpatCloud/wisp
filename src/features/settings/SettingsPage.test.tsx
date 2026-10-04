@@ -80,6 +80,19 @@ test('Security section sets a master password via vaultChangePassword', async ()
   expect(vaultChangePassword).toHaveBeenCalledWith('sup3r-secret')
 })
 
+test('Security section offers clipboard sync for remote desktops', async () => {
+  const user = userEvent.setup()
+  render(<SettingsPage tabId="s1" />)
+  await user.click(screen.getByRole('button', { name: 'Security' }))
+  expect(
+    screen.getByText(
+      'Lets a connected VNC or RDP server read and write your clipboard. Off by default.',
+    ),
+  ).toBeInTheDocument()
+  await user.click(screen.getByLabelText('Sync clipboard with remote desktops'))
+  expect(update).toHaveBeenCalledWith({ vncClipboardSync: true })
+})
+
 test('close button calls removeTab', async () => {
   const user = userEvent.setup()
   render(<SettingsPage tabId="s1" />)

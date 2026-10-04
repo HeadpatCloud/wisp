@@ -55,7 +55,16 @@ test('keeps every connection tab and stores only vault references', () => {
       allowInvalidCert: false,
       ignoreHostname: false,
     },
-    { id: 't3', kind: 'vnc', title: 'vnc', host: 'h', port: 5900, secretId: 'vault-2' },
+    {
+      id: 't3',
+      kind: 'vnc',
+      title: 'vnc',
+      host: 'h',
+      port: 5900,
+      username: null,
+      secretId: 'vault-2',
+      profileId: null,
+    },
     {
       id: 't4',
       kind: 'sftp',
@@ -106,7 +115,16 @@ test('round-trips the real store and arms every pane for reconnect', () => {
   useSessionStore.setState({
     tabs: [
       sessionTab,
-      { id: 't2', kind: 'vnc', title: 'vnc', host: 'h', port: 5900, secretId: 'vault-2' },
+      {
+        id: 't2',
+        kind: 'vnc',
+        title: 'vnc',
+        host: 'h',
+        port: 5900,
+        username: null,
+        secretId: 'vault-2',
+        profileId: null,
+      },
     ],
     sessions: { s1: pane('s1') },
     activeTabId: 't1',
@@ -134,7 +152,9 @@ test('closing a tab drops its vault secret, but not while a duplicate holds it',
     title: 'vnc',
     host: 'h',
     port: 5900,
+    username: null,
     secretId: 'shared',
+    profileId: null,
   })
   useSessionStore.setState({ tabs: [vnc('a'), vnc('b')], sessions: {}, activeTabId: 'a' })
 
@@ -143,6 +163,67 @@ test('closing a tab drops its vault secret, but not while a duplicate holds it',
 
   useSessionStore.getState().removeTab('b')
   expect(deleteSecret).toHaveBeenCalledWith('shared')
+})
+
+test('closing a VNC tab of a saved profile leaves the profile secret alone', () => {
+  useSessionStore.setState({
+    tabs: [
+      {
+        id: 'a',
+        kind: 'vnc',
+        title: 'Office Mac',
+        host: 'h',
+        port: 5900,
+        username: 'alice',
+        secretId: 'vault-profile',
+        profileId: 'vnc-1',
+      },
+    ],
+    sessions: {},
+    activeTabId: 'a',
+  })
+  useSessionStore.getState().removeTab('a')
+  expect(deleteSecret).not.toHaveBeenCalled()
+})
+
+test('a VNC tab saved before it had a username or a profile loads without them', () => {
+  localStorage.setItem(
+    'wisp.session',
+    JSON.stringify({
+      tabs: [
+        { id: 't1', kind: 'vnc', title: 'h:5900', host: 'h', port: 5900, secretId: 'vault-1' },
+      ],
+      sessions: {},
+      activeTabId: 't1',
+    }),
+  )
+  expect(loadSnapshot()?.tabs).toEqual([
+    {
+      id: 't1',
+      kind: 'vnc',
+      title: 'h:5900',
+      host: 'h',
+      port: 5900,
+      username: null,
+      secretId: 'vault-1',
+      profileId: null,
+    },
+  ])
+})
+
+test('a VNC tab keeps its username and profile across a restart', () => {
+  const tab: Tab = {
+    id: 't1',
+    kind: 'vnc',
+    title: 'Office Mac',
+    host: 'h',
+    port: 5900,
+    username: 'alice',
+    secretId: 'vault-1',
+    profileId: 'vnc-1',
+  }
+  saveSnapshot({ tabs: [tab], sessions: {}, activeTabId: 't1' })
+  expect(loadSnapshot()?.tabs).toEqual([tab])
 })
 
 // A tab opened from a saved SFTP profile only references it by id, so closing the tab must

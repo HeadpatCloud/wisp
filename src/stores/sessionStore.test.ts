@@ -1,6 +1,6 @@
 import { beforeEach, expect, test } from 'vitest'
-import type { SessionTab } from './sessionStore'
-import { useSessionStore } from './sessionStore'
+import type { SessionTab, VncTab } from './sessionStore'
+import { tabSecretIds, useSessionStore } from './sessionStore'
 
 const session = (id: string, profileId = 'p1') => ({
   id,
@@ -26,6 +26,63 @@ test('openLocalShell adds an active local tab', () => {
   expect(st.tabs).toHaveLength(1)
   expect(st.tabs[0]).toMatchObject({ kind: 'local', title: 'Local shell' })
   expect(st.activeTabId).toBe(st.tabs[0].id)
+})
+
+test('openVnc adds an active tab titled host:port', () => {
+  useSessionStore
+    .getState()
+    .openVnc({ host: 'mac', port: 5901, username: 'alice', secretId: 'vault-1', profileId: null })
+  const st = useSessionStore.getState()
+  expect(st.tabs).toEqual([
+    {
+      id: st.tabs[0].id,
+      kind: 'vnc',
+      title: 'mac:5901',
+      host: 'mac',
+      port: 5901,
+      username: 'alice',
+      secretId: 'vault-1',
+      profileId: null,
+    },
+  ])
+  expect(st.activeTabId).toBe(st.tabs[0].id)
+})
+
+test('openVnc uses the given title', () => {
+  useSessionStore.getState().openVnc({
+    host: 'mac',
+    port: 5900,
+    username: null,
+    secretId: 'vault-1',
+    profileId: 'vnc-1',
+    title: 'Office Mac',
+  })
+  expect(useSessionStore.getState().tabs[0]).toMatchObject({
+    kind: 'vnc',
+    title: 'Office Mac',
+    username: null,
+    profileId: 'vnc-1',
+  })
+})
+
+const vncTab: VncTab = {
+  id: 'v1',
+  kind: 'vnc',
+  title: 'mac:5900',
+  host: 'mac',
+  port: 5900,
+  username: null,
+  secretId: 'vault-1',
+  profileId: null,
+}
+
+test('a quick-connect VNC tab owns its secret', () => {
+  expect(tabSecretIds(vncTab)).toEqual(['vault-1'])
+  expect(tabSecretIds({ ...vncTab, secretId: null })).toEqual([])
+})
+
+test('a VNC tab of a saved profile owns no secret', () => {
+  expect(tabSecretIds({ ...vncTab, profileId: 'vnc-1' })).toEqual([])
 })
 
 test('duplicateTab on a session opens a new session tab with the same profile', () => {

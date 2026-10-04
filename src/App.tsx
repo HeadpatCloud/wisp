@@ -74,11 +74,11 @@ function nudgeZoom(delta: number, reset = false) {
 }
 
 function VncTabView({ tab, active }: { tab: VncTab; active: boolean }) {
-  const { host, port, secretId } = tab
+  const { host, port, username, secretId } = tab
   // The view reconnects whenever it is given another driver object.
   const driver = useMemo(
-    () => vncDriver({ host, port, username: null, secretId }),
-    [host, port, secretId],
+    () => vncDriver({ host, port, username, secretId }),
+    [host, port, username, secretId],
   )
   return <RemoteDesktopView tabId={tab.id} driver={driver} active={active} />
 }
@@ -240,8 +240,14 @@ export default function App() {
       <VncConnectDialog
         open={vncDialogOpen}
         onOpenChange={setVncDialogOpen}
-        onConnect={async (host, port, password) =>
-          openVnc(host, port, password ? await setSecret(password) : null)
+        onConnect={async (host, port, username, password) =>
+          openVnc({
+            host,
+            port,
+            username: username.trim() || null,
+            secretId: password ? await setSecret(password) : null,
+            profileId: null,
+          })
         }
       />
       <FtpConnectDialog

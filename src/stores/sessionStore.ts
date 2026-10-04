@@ -54,7 +54,9 @@ export interface VncTab {
   title: string
   host: string
   port: number
+  username: string | null
   secretId: string | null
+  profileId: string | null
 }
 
 export interface SftpTab {
@@ -94,7 +96,8 @@ export type Tab = SessionTab | ViewTab | LocalTab | VncTab | SftpTab | FtpTab | 
 // Vault entries a tab owns outright, so closing it can clean them up. Secrets belonging to
 // a saved profile are excluded - the profile owns those and outlives the tab.
 export function tabSecretIds(t: Tab): string[] {
-  if (t.kind === 'ftp' || t.kind === 'vnc') return t.secretId ? [t.secretId] : []
+  if (t.kind === 'ftp') return t.secretId ? [t.secretId] : []
+  if (t.kind === 'vnc') return t.secretId && t.profileId === null ? [t.secretId] : []
   if (t.kind === 'sftp' && t.adhoc) {
     return [t.adhoc.secretId, ...t.adhoc.keys.map((k) => k.secretId)].filter(
       (id): id is string => !!id,
@@ -117,7 +120,14 @@ interface SessionState {
   openTab: (session: PaneSession) => void
   openView: (view: TabView, title: string) => void
   openLocalShell: (program?: string | null, title?: string) => void
-  openVnc: (host: string, port: number, secretId: string | null) => void
+  openVnc: (target: {
+    host: string
+    port: number
+    username: string | null
+    secretId: string | null
+    profileId: string | null
+    title?: string
+  }) => void
   openSftp: (profileId: string, title: string) => void
   openSftpProfile: (sftpProfileId: string, title: string) => void
   openSftpAdhoc: (params: SftpAdhocParams, title?: string) => void
@@ -185,14 +195,16 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
     set({ tabs: [...get().tabs, tab], activeTabId: tab.id })
   },
 
-  openVnc: (host, port, secretId) => {
+  openVnc: ({ host, port, username, secretId, profileId, title }) => {
     const tab: VncTab = {
       id: crypto.randomUUID(),
       kind: 'vnc',
-      title: `${host}:${port}`,
+      title: title ?? `${host}:${port}`,
       host,
       port,
+      username,
       secretId,
+      profileId,
     }
     set({ tabs: [...get().tabs, tab], activeTabId: tab.id })
   },

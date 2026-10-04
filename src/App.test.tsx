@@ -29,6 +29,10 @@ vi.mock('@/lib/vault', () => ({
   vaultUnlock: vi.fn().mockResolvedValue(undefined),
 }))
 vi.mock('@/lib/theme', () => ({ watchSystemTheme: vi.fn().mockReturnValue(() => undefined) }))
+vi.mock('@/lib/vnc', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/vnc')>()
+  return { vncDriver: vi.fn(actual.vncDriver) }
+})
 vi.mock('@/stores/profileStore', () => ({
   useProfileStore: vi.fn(
     (sel: (s: { load: () => Promise<void>; profiles: unknown[] }) => unknown) =>
@@ -42,7 +46,11 @@ vi.mock('@/stores/settingsStore', () => ({
   ),
 }))
 vi.mock('@/features/profiles/ProfileTree', () => ({
-  ProfileTree: () => <div data-testid="profile-tree" />,
+  ProfileTree: ({ onNewVnc }: { onNewVnc: () => void }) => (
+    <button type="button" data-testid="profile-tree" onClick={onNewVnc}>
+      New VNC
+    </button>
+  ),
 }))
 vi.mock('@/features/sessions/TabBar', () => ({
   TabBar: () => <div data-testid="tab-bar" />,
@@ -63,6 +71,8 @@ vi.mock('@/features/welcome/WelcomePage', () => ({
   WelcomePage: () => <div data-testid="welcome-page" />,
 }))
 
+import { setSecret } from '@/lib/vault'
+import { vncDriver } from '@/lib/vnc'
 import { useSessionStore } from '@/stores/sessionStore'
 import App from './App'
 
@@ -194,7 +204,9 @@ const vncTab = {
   title: 'h:5900',
   host: 'h',
   port: 5900,
+  username: null,
   secretId: 's1',
+  profileId: null,
 }
 
 test('a VNC tab renders the remote view in its pane and tells it when it is active', () => {
@@ -213,16 +225,36 @@ test('a VNC tab renders the remote view in its pane and tells it when it is acti
 })
 
 test('re-rendering the app keeps the driver of a VNC tab', () => {
-  useSessionStore.setState({ tabs: [vncTab], activeTabId: 'tab-vnc' })
+  const tab = { ...vncTab, username: 'alice' }
+  useSessionStore.setState({ tabs: [tab], activeTabId: 'tab-vnc' })
   const { rerender } = render(<App />)
   const { driver } = remote.props[0]
   expect(typeof (driver as { open: unknown }).open).toBe('function')
   rerender(<App />)
   act(() => {
-    useSessionStore.setState({ tabs: [vncTab, tab1], activeTabId: 'tab-1' })
+    useSessionStore.setState({ tabs: [{ ...tab }, tab1], activeTabId: 'tab-1' })
   })
   expect(remote.props.length).toBeGreaterThan(1)
   for (const props of remote.props) expect(props.driver).toBe(driver)
+  expect(vi.mocked(vncDriver).mock.calls).toEqual([
+    [{ host: 'h', port: 5900, username: 'alice', secretId: 's1' }],
+  ])
+})
+
+test('a VNC tab whose username changed gets a new driver', () => {
+  useSessionStore.setState({ tabs: [vncTab], activeTabId: 'tab-vnc' })
+  render(<App />)
+  const { driver } = remote.props[0]
+  act(() => {
+    useSessionStore.setState({ tabs: [{ ...vncTab, username: 'alice' }] })
+  })
+  expect(remote.props.at(-1)?.driver).not.toBe(driver)
+  expect(vncDriver).toHaveBeenLastCalledWith({
+    host: 'h',
+    port: 5900,
+    username: 'alice',
+    secretId: 's1',
+  })
 })
 
 test('a VNC tab for another target gets a driver of its own', () => {
@@ -234,4 +266,42 @@ test('a VNC tab for another target gets a driver of its own', () => {
   expect(first?.driver).toBeDefined()
   expect(second?.driver).toBeDefined()
   expect(second?.driver).not.toBe(first?.driver)
+})
+
+async function connectVnc(username: string, password: string) {
+  useSessionStore.setState({ tabs: [], sessions: {}, activeTabId: null })
+  render(<App />)
+  fireEvent.click(screen.getByRole('button', { name: 'New VNC' }))
+  fireEvent.change(screen.getByLabelText('Host'), { target: { value: 'mac' } })
+  fireEvent.change(screen.getByLabelText('Username (optional)'), { target: { value: username } })
+  fireEvent.change(screen.getByLabelText('Password'), { target: { value: password } })
+  await act(async () => {
+    fireEvent.click(screen.getByRole('button', { name: 'Connect' }))
+  })
+  return useSessionStore.getState().tabs
+}
+
+test('the VNC dialog opens a quick-connect tab with the username and the stored password', async () => {
+  const tabs = await connectVnc(' alice ', 'hunter2')
+  expect(setSecret).toHaveBeenCalledWith('hunter2')
+  expect(tabs).toEqual([
+    {
+      id: tabs[0].id,
+      kind: 'vnc',
+      title: 'mac:5900',
+      host: 'mac',
+      port: 5900,
+      username: 'alice',
+      secretId: 'vault-id',
+      profileId: null,
+    },
+  ])
+  expect(screen.getByTestId(`tabpane-${tabs[0].id}`)).toBeInTheDocument()
+})
+
+test.each(['', '   '])('the VNC dialog opens a tab without a username for "%s"', async (typed) => {
+  const tabs = await connectVnc(typed, '')
+  expect(setSecret).not.toHaveBeenCalled()
+  expect(tabs).toHaveLength(1)
+  expect(tabs[0]).toMatchObject({ kind: 'vnc', username: null, secretId: null, profileId: null })
 })

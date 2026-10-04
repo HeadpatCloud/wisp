@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -17,11 +17,21 @@ export function VncConnectDialog({
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
-  onConnect: (host: string, port: number, password: string) => void
+  onConnect: (host: string, port: number, username: string, password: string) => void
 }) {
   const [host, setHost] = useState('')
   const [port, setPort] = useState(5900)
+  const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+
+  // Cleared on close, so a password never stays behind in the hidden dialog.
+  useEffect(() => {
+    if (open) return
+    setHost('')
+    setPort(5900)
+    setUsername('')
+    setPassword('')
+  }, [open])
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -44,6 +54,17 @@ export function VncConnectDialog({
             />
           </div>
           <div className="space-y-1">
+            <Label htmlFor="vnc-username">Username (optional)</Label>
+            <Input
+              id="vnc-username"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+            />
+            <p className="text-muted-foreground text-xs">
+              Only for macOS Screen Sharing and servers that ask for one.
+            </p>
+          </div>
+          <div className="space-y-1">
             <Label htmlFor="vnc-password">Password</Label>
             <Input
               id="vnc-password"
@@ -61,7 +82,7 @@ export function VncConnectDialog({
             type="button"
             disabled={!host}
             onClick={() => {
-              onConnect(host, port, password)
+              onConnect(host, port, username, password)
               onOpenChange(false)
             }}
           >

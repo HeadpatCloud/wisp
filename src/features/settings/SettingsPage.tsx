@@ -429,10 +429,10 @@ export function SettingsPage({ tabId }: { tabId: string }) {
                     checked={settings.vncClipboardSync}
                     onChange={(e) => update({ vncClipboardSync: e.target.checked })}
                   />
-                  Sync clipboard from VNC servers
+                  Sync clipboard with remote desktops
                 </label>
                 <p className="mt-1 text-muted-foreground text-xs">
-                  Lets a connected VNC server write to your local clipboard. Off by default.
+                  Lets a connected VNC or RDP server read and write your clipboard. Off by default.
                 </p>
               </div>
             </div>

@@ -109,7 +109,8 @@ impl Session {
     }
 
     pub async fn clipboard(&self, text: &str) -> AppResult<()> {
-        let text = latin1_encode(text);
+        // RFC 6143 7.5.6: a line ends with a line feed alone.
+        let text = latin1_encode(&text.replace("\r\n", "\n"));
         // Servers drop a client that sends more, so a longer text is not synced.
         if text.len() > MAX_TEXT {
             return Ok(());
@@ -555,6 +556,16 @@ mod tests {
         assert_eq!(log, [setup(), vec![text]].concat());
         server.send(cut_text(&[0xE9]));
         assert_eq!(next(&mut ops).await, FrameOp::Clipboard("é".into()));
+    }
+
+    #[tokio::test]
+    async fn crlf_in_clipboard_text_is_sent_as_a_line_feed() {
+        let mut server = Server::start(script(Vec::new(), After::Hold)).await;
+        let (session, _ops) = open(server.port, "hunter2").await;
+        let session = session.unwrap();
+        session.clipboard("a\r\nb\r\n").await.unwrap();
+        let log = server.wait(|log| log.len() >= 4).await;
+        assert_eq!(log, [setup(), vec![Seen::CutText(b"a\nb\n".to_vec())]].concat());
     }
 
     #[tokio::test]

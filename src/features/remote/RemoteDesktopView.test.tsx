@@ -496,6 +496,18 @@ test.each([
   expect(view.driver.close).not.toHaveBeenCalled()
 })
 
+test('a long error or reason wraps and scrolls inside the overlay', async () => {
+  const long = 'x'.repeat(5000)
+  const view = start()
+  await view.fail({ kind: 'io', message: long })
+  expect(screen.getByText(long)).toHaveClass('break-words', 'max-h-40', 'overflow-y-auto')
+
+  fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }))
+  await view.open()
+  await view.emit({ kind: 'closed', reason: long })
+  expect(screen.getByText(long)).toHaveClass('break-words', 'max-h-40', 'overflow-y-auto')
+})
+
 test('a canvas without a 2d context fails without connecting', () => {
   vi.mocked(HTMLCanvasElement.prototype.getContext).mockReturnValue(null)
   const view = start()

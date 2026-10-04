@@ -475,7 +475,7 @@ export function RemoteDesktopView({
             <>
               <p
                 className={cn(
-                  'max-w-xs text-center',
+                  'max-h-40 max-w-xs overflow-y-auto break-words text-center',
                   state.status === 'failed' ? 'text-destructive' : 'text-muted-foreground',
                 )}
               >

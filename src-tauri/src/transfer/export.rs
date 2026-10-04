@@ -196,6 +196,7 @@ mod tests {
             sftp_profiles: vec![],
             s3_profiles: vec![],
             vnc_profiles: vec![],
+            unknown: Default::default(),
         }
     }
 

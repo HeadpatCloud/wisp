@@ -249,6 +249,11 @@ pub struct ProfileStore {
     pub s3_profiles: Vec<S3Profile>,
     #[serde(default)]
     pub vnc_profiles: Vec<VncProfile>,
+    // What a later version keeps in the file. It is written back as it was read: left out, the
+    // first save by this version would delete it.
+    #[serde(flatten)]
+    #[specta(skip)]
+    pub unknown: serde_json::Map<String, serde_json::Value>,
 }
 
 impl ProfileStore {

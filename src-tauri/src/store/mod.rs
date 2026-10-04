@@ -446,6 +446,41 @@ mod tests {
         assert!(store.vnc_profiles().is_empty());
     }
 
+    // What a later build that knows more kinds of profile leaves in the file.
+    #[test]
+    fn sections_this_build_does_not_know_survive_a_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let rdp = serde_json::json!([{
+            "id": "r1", "name": "büro", "host": "10.0.0.9", "port": 3389, "gateway": null,
+            "scale": 1.5, "icon": { "kind": "builtin", "name": "server" }, "order": 0
+        }]);
+        let file = serde_json::json!({
+            "version": 1, "groups": [], "profiles": [], "vncProfiles": [vnc("v1")],
+            "rdpProfiles": rdp, "syncedAt": 1759622400
+        });
+        std::fs::write(&path, file.to_string()).unwrap();
+        let saved = || -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
+        };
+
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        store.upsert_vnc_profile(VncProfile { name: "renamed".into(), ..vnc("v1") }).unwrap();
+        assert_eq!(saved()["vncProfiles"][0]["name"], "renamed");
+        assert_eq!(saved()["rdpProfiles"].to_string(), rdp.to_string());
+        assert_eq!(saved()["syncedAt"], 1759622400);
+
+        // Every other save writes the same data: the plain ones, an import, and a later start.
+        store.upsert_group(group("g1")).unwrap();
+        assert_eq!(saved()["rdpProfiles"].to_string(), rdp.to_string());
+        store.commit(store.snapshot()).unwrap();
+        assert_eq!(saved()["rdpProfiles"].to_string(), rdp.to_string());
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        store.delete_vnc_profile("v1").unwrap();
+        assert_eq!(saved()["rdpProfiles"].to_string(), rdp.to_string());
+        assert_eq!(saved()["groups"][0]["id"], "g1");
+    }
+
     #[test]
     fn delete_missing_is_not_found() {
         let dir = tempfile::tempdir().unwrap();

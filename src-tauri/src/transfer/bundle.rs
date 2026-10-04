@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -121,6 +122,15 @@ fn checked(payload: Payload) -> AppResult<Opened> {
     }
 }
 
+// A key this build does not write holds a kind of profile it would leave out without a word.
+fn known_keys<'a>(keys: impl IntoIterator<Item = &'a String>) -> AppResult<()> {
+    let known = serde_json::to_value(Payload::default())?;
+    if keys.into_iter().all(|key| known.get(key).is_some()) {
+        return Ok(());
+    }
+    Err(AppError::Import("this file was made by a newer version of Wisp".into()))
+}
+
 pub fn load(path: &str) -> AppResult<Zeroizing<Vec<u8>>> {
     let io = |e: std::io::Error| AppError::Io(format!("{path}: {e}"));
     if std::fs::metadata(path).map_err(io)?.len() > MAX_FILE_BYTES {
@@ -136,6 +146,9 @@ pub fn read(bytes: &[u8], password: Option<&str>) -> AppResult<Opened> {
             checked(serde_json::from_value(value)?)
         }
         Some(2) => {
+            if let Some(serde_json::Value::Object(payload)) = value.get("payload") {
+                known_keys(payload.keys())?;
+            }
             let envelope: Envelope = serde_json::from_value(value)?;
             if !envelope.encrypted {
                 return checked(envelope.payload.ok_or_else(corrupt)?);
@@ -155,6 +168,9 @@ pub fn read(bytes: &[u8], password: Option<&str>) -> AppResult<Opened> {
             let key = crypto::derive_key(password.as_bytes(), &salt, Some(params.tuple()))?;
             let plain =
                 crypto::open(&key, &nonce, &ciphertext).map_err(|_| AppError::WrongPassphrase)?;
+            // Only the keys are read here, so that no secret is copied out of `plain`.
+            let keys: BTreeMap<String, IgnoredAny> = serde_json::from_slice(&plain)?;
+            known_keys(keys.keys())?;
             checked(serde_json::from_slice(&plain)?)
         }
         Some(1) | None => Err(AppError::Import("this isn't a wisp export file".into())),
@@ -366,6 +382,35 @@ mod tests {
             };
             assert_eq!(p.profiles.len(), 1);
             assert!(p.vnc_profiles.is_empty());
+        }
+    }
+
+    #[test]
+    fn version_two_files_with_a_kind_this_build_does_not_know_are_refused() {
+        let newer = serde_json::json!({
+            "groups": [], "profiles": [profile("p1")], "sftpProfiles": [], "s3Profiles": [],
+            "vncProfiles": [vnc("v1")], "rdpProfiles": [{ "id": "r1" }], "secrets": {},
+            "keyFiles": {}
+        });
+        let kdf = KdfParams { m_cost: 8, t_cost: 1, p_cost: 1 };
+        let salt = crypto::random_bytes::<16>().unwrap();
+        let key = crypto::derive_key(b"pw", &salt, Some(kdf.tuple())).unwrap();
+        let (nonce, ciphertext) = crypto::seal(&key, newer.to_string().as_bytes()).unwrap();
+        let sealed = serde_json::json!({
+            "version": 2, "encrypted": true, "kdf": kdf, "salt": STANDARD.encode(salt),
+            "nonce": STANDARD.encode(nonce), "ciphertext": STANDARD.encode(ciphertext)
+        });
+        let plain = serde_json::json!({ "version": 2, "encrypted": false, "payload": newer });
+        assert!(matches!(
+            read(sealed.to_string().as_bytes(), None).unwrap(),
+            Opened::NeedsPassword
+        ));
+        for (file, password) in [(plain, None), (sealed, Some("pw"))] {
+            assert!(matches!(
+                read(file.to_string().as_bytes(), password),
+                Err(AppError::Import(told))
+                    if told == "this file was made by a newer version of Wisp"
+            ));
         }
     }
 

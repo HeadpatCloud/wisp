@@ -33,15 +33,17 @@ export function VncProfileDialog({
   const [saving, setSaving] = useState(false)
 
   // Filled on open and emptied on close, so a password never stays behind in the hidden dialog.
+  // The other fields keep their text on close, so the dialog does not look wiped while it fades
+  // out.
   useEffect(() => {
-    const shown = open ? editing : null
-    setName(shown?.name ?? '')
-    setHost(shown?.host ?? '')
-    setPort(String(shown?.port ?? 5900))
-    setUsername(shown?.username ?? '')
     setPassword('')
     setRemovePassword(false)
     setError(null)
+    if (!open) return
+    setName(editing?.name ?? '')
+    setHost(editing?.host ?? '')
+    setPort(String(editing?.port ?? 5900))
+    setUsername(editing?.username ?? '')
   }, [open, editing])
 
   const target = host.trim()

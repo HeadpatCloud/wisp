@@ -20,6 +20,24 @@ function Reopenable({ onConnect }: { onConnect: () => void }) {
   )
 }
 
+// An exit animation keeps the content mounted after the dialog has closed.
+function keepClosingDialog() {
+  const computed = window.getComputedStyle.bind(window)
+  vi.stubGlobal('getComputedStyle', (el: Element, pseudo?: string) => {
+    const styles = computed(el, pseudo)
+    if (!el.getAttribute('data-slot')?.startsWith('dialog-')) return styles
+    return new Proxy(styles, {
+      get(target, prop) {
+        if (prop === 'animationName') {
+          return el.getAttribute('data-state') === 'open' ? 'enter' : 'exit'
+        }
+        const value = Reflect.get(target, prop)
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+  })
+}
+
 test('Connect passes the host, port, username and password', async () => {
   const onConnect = vi.fn()
   const user = userEvent.setup()
@@ -104,21 +122,7 @@ test.each<[string, (user: UserEvent) => Promise<void>]>([
 })
 
 test('the password is gone while the closed dialog is still fading out', async () => {
-  const computed = window.getComputedStyle.bind(window)
-  // An exit animation keeps the content mounted after the dialog has closed.
-  vi.stubGlobal('getComputedStyle', (el: Element, pseudo?: string) => {
-    const styles = computed(el, pseudo)
-    if (!el.getAttribute('data-slot')?.startsWith('dialog-')) return styles
-    return new Proxy(styles, {
-      get(target, prop) {
-        if (prop === 'animationName') {
-          return el.getAttribute('data-state') === 'open' ? 'enter' : 'exit'
-        }
-        const value = Reflect.get(target, prop)
-        return typeof value === 'function' ? value.bind(target) : value
-      },
-    })
-  })
+  keepClosingDialog()
   const user = userEvent.setup()
   render(<Reopenable onConnect={vi.fn()} />)
   await user.type(screen.getByLabelText('Password'), 'hunter2')
@@ -127,5 +131,30 @@ test('the password is gone while the closed dialog is still fading out', async (
     'data-state',
     'closed',
   )
+  expect(screen.getByLabelText('Password')).toHaveValue('')
+})
+
+test('the other fields stay as typed while the closed dialog is still fading out', async () => {
+  keepClosingDialog()
+  const user = userEvent.setup()
+  render(<Reopenable onConnect={vi.fn()} />)
+  await user.type(screen.getByLabelText('Host'), 'mac')
+  fireEvent.change(screen.getByLabelText('Port'), { target: { value: '5901' } })
+  await user.type(screen.getByLabelText('Username (optional)'), 'alice')
+  await user.type(screen.getByLabelText('Password'), 'hunter2')
+  await user.click(screen.getByRole('button', { name: 'Connect' }))
+  expect(document.querySelector('[data-slot="dialog-content"]')).toHaveAttribute(
+    'data-state',
+    'closed',
+  )
+  expect(screen.getByLabelText('Host')).toHaveValue('mac')
+  expect(screen.getByLabelText('Port')).toHaveValue(5901)
+  expect(screen.getByLabelText('Username (optional)')).toHaveValue('alice')
+  expect(screen.getByLabelText('Password')).toHaveValue('')
+
+  fireEvent.click(screen.getByRole('button', { name: 'Reopen', hidden: true }))
+  expect(screen.getByLabelText('Host')).toHaveValue('')
+  expect(screen.getByLabelText('Port')).toHaveValue(5900)
+  expect(screen.getByLabelText('Username (optional)')).toHaveValue('')
   expect(screen.getByLabelText('Password')).toHaveValue('')
 })

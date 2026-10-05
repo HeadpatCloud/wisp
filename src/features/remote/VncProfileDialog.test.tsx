@@ -72,6 +72,24 @@ function Reopenable({ editing }: { editing: VncProfile | null }) {
   )
 }
 
+// An exit animation keeps the content mounted after the dialog has closed.
+function keepClosingDialog() {
+  const computed = window.getComputedStyle.bind(window)
+  vi.stubGlobal('getComputedStyle', (el: Element, pseudo?: string) => {
+    const styles = computed(el, pseudo)
+    if (!el.getAttribute('data-slot')?.startsWith('dialog-')) return styles
+    return new Proxy(styles, {
+      get(target, prop) {
+        if (prop === 'animationName') {
+          return el.getAttribute('data-state') === 'open' ? 'enter' : 'exit'
+        }
+        const value = Reflect.get(target, prop)
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+  })
+}
+
 test('creating stores the password in the vault and saves the profile', async () => {
   const onOpenChange = vi.fn()
   const user = userEvent.setup()
@@ -379,21 +397,7 @@ test('an error is gone when the dialog is opened again', async () => {
 })
 
 test('the password is gone while the closed dialog is still fading out', async () => {
-  const computed = window.getComputedStyle.bind(window)
-  // An exit animation keeps the content mounted after the dialog has closed.
-  vi.stubGlobal('getComputedStyle', (el: Element, pseudo?: string) => {
-    const styles = computed(el, pseudo)
-    if (!el.getAttribute('data-slot')?.startsWith('dialog-')) return styles
-    return new Proxy(styles, {
-      get(target, prop) {
-        if (prop === 'animationName') {
-          return el.getAttribute('data-state') === 'open' ? 'enter' : 'exit'
-        }
-        const value = Reflect.get(target, prop)
-        return typeof value === 'function' ? value.bind(target) : value
-      },
-    })
-  })
+  keepClosingDialog()
   const user = userEvent.setup()
   render(<Reopenable editing={desk} />)
   await user.type(field('Password'), 'hunter2')
@@ -403,5 +407,43 @@ test('the password is gone while the closed dialog is still fading out', async (
     'closed',
   )
   expect(field('Password')).toHaveValue('')
+
+  fireEvent.click(screen.getByRole('button', { name: 'New profile', hidden: true }))
   expect(field('Host')).toHaveValue('')
+})
+
+test('the other fields stay as typed while the closed dialog is still fading out', async () => {
+  keepClosingDialog()
+  save.mockRejectedValueOnce(new Error('io: disk full'))
+  const user = userEvent.setup()
+  render(<Reopenable editing={desk} />)
+  await user.clear(field('Name'))
+  await user.type(field('Name'), 'Office Mac')
+  await user.clear(field('Host'))
+  await user.type(field('Host'), 'mac')
+  fireEvent.change(field('Port'), { target: { value: '5902' } })
+  await user.clear(field('Username (optional)'))
+  await user.type(field('Username (optional)'), 'alice')
+  await user.click(saveButton())
+  expect(await screen.findByText('io: disk full')).toBeInTheDocument()
+  await user.type(field('Password'), 'hunter2')
+  await user.click(field('Remove saved password'))
+  await user.click(screen.getByRole('button', { name: 'Cancel' }))
+  expect(document.querySelector('[data-slot="dialog-content"]')).toHaveAttribute(
+    'data-state',
+    'closed',
+  )
+  expect(field('Name')).toHaveValue('Office Mac')
+  expect(field('Host')).toHaveValue('mac')
+  expect(field('Port')).toHaveValue(5902)
+  expect(field('Username (optional)')).toHaveValue('alice')
+  expect(field('Password')).toHaveValue('')
+  expect(field('Remove saved password')).not.toBeChecked()
+  expect(screen.queryByText('io: disk full')).not.toBeInTheDocument()
+
+  fireEvent.click(screen.getByRole('button', { name: 'Edit desk', hidden: true }))
+  expect(field('Name')).toHaveValue('desk')
+  expect(field('Host')).toHaveValue('10.0.0.5')
+  expect(field('Port')).toHaveValue(5901)
+  expect(field('Username (optional)')).toHaveValue('faye')
 })

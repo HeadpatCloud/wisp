@@ -24,13 +24,16 @@ export function VncConnectDialog({
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
 
-  // Cleared on close, so a password never stays behind in the hidden dialog.
+  // Cleared on close, so a password never stays behind in the hidden dialog. The other fields
+  // are reset on open, so the dialog does not look wiped while it fades out.
   useEffect(() => {
-    if (open) return
+    if (!open) {
+      setPassword('')
+      return
+    }
     setHost('')
     setPort('5900')
     setUsername('')
-    setPassword('')
   }, [open])
 
   const portNumber = Number(port)

@@ -118,6 +118,7 @@ export function vncDriver(target: {
         // The error object itself, so that the view can tell a certificate prompt by its kind.
         // It shows a message as it is, so the backend's own prefix is taken off.
         if (
+          typeof error === 'object' &&
           'message' in error &&
           typeof error.message === 'string' &&
           error.message.startsWith('vnc: ')

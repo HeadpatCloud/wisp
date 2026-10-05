@@ -1,4 +1,5 @@
 import { getCurrentWindow } from '@tauri-apps/api/window'
+import { message } from '@tauri-apps/plugin-dialog'
 import { Settings } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
@@ -254,15 +255,18 @@ export default function App() {
       <VncConnectDialog
         open={vncDialogOpen}
         onOpenChange={setVncDialogOpen}
-        onConnect={async (host, port, username, password) =>
-          openVnc({
-            host,
-            port,
-            username: username.trim() || null,
-            secretId: password ? await setSecret(password) : null,
-            profileId: null,
-          })
-        }
+        onConnect={async (host, port, username, password) => {
+          let secretId: string | null = null
+          if (password) {
+            try {
+              secretId = await setSecret(password)
+            } catch (e) {
+              await message(String(e), { title: 'Could not store the password', kind: 'error' })
+              return
+            }
+          }
+          openVnc({ host, port, username: username.trim() || null, secretId, profileId: null })
+        }}
       />
       <FtpConnectDialog
         open={ftpDialogOpen}

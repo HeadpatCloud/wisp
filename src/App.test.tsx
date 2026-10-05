@@ -20,6 +20,12 @@ vi.mock('@/bindings', () => ({
     sshStatus: { listen: vi.fn().mockResolvedValue(() => undefined) },
   },
 }))
+vi.mock('@tauri-apps/plugin-dialog', () => ({
+  confirm: vi.fn(),
+  message: vi.fn(),
+  open: vi.fn(),
+  save: vi.fn(),
+}))
 vi.mock('@/lib/ssh', () => ({
   connectSession: vi.fn().mockResolvedValue('sid'),
   disconnectSession: vi.fn().mockResolvedValue(undefined),
@@ -97,6 +103,7 @@ vi.mock('@/features/welcome/WelcomePage', () => ({
   WelcomePage: () => <div data-testid="welcome-page" />,
 }))
 
+import { message } from '@tauri-apps/plugin-dialog'
 import { deleteSecret, setSecret } from '@/lib/vault'
 import { vncDriver } from '@/lib/vnc'
 import { tabSecretIds, useSessionStore } from '@/stores/sessionStore'
@@ -353,6 +360,16 @@ test.each(['', '   '])('the VNC dialog opens a tab without a username for "%s"',
   expect(setSecret).not.toHaveBeenCalled()
   expect(tabs).toHaveLength(1)
   expect(tabs[0]).toMatchObject({ kind: 'vnc', username: null, secretId: null, profileId: null })
+})
+
+test('a VNC password that cannot be stored opens no tab and is reported', async () => {
+  vi.mocked(setSecret).mockRejectedValueOnce(new Error('io: disk full'))
+  const tabs = await connectVnc('', 'hunter2')
+  expect(tabs).toEqual([])
+  expect(vi.mocked(message).mock.calls).toEqual([
+    ['Error: io: disk full', { title: 'Could not store the password', kind: 'error' }],
+  ])
+  expect(screen.queryByLabelText('Password')).not.toBeInTheDocument()
 })
 
 test('closing a quick-connect VNC tab deletes its password', async () => {

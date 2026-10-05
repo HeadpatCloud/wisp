@@ -20,7 +20,7 @@ export function VncConnectDialog({
   onConnect: (host: string, port: number, username: string, password: string) => void
 }) {
   const [host, setHost] = useState('')
-  const [port, setPort] = useState(5900)
+  const [port, setPort] = useState('5900')
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
 
@@ -28,10 +28,13 @@ export function VncConnectDialog({
   useEffect(() => {
     if (open) return
     setHost('')
-    setPort(5900)
+    setPort('5900')
     setUsername('')
     setPassword('')
   }, [open])
+
+  const portNumber = Number(port)
+  const portValid = Number.isInteger(portNumber) && portNumber >= 1 && portNumber <= 65535
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -50,7 +53,7 @@ export function VncConnectDialog({
               id="vnc-port"
               type="number"
               value={port}
-              onChange={(e) => setPort(Number(e.target.value) || 5900)}
+              onChange={(e) => setPort(e.target.value)}
             />
           </div>
           <div className="space-y-1">
@@ -80,9 +83,9 @@ export function VncConnectDialog({
           </Button>
           <Button
             type="button"
-            disabled={!host}
+            disabled={!host || !portValid}
             onClick={() => {
-              onConnect(host, port, username, password)
+              onConnect(host, portNumber, username, password)
               onOpenChange(false)
             }}
           >

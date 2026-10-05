@@ -49,6 +49,24 @@ test('Connect is disabled until a host is entered', () => {
   expect(screen.getByRole('button', { name: 'Connect' })).toBeDisabled()
 })
 
+test('Connect needs a port from 1 to 65535', () => {
+  const onConnect = vi.fn()
+  render(<VncConnectDialog open onOpenChange={vi.fn()} onConnect={onConnect} />)
+  const connect = screen.getByRole('button', { name: 'Connect' })
+  fireEvent.change(screen.getByLabelText('Host'), { target: { value: 'mac' } })
+  expect(connect).toBeEnabled()
+  for (const port of ['', '0', '65536', '70000', '-1', '5900.5']) {
+    fireEvent.change(screen.getByLabelText('Port'), { target: { value: port } })
+    expect(connect, port).toBeDisabled()
+  }
+  for (const port of ['1', '65535']) {
+    fireEvent.change(screen.getByLabelText('Port'), { target: { value: port } })
+    expect(connect, port).toBeEnabled()
+  }
+  fireEvent.click(connect)
+  expect(onConnect).toHaveBeenCalledWith('mac', 65535, '', '')
+})
+
 test.each<[string, (user: UserEvent) => Promise<void>]>([
   ['Connect', (user) => user.click(screen.getByRole('button', { name: 'Connect' }))],
   ['Cancel', (user) => user.click(screen.getByRole('button', { name: 'Cancel' }))],

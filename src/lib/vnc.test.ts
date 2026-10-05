@@ -180,6 +180,11 @@ test('a failed open rejects with every other error object as it is', async () =>
   }
 })
 
+test('a failed open rejects with a string error as it is', async () => {
+  const error = 'invalid args `port` for command `vnc_open`: integer `70000`, expected u16'
+  expect(await rejection(error)).toBe(error)
+})
+
 test('an undecodable message closes the session, then is reported, once', async () => {
   const order: string[] = []
   m.vncClose.mockImplementation(async () => {

@@ -473,7 +473,7 @@ export function RemoteDesktopView({
             releaseButtons(driver, live)
             live.keyboard.releaseAll()
           }}
-          className="max-h-full max-w-full touch-none object-contain outline-none"
+          className="h-full w-full touch-none object-contain outline-none"
         />
       </div>
       {state.status !== 'connected' && (

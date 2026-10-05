@@ -895,6 +895,33 @@ test('a taller box than the picture is mapped through its letterbox too', async 
   ])
 })
 
+test('a box larger than the picture is mapped back to framebuffer pixels', async () => {
+  const view = await connect()
+  await view.emit({ kind: 'resize', w: 640, h: 400 })
+  displayAt(view.canvas, 0, 0, 1280, 1000)
+  fireEvent.pointerDown(view.canvas, { clientX: 640, clientY: 500, buttons: 1, pointerId: 1 })
+  fireEvent.pointerUp(view.canvas, { clientX: 640, clientY: 50, buttons: 0, pointerId: 1 })
+  fireEvent.pointerDown(view.canvas, { clientX: 1279.9, clientY: 899.9, buttons: 1, pointerId: 1 })
+  fireEvent.pointerUp(view.canvas, { clientX: 0, clientY: 950, buttons: 0, pointerId: 1 })
+  fireEvent.pointerDown(view.canvas, { clientX: 3, clientY: 100, buttons: 1, pointerId: 1 })
+
+  expect(points(view.driver)).toEqual([
+    [1, 320, 200],
+    [0, 320, 0],
+    [1, 639, 399],
+    [0, 0, 399],
+    [1, 1, 0],
+  ])
+})
+
+test('the canvas fills its area in both directions and keeps the shape of the picture', async () => {
+  const view = await connect()
+
+  expect(view.canvas).toHaveClass('h-full', 'w-full', 'object-contain')
+  expect(view.canvas).not.toHaveClass('max-h-full')
+  expect(view.canvas).not.toHaveClass('max-w-full')
+})
+
 test.each([
   ['a display rectangle without width', 200, 100, 0, 50],
   ['a display rectangle without height', 200, 100, 100, 0],

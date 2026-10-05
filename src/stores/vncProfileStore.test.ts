@@ -39,20 +39,26 @@ test('load pulls the saved profiles', async () => {
   expect(useVncProfileStore.getState()).toMatchObject({ profiles: [desk], loaded: true })
 })
 
-test('save upserts the profile, then reloads the list', async () => {
-  const order: string[] = []
-  m.upsertVncProfile.mockImplementation(async () => {
-    order.push('upsert')
-    return OK
+test('save upserts the profile and holds it without asking for the list', async () => {
+  m.listVncProfiles.mockResolvedValue({
+    status: 'error',
+    error: { kind: 'io', message: 'disk full' },
   })
-  m.listVncProfiles.mockImplementation(async () => {
-    order.push('list')
-    return { status: 'ok', data: [desk] }
-  })
+  const other = { ...desk, id: 'vnc-2', name: 'other' }
+  useVncProfileStore.setState({ profiles: [other] })
   await useVncProfileStore.getState().save(desk)
   expect(m.upsertVncProfile).toHaveBeenCalledWith(desk)
-  expect(order).toEqual(['upsert', 'list'])
-  expect(useVncProfileStore.getState().profiles).toEqual([desk])
+  expect(m.listVncProfiles).not.toHaveBeenCalled()
+  expect(useVncProfileStore.getState().profiles).toEqual([other, desk])
+})
+
+test('save puts a changed profile in the place of the one with its id', async () => {
+  const other = { ...desk, id: 'vnc-2', name: 'other' }
+  const renamed = { ...desk, name: 'renamed', secretId: 'vault-2' }
+  useVncProfileStore.setState({ profiles: [desk, other] })
+  await useVncProfileStore.getState().save(renamed)
+  expect(m.listVncProfiles).not.toHaveBeenCalled()
+  expect(useVncProfileStore.getState().profiles).toEqual([renamed, other])
 })
 
 test('a save the backend refuses rejects and keeps the list', async () => {

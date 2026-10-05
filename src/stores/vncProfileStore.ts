@@ -18,7 +18,13 @@ export const useVncProfileStore = create<VncProfileState>()((set, get) => ({
   },
   save: async (profile) => {
     unwrap(await commands.upsertVncProfile(profile))
-    set({ profiles: unwrap(await commands.listVncProfiles()) })
+    // No reload: one that failed would report a profile that was saved as not saved.
+    const { profiles } = get()
+    set({
+      profiles: profiles.some((p) => p.id === profile.id)
+        ? profiles.map((p) => (p.id === profile.id ? profile : p))
+        : [...profiles, profile],
+    })
   },
   remove: async (id) => {
     const target = get().profiles.find((p) => p.id === id)

@@ -1,4 +1,4 @@
-import { beforeEach, expect, test, vi } from 'vitest'
+import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import type { VncInput } from '@/bindings'
 import type { FrameMessage } from './remoteFrames'
 
@@ -96,6 +96,10 @@ beforeEach(() => {
   m.channels.length = 0
   m.vncOpen.mockResolvedValue({ status: 'ok', data: opened })
   for (const command of [m.vncInput, m.vncAck, m.vncClose]) command.mockResolvedValue(OK)
+})
+
+afterEach(() => {
+  vi.useRealTimers()
 })
 
 test('open connects to the target and forwards a decoded rect', async () => {
@@ -358,6 +362,31 @@ test('close waits for the call in flight and sends what is queued before it clos
   expect(order).toEqual(['close'])
   expect(m.vncClose).toHaveBeenCalledWith('v1')
   expect(calls).toHaveLength(2)
+})
+
+test('close stops waiting after a second for an input call that never returns', async () => {
+  vi.useFakeTimers()
+  const calls = held()
+  const driver = vncDriver(target)
+  driver.key('v1', true, 0x61)
+  driver.key('v1', false, 0x61)
+  const closing = driver.close('v1')
+  await vi.advanceTimersByTimeAsync(999)
+  expect(m.vncClose).not.toHaveBeenCalled()
+
+  await vi.advanceTimersByTimeAsync(1)
+  expect(m.vncClose.mock.calls).toEqual([['v1']])
+  await closing
+  expect(calls).toHaveLength(1)
+})
+
+test('a close that did not have to wait leaves no timer behind', async () => {
+  vi.useFakeTimers()
+  const driver = vncDriver(target)
+  await driver.key('v1', true, 0x61)
+  await driver.close('v1')
+  expect(m.vncClose.mock.calls).toEqual([['v1']])
+  expect(vi.getTimerCount()).toBe(0)
 })
 
 test('close without input goes straight to the command', async () => {

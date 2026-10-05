@@ -128,7 +128,8 @@ export function RemoteDesktopView({
     const stop = () => {
       ended = true
       release()
-      if (sessionId) driver.close(sessionId)
+      // A close that failed leaves nothing to show.
+      if (sessionId) driver.close(sessionId).catch(() => {})
       sessionId = null
     }
     stopRef.current = stop
@@ -205,7 +206,7 @@ export function RemoteDesktopView({
       .then(
         (opened) => {
           if (ended) {
-            driver.close(opened.id)
+            driver.close(opened.id).catch(() => {})
             return
           }
           sessionId = opened.id

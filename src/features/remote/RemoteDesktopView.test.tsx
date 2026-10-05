@@ -2018,6 +2018,28 @@ test('a queued message that cannot be painted closes the session as it opens', a
   expect(view.driver.ack).not.toHaveBeenCalled()
 })
 
+test('a close that fails when the session is stopped is not left unhandled', async () => {
+  const view = await connect()
+  // A plain function: a mock handles the promises it returns, which would hide a missing catch.
+  Object.assign(view.driver, { close: () => Promise.reject(new Error('ipc')) })
+
+  expect(
+    await unhandledRejections(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Disconnect' }))
+    }),
+  ).toBe(0)
+  expect(screen.getByText('Disconnected.')).toBeInTheDocument()
+  expect(screen.queryByText(/ipc/)).toBeNull()
+})
+
+test('a close that fails for an open that resolved after unmount is not left unhandled', async () => {
+  const view = start()
+  Object.assign(view.driver, { close: () => Promise.reject(new Error('ipc')) })
+  view.unmount()
+
+  expect(await unhandledRejections(() => view.open(session('late')))).toBe(0)
+})
+
 test('unmount closes the session', async () => {
   const view = await connect()
   view.unmount()

@@ -64,7 +64,16 @@ export function vncDriver(target: {
     const queue = queues.get(id)
     if (queue) {
       // What is queued goes out as a call of its own once the one in flight has returned.
-      while (queue.flight) await queue.flight
+      const sent = (async () => {
+        while (queue.flight) await queue.flight
+      })()
+      // A server that stopped reading never lets the call in flight return; closing ends it.
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const stuck = new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, 1000)
+      })
+      await Promise.race([sent, stuck])
+      clearTimeout(timer)
       queues.delete(id)
     }
     unwrap(await commands.vncClose(id))

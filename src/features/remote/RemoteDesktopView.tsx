@@ -96,6 +96,7 @@ export function RemoteDesktopView({
   const liveRef = useRef<Live | null>(null)
   const stopRef = useRef(() => {})
   const attemptRef = useRef(0)
+  const activeRef = useRef(active)
   const removeTab = useSessionStore((s) => s.removeTab)
 
   const connect = useCallback(() => {
@@ -142,7 +143,9 @@ export function RemoteDesktopView({
           } else {
             session.received += 1
             if (useSettingsStore.getState().settings.vncClipboardSync) {
-              writeClipboard(session, m.text)
+              // A hidden tab leaves the local clipboard alone until it is shown.
+              if (activeRef.current) writeClipboard(session, m.text)
+              else session.pending = m.text
             } else {
               session.pending = null
             }
@@ -288,6 +291,7 @@ export function RemoteDesktopView({
   }, [driver])
 
   useEffect(() => {
+    activeRef.current = active
     if (active) {
       syncClipboard()
       return

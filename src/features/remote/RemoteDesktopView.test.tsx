@@ -1415,6 +1415,52 @@ test('local text read for a session that ended meanwhile is not sent', async () 
   expect(view.driver.clipboard).not.toHaveBeenCalled()
 })
 
+test('remote text for a hidden tab is held and written once the tab is shown', async () => {
+  const view = await connectSynced()
+  await view.setActive(false)
+  await view.emit({ kind: 'clipboard', text: 'remote' })
+  expect(clipboard.writeText).not.toHaveBeenCalled()
+  expect(localText).toBe('local')
+
+  await view.setActive(true)
+  expect(clipboard.writeText.mock.calls).toEqual([['remote']])
+  expect(localText).toBe('remote')
+  expect(view.driver.clipboard).not.toHaveBeenCalled()
+
+  await view.setActive(false)
+  await view.setActive(true)
+  expect(clipboard.writeText).toHaveBeenCalledTimes(1)
+  expect(view.driver.clipboard).not.toHaveBeenCalled()
+})
+
+test('text copied locally while the tab was hidden wins over the remote text held for it', async () => {
+  const view = await connectSynced()
+  await view.setActive(false)
+  await view.emit({ kind: 'clipboard', text: 'remote' })
+  localText = 'copied here'
+
+  await view.setActive(true)
+  expect(clipboard.writeText).not.toHaveBeenCalled()
+  expect(localText).toBe('copied here')
+  expect(view.driver.clipboard.mock.calls).toEqual([['s1', 'copied here']])
+
+  await view.setActive(false)
+  await view.setActive(true)
+  expect(clipboard.writeText).not.toHaveBeenCalled()
+  expect(view.driver.clipboard).toHaveBeenCalledTimes(1)
+})
+
+test('the last of several remote texts for a hidden tab is the one written', async () => {
+  const view = await connectSynced()
+  await view.setActive(false)
+  await view.emit({ kind: 'clipboard', text: 'first' }, { kind: 'clipboard', text: 'second' })
+  expect(clipboard.writeText).not.toHaveBeenCalled()
+
+  await view.setActive(true)
+  expect(clipboard.writeText.mock.calls).toEqual([['second']])
+  expect(view.driver.clipboard).not.toHaveBeenCalled()
+})
+
 test('a cursor message becomes a data-URL cursor with its hotspot', async () => {
   const view = await connect()
   const rgba = pixels(16, 24)

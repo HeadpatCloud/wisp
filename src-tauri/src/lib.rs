@@ -207,6 +207,11 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
+            // Built here because the window config has no setting for clipboard access;
+            // without it WebView2 asks with its own prompt on the first clipboard read.
+            tauri::WebviewWindowBuilder::from_config(app.handle(), &app.config().app.windows[0])?
+                .enable_clipboard_access()
+                .build()?;
             builder.mount_events(app);
             let dir = app.path().app_config_dir()?;
             let store = Store::load(dir.clone())

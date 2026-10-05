@@ -323,8 +323,8 @@ export function SettingsPage({ tabId }: { tabId: string }) {
                   Reopen tabs on startup
                 </label>
                 <p className="mt-1 text-muted-foreground text-xs">
-                  Restores SSH, SFTP and S3 tabs. FTP and VNC tabs are skipped because their
-                  passwords would have to be stored on disk.
+                  Restores SSH, local shell, SFTP, FTP, S3 and VNC tabs. Their passwords stay in the
+                  vault. Settings and editor tabs are not reopened.
                 </p>
               </div>
             </>

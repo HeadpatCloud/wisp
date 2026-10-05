@@ -1,3 +1,4 @@
+import { useRef } from 'react'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -27,44 +28,49 @@ export function HostKeyDialog({
   onAccept: () => void
   onReject: () => void
 }) {
+  // The closing dialog still shows the prompt it was opened for.
+  const lastRef = useRef(prompt)
+  if (prompt) lastRef.current = prompt
+  const shown = prompt ?? lastRef.current
+
   return (
     <Dialog open={prompt !== null} onOpenChange={(open) => !open && onReject()}>
       <DialogContent>
         <DialogHeader>
           <DialogTitle>
-            {prompt?.kind === 'mismatch'
-              ? prompt.certificate
+            {shown?.kind === 'mismatch'
+              ? shown.certificate
                 ? 'Certificate CHANGED'
                 : 'Host key CHANGED'
-              : prompt?.certificate
+              : shown?.certificate
                 ? 'Unknown certificate'
                 : 'Unknown host key'}
           </DialogTitle>
         </DialogHeader>
-        {prompt && (
+        {shown && (
           <div className="space-y-2 text-sm">
             <p className="text-muted-foreground">
-              {prompt.certificate ? prompt.host.replace(/^(vnc|rdp|rdg)\//, '') : prompt.host}:
-              {prompt.port}
+              {shown.certificate ? shown.host.replace(/^(vnc|rdp|rdg)\//, '') : shown.host}:
+              {shown.port}
             </p>
-            {prompt.kind === 'unknown' ? (
+            {shown.kind === 'unknown' ? (
               <>
                 <p>
-                  {prompt.certificate
+                  {shown.certificate
                     ? 'First connection to this server. Trust this certificate?'
                     : 'First connection to this host. Trust this key?'}
                 </p>
-                <p className="break-all font-mono text-xs">{prompt.fingerprint}</p>
+                <p className="break-all font-mono text-xs">{shown.fingerprint}</p>
               </>
             ) : (
               <>
                 <p className="text-destructive">
-                  {prompt.certificate
+                  {shown.certificate
                     ? 'The certificate has changed - this may indicate a man-in-the-middle attack. Only accept if you know it was replaced.'
                     : 'The host key has changed - this may indicate a man-in-the-middle attack. Only accept if you know the key was rotated.'}
                 </p>
-                <p className="break-all font-mono text-xs">stored: {prompt.stored}</p>
-                <p className="break-all font-mono text-xs">offered: {prompt.offered}</p>
+                <p className="break-all font-mono text-xs">stored: {shown.stored}</p>
+                <p className="break-all font-mono text-xs">offered: {shown.offered}</p>
               </>
             )}
           </div>
@@ -74,8 +80,8 @@ export function HostKeyDialog({
             Reject
           </Button>
           <Button type="button" onClick={onAccept}>
-            {prompt?.kind === 'mismatch'
-              ? prompt.certificate
+            {shown?.kind === 'mismatch'
+              ? shown.certificate
                 ? 'Accept changed certificate'
                 : 'Accept changed key'
               : 'Trust'}

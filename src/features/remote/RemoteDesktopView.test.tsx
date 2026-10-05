@@ -504,6 +504,50 @@ test('a changed certificate is trusted with the offered fingerprint', async () =
   expect(view.driver.open).toHaveBeenCalledTimes(2)
 })
 
+test.each([
+  [
+    'Trust',
+    { kind: 'hostKeyUnknown', message: { host: 'vnc/h', port: 5900, fingerprint: 'SHA256:ab' } },
+    'Unknown certificate',
+    'Trust',
+  ],
+  [
+    'Reject',
+    { kind: 'hostKeyUnknown', message: { host: 'vnc/h', port: 5900, fingerprint: 'SHA256:ab' } },
+    'Unknown certificate',
+    'Trust',
+  ],
+  [
+    'Accept changed certificate',
+    {
+      kind: 'hostKeyMismatch',
+      message: { host: 'vnc/h', port: 5901, stored: 'SHA256:old', offered: 'SHA256:new' },
+    },
+    'Certificate CHANGED',
+    'Accept changed certificate',
+  ],
+])(
+  'the certificate dialog keeps its wording while it closes after %s',
+  async (button, error, title, accept) => {
+    keepClosingDialogs()
+    const view = start()
+    await view.fail(error)
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: button }))
+    })
+
+    expect(document.querySelector('[data-slot="dialog-content"]')).toHaveAttribute(
+      'data-state',
+      'closed',
+    )
+    expect(screen.getByRole('heading', { name: title })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: accept })).toBeInTheDocument()
+    expect(
+      screen.getByText(`${error.message.host.replace('vnc/', '')}:${error.message.port}`),
+    ).toBeInTheDocument()
+  },
+)
+
 test('a certificate that cannot be stored shows why and does not connect', async () => {
   vi.mocked(trustHostKey).mockRejectedValue(new Error('io: disk full'))
   const view = start()

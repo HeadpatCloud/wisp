@@ -1,3 +1,5 @@
+use std::future::Future;
+
 use russh::client::Msg;
 use russh::{Channel, ChannelMsg};
 use tokio::sync::mpsc;
@@ -12,12 +14,10 @@ pub enum PtyMsg {
     Close,
 }
 
-// Reachable from outside only for tests/live_ssh.rs; nothing else implements it.
-#[allow(async_fn_in_trait)]
 pub trait PtyChannel {
-    async fn next(&mut self) -> Option<PtyMsg>;
-    async fn write(&mut self, data: &[u8]) -> AppResult<()>;
-    async fn resize(&mut self, cols: u32, rows: u32) -> AppResult<()>;
+    fn next(&mut self) -> impl Future<Output = Option<PtyMsg>> + Send;
+    fn write(&mut self, data: &[u8]) -> impl Future<Output = AppResult<()>> + Send;
+    fn resize(&mut self, cols: u32, rows: u32) -> impl Future<Output = AppResult<()>> + Send;
 }
 
 pub struct RusshPty(pub Channel<Msg>);

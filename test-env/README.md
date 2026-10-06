@@ -273,10 +273,10 @@ All servers
 | address | sshd | for |
 |---|---|---|
 | `127.0.0.1:2201` | Debian's `sshd_config` plus `/etc/ssh/sshd_config.d/wisp.conf` | normal sessions |
-| `127.0.0.1:2202` | the same, with `openssh/sshd_rekey.conf` in front: `RekeyLimit 1M 10s`, `LogLevel DEBUG1` | new keys after every mebibyte |
+| `127.0.0.1:2202` | the same, with `openssh/sshd_rekey.conf` in front: `RekeyLimit 1M 10s` | new keys after every mebibyte |
 
-Both send `SSH-2.0-OpenSSH_10.0p2 Debian-7+deb13u4`. `docker logs wisp-test-openssh` has the
-log of both.
+Both send `SSH-2.0-OpenSSH_10.0p2 Debian-7+deb13u4` and both log at `DEBUG1`, which has a
+line for every key exchange. `docker logs wisp-test-openssh` has the log of both.
 
 - User `wisp`, password `wisptest`, shell `bash`, home `/home/wisp`. Password and public key
   login are on, keyboard-interactive is off, TCP forwarding is on, `GatewayPorts` is off.
@@ -305,58 +305,98 @@ cargo test --manifest-path src-tauri/Cargo.toml --test live_ssh -- --ignored --t
 ```
 
 A run takes about three minutes, 90 s of it in `idle_session_survives`. It writes up to
-1.3 GB into the system's temporary folder and 2.5 GB into the container, and removes both.
+1.3 GB into the system's temporary folder and 2.5 GB into `/home/wisp/live` in the
+container, and removes both. Two things stay and grow with every run until the container is
+recreated: `/home/wisp/.bash_history` (about 2 KB a run) and the container's log (about
+0.25 MB a run). The tests count key exchanges in that log, from the moment a transfer starts
+(`docker logs --since`).
+
 Every test that measures prints one line `MEASURE <test> <name>=<value> ...`.
+
+The same with an optimised build (the first build takes about two and a half minutes and
+2.2 GB under `src-tauri/target/release`):
+
+```bash
+cargo test --release --manifest-path src-tauri/Cargo.toml --test live_ssh -- --ignored --test-threads=1 --nocapture
+```
 
 ### Measured with russh 0.61.2
 
-Three runs on 2026-10-06, test binary built with the `test` profile (not optimised), server
-and client on the same machine. russh and the server agreed on `mlkem768x25519-sha256`,
-host key `ssh-ed25519` and `chacha20-poly1305@openssh.com`.
+2026-10-06, server and client on the same machine, nothing else running. russh and the
+server agreed on `mlkem768x25519-sha256`, host key `ssh-ed25519` and
+`chacha20-poly1305@openssh.com`.
 
-| test | value | run 1 | run 2 | run 3 |
-|---|---|---|---|---|
-| `sftp_round_trip` (64 MiB) | upload MiB/s | 139.4 | 151.1 | 144.6 |
-| | download MiB/s | 60.1 | 59.2 | 69.8 |
-| `sftp_through_forced_rekeys` (64 MiB, port 2202) | upload MiB/s | 76.7 | 75.6 | 75.3 |
-| | download MiB/s | 26.8 | 27.3 | 28.8 |
-| | key exchanges during the upload | 29 | 31 | 26 |
-| | key exchanges during the download | 85 | 85 | 85 |
-| `sftp_past_one_gibibyte` (1200 MiB) | download s | 17.4 | 18.5 | 18.7 |
-| | upload s | 6.1 | 6.0 | 6.2 |
-| | download MiB/s | 68.8 | 64.8 | 64.3 |
-| | upload MiB/s | 197.3 | 200.3 | 194.9 |
-| `local_forward_carries_bulk_both_ways` (8 MiB) | MiB/s | 32.7 | 39.5 | 37.7 |
-| `shell_stays_responsive_while_a_tunnel_is_blocked` | echo median ms | 0.6 | 0.6 | 0.5 |
-| | echo maximum ms | 1.3 | 1.5 | 1.3 |
-| | the same before the tunnel, median / maximum ms | 0.5 / 0.7 | 0.5 / 0.6 | 0.6 / 0.7 |
-| | KiB written before the write blocked | 5248 | 4800 | 4480 |
-| `shell_stays_responsive_during_a_transfer` (256 MiB) | echo median ms | 9.6 | 7.7 | 8.6 |
-| | echo maximum ms | 24.7 | 10.2 | 11.3 |
-| | the same before the upload, median / maximum ms | 0.5 / 0.7 | 0.5 / 0.6 | 0.5 / 0.9 |
-| | upload MiB/s | 162.6 | 173.4 | 167.3 |
-| | MiB sent when the echoes began / ended | 16 / 53 | 17 / 53 | 17 / 54 |
-| `shell_echo_and_resize` | echo ms | 0.7 | 0.7 | 0.7 |
-| `idle_session_survives` | echo after 90 s, ms | 1.3 | 1.4 | 1.3 |
-| `password_login` | connect ms | 24.2 | 21.9 | 24.5 |
-| | wrong password refused after ms | 4284.7 | 2142.9 | 2142.9 |
-| | login ms | 19.1 | 19.6 | 36.0 |
-| `key_login` | ed25519 ms | 19.9 | 19.6 | 19.9 |
-| | RSA ms | 30.8 | 39.3 | 42.6 |
-| | ed25519 with passphrase ms | 422.1 | 359.7 | 414.1 |
-| `jump_host` | channel, connect and login of the second hop, ms | 232.8 | 245.7 | 242.0 |
-| | echo ms | 0.7 | 0.8 | 0.7 |
-| `dynamic_forward` | SOCKS5 greeting to reply, ms | 1.4 | 3.5 | 4.4 |
-| `remote_forward` | `docker exec` of `socat` with the exchange, ms | 180.1 | 180.2 | 181.1 |
+The range over 12 runs of the unoptimised `test` profile. Compare library versions on the
+rows marked yes; the others are too noisy, or are not the client's doing.
+
+| test | value | range | compare |
+|---|---|---|---|
+| `sftp_round_trip` (64 MiB) | upload MiB/s | 121 to 157 | yes |
+| | download MiB/s | 51 to 70 | yes |
+| `sftp_through_forced_rekeys` (64 MiB, port 2202) | upload MiB/s | 67 to 82 | yes |
+| | download MiB/s | 25.8 to 28.8 | yes |
+| | key exchanges during the upload | 25 to 32 | no, depends on the rate |
+| | key exchanges during the download | 85 | yes |
+| `sftp_past_one_gibibyte` (1200 MiB) | upload MiB/s | 183 to 203 | yes |
+| | download MiB/s | 64 to 69 | yes |
+| | key exchanges during the download / upload | 1 / 1 (one run) | yes |
+| `local_forward_carries_bulk_both_ways` (8 MiB) | MiB/s | 28.0 to 52.4 | no, pass or fail only |
+| `shell_stays_responsive_while_a_tunnel_is_blocked` | echo median ms | 0.5 to 0.6 | yes |
+| | echo maximum ms | 1.2 to 1.5 | yes |
+| | the same before the tunnel, median / maximum ms | 0.5 to 0.6 / 0.6 to 0.8 | yes |
+| | KiB written before the write blocked | 4224 to 5440 | no |
+| `shell_stays_responsive_during_a_transfer` (256 MiB) | echo median ms | 7.7 to 9.6 | yes |
+| | echo maximum ms | 10.2 to 24.7 | no, one late echo decides it |
+| | the same before the upload, median / maximum ms | 0.5 to 0.6 / 0.6 to 0.9 | yes |
+| | upload MiB/s | 142 to 173 | yes |
+| `shell_echo_and_resize` | echo ms | 0.5 to 0.7 | yes |
+| `idle_session_survives` | echo after 90 s, ms | 1.1 to 1.6 | yes |
+| `password_login` | connect ms | 21.9 to 25.8 | yes |
+| | wrong password refused after ms | 2143 or 4285 | no, the server's delay |
+| | login ms | 19.1 to 36.4 | no |
+| `key_login` | ed25519 ms | 19.5 to 20.3 | yes |
+| | RSA ms | 29.8 to 42.6 | no |
+| | ed25519 with passphrase ms | 339 to 447 | no, mostly unlocking the key |
+| `jump_host` | channel, connect and login of the second hop, ms | 233 to 255 | yes |
+| | echo ms | 0.7 to 0.9 | yes |
+| `dynamic_forward` | SOCKS5 greeting to reply, ms | 1.3 to 4.4 | no |
+| `remote_forward` | exchange ms | 179 to 181 | no, mostly `docker exec` |
+
+- Download rates include writing the file here, through eight handles at once; upload rates
+  include reading it.
+- A wrong password is refused by `sshd` after 2.14 s or after 4.28 s, with one
+  `Failed password` line in the log either way.
+- The echo times of the blocked tunnel are those of the quiet connection: on this version a
+  channel that waits for window does not hold the others back. An upload does slow the
+  shell, from 0.5 ms to 8 or 9.
+
+One run of the optimised build (`--release`), for the order of magnitude:
+
+```
+MEASURE dynamic_forward open_ms=1.4
+MEASURE idle_session_survives echo_ms=1.1
+MEASURE jump_host login_ms=236.0 echo_ms=0.6
+MEASURE key_login ed25519_ms=20.2 rsa_ms=19.9 ed25519_passphrase_ms=148.5
+MEASURE local_forward_carries_bulk_both_ways mib_s=49.4
+MEASURE password_login connect_ms=14.2 refuse_ms=4284.5 login_ms=36.0
+MEASURE remote_forward exchange_ms=181.5
+MEASURE sftp_past_one_gibibyte down_s=11.5 up_s=4.2 down_mib_s=104.7 up_mib_s=285.5 down_rekeys=1 up_rekeys=1
+MEASURE sftp_round_trip up_mib_s=169.9 down_mib_s=111.7
+MEASURE sftp_through_forced_rekeys up_mib_s=134.6 down_mib_s=52.4 up_rekeys=38 down_rekeys=85
+MEASURE shell_echo_and_resize echo_ms=0.6
+MEASURE shell_stays_responsive_during_a_transfer median_ms=4.3 max_ms=27.6 quiet_median_ms=0.5 quiet_max_ms=1.0 up_mib_s=191.1 echoes_from_mib=20 echoes_until_mib=53
+MEASURE shell_stays_responsive_while_a_tunnel_is_blocked median_ms=0.5 max_ms=1.1 quiet_median_ms=0.5 quiet_max_ms=0.6 taken_kib=5248
+```
 
 ### Quirks
 
-- A download gets one key exchange per 789,196 bytes `sshd` sent. During a 64 MiB upload
-  `sshd` had received 1.7 to 3.1 MB between two exchanges, so an upload sees about a third
-  as many.
-- `sshd` logs a line with `rekeying out` for every exchange at `DEBUG1`.
-- A wrong password is refused after 2.14 s or after 4.28 s, with one `Failed password` line
-  in the log either way.
+- A download gets one key exchange per 789,196 bytes `sshd` sent on port 2202. During a
+  64 MiB upload `sshd` had received 1.7 to 3.1 MB between two exchanges, so an upload sees
+  about a third as many.
+- On port 2201 `sshd` asks for new keys by itself after 134,217,728 cipher blocks of 8 bytes,
+  1 GiB (`rekey out after 134217728 blocks` in its log). The 1200 MiB transfers cross that
+  once each way.
+- `sshd` logs a line with `rekeying out` for every exchange.
 - `sshd` counts connections that end without a login against the client's address
   (`PerSourcePenalties`, logged as `srclimit_penalise`), and all clients come from the Docker
   gateway. A probe of the banner costs 1 s and a failed login 5 s; the address is refused

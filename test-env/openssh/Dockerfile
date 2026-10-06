@@ -22,6 +22,7 @@ RUN useradd -m -s /bin/bash wisp \
         'KbdInteractiveAuthentication no' \
         'AllowTcpForwarding yes' \
         'GatewayPorts no' \
+        'LogLevel DEBUG1' \
         > /etc/ssh/sshd_config.d/wisp.conf
 
 COPY openssh/sshd_rekey.conf /etc/wisp/sshd_rekey.conf

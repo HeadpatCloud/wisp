@@ -92,6 +92,18 @@ fn host_key() -> String {
     printed.split(' ').nth(1).expect("ssh-keygen's output").to_string()
 }
 
+// The container's clock, which is the one its log is stamped with.
+fn clock() -> String {
+    inside("date +%s.%N")
+}
+
+// What sshd logs at DEBUG1 for each new set of keys it starts to send with.
+fn exchanges(since: &str) -> usize {
+    let logged = docker(&["logs", "--since", since, CONTAINER]);
+    assert!(logged.ok, "no log: {}", text(&logged.err));
+    text(&[logged.out, logged.err].concat()).matches("rekeying out").count()
+}
+
 fn sha256_inside(path: &str) -> String {
     let printed = inside(&format!("sha256sum {path}"));
     printed.split(' ').next().expect("sha256sum's output").to_string()
@@ -295,20 +307,14 @@ async fn round_trip(port: u16, seed: u64) -> (f64, f64, usize, usize) {
     let sftp = within(WAIT, "sftp", open_sftp(&handle)).await.unwrap();
     within(WAIT, "mkdir", mkdir(&sftp, REMOTE)).await.unwrap();
 
-    // What the sshd on 2202 logs for each new set of keys it starts to send with.
-    let exchanges = || {
-        let logged = docker(&["logs", CONTAINER]);
-        assert!(logged.ok, "no log: {}", text(&logged.err));
-        text(&[logged.out, logged.err].concat()).matches("rekeying out").count()
-    };
-    let before = exchanges();
+    let began = clock();
     let up_rate = rate(size, up(&sftp, &sent, &remote).await);
     assert_eq!(sha256_inside(&remote), hash, "the uploaded file inside");
-    let between = exchanges();
+    let up_rekeys = exchanges(&began);
+    let began = clock();
     let down_rate = rate(size, down(&sftp, &remote, &back, size).await);
     assert_eq!(sha256_file(&back), hash, "the downloaded file");
-    let after = exchanges();
-    (up_rate, down_rate, between - before, after - between)
+    (up_rate, down_rate, up_rekeys, exchanges(&began))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -503,15 +509,20 @@ async fn sftp_past_one_gibibyte() {
 
     let handle = logged_in(PORT).await;
     let sftp = within(WAIT, "sftp", open_sftp(&handle)).await.unwrap();
+    let began = clock();
     let down_time = down(&sftp, &made, &local, size).await;
     assert_eq!(sha256_file(&local), hash, "the downloaded file");
+    let down_rekeys = exchanges(&began);
+    let began = clock();
     let up_time = up(&sftp, &local, &sent).await;
     assert_eq!(sha256_inside(&sent), hash, "the uploaded file inside");
+    let up_rekeys = exchanges(&began);
     // The same connection is still good for a small request.
     let entry = within(WAIT, "stat", stat(&sftp, &sent)).await.unwrap();
     assert_eq!(entry.size, size);
     println!(
-        "MEASURE sftp_past_one_gibibyte down_s={:.1} up_s={:.1} down_mib_s={:.1} up_mib_s={:.1}",
+        "MEASURE sftp_past_one_gibibyte down_s={:.1} up_s={:.1} down_mib_s={:.1} up_mib_s={:.1} \
+         down_rekeys={down_rekeys} up_rekeys={up_rekeys}",
         down_time.as_secs_f64(),
         up_time.as_secs_f64(),
         rate(size, down_time),
@@ -727,6 +738,10 @@ async fn shell_stays_responsive_during_a_transfer() {
         upload(&session, local.to_str().unwrap(), &to, report).await
     });
     while done.load(Ordering::Relaxed) < 16 * MIB as u64 {
+        if sending.is_finished() {
+            let ended = sending.await.unwrap();
+            panic!("the upload ended before 16 MiB were sent: {ended:?}");
+        }
         assert!(started.elapsed() < WAIT * 3, "the upload does not get going");
         sleep(Duration::from_millis(10)).await;
     }

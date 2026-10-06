@@ -291,7 +291,8 @@ line for every key exchange. `docker logs wisp-test-openssh` has the log of both
   ```
 - Inside, `socat` echoes on `127.0.0.1:7000`, and on `127.0.0.1:7001` it accepts connections
   and reads nothing from them (each is held for 10 minutes by a `sleep`, also after the
-  client has gone). `socat`, `sha256sum`, `dd` and `head` are there for checks from inside.
+  client has gone). One test starts a third `socat` on `127.0.0.1:7002` that sends zeros
+  without end, and ends it. `socat`, `sha256sum`, `dd` and `head` are there for checks from inside.
 - `docker exec` runs as root; add `-u wisp` to act as the user.
 
 ### Live tests
@@ -304,9 +305,9 @@ docker compose -f test-env/docker-compose.yml up -d openssh
 cargo test --manifest-path src-tauri/Cargo.toml --test live_ssh -- --ignored --test-threads=1 --nocapture
 ```
 
-A run takes about three minutes, 90 s of it in `idle_session_survives`. It writes up to
-1.3 GB into the system's temporary folder and 2.5 GB into `/home/wisp/live` in the
-container, and removes both. Two things stay and grow with every run until the container is
+A run takes about five minutes, 90 s of it in `idle_session_survives` and 100 s in
+`shell_while_a_tunnel_download_is_blocked`. It writes up to 1.3 GB into the system's
+temporary folder and 2.5 GB into `/home/wisp/live` in the container, and removes both. Two things stay and grow with every run until the container is
 recreated: `/home/wisp/.bash_history` (about 2 KB a run) and the container's log (about
 0.25 MB a run). The tests count key exchanges in that log, from the moment a transfer starts
 (`docker logs --since`).
@@ -345,6 +346,8 @@ rows marked yes; the others are too noisy, or are not the client's doing.
 | | echo maximum ms | 1.2 to 1.5 | yes |
 | | the same before the tunnel, median / maximum ms | 0.5 to 0.6 / 0.6 to 0.8 | yes |
 | | KiB written before the write blocked | 4224 to 5440 | no |
+| `shell_while_a_tunnel_download_is_blocked` | echoes unanswered after 5 s, of 20 | 20 (3 runs) | yes |
+| | KiB delivered before the flow stopped | 272 to 411 | no |
 | `shell_stays_responsive_during_a_transfer` (256 MiB) | echo median ms | 7.7 to 9.6 | yes |
 | | echo maximum ms | 10.2 to 24.7 | no, one late echo decides it |
 | | the same before the upload, median / maximum ms | 0.5 to 0.6 / 0.6 to 0.9 | yes |
@@ -369,6 +372,11 @@ rows marked yes; the others are too noisy, or are not the client's doing.
 - The echo times of the blocked tunnel are those of the quiet connection: on this version a
   channel that waits for window does not hold the others back. An upload does slow the
   shell, from 0.5 ms to 8 or 9.
+- The other direction freezes the whole connection. When a program connected to a local
+  forward stops reading while the service behind it keeps sending, no shell echo on the same
+  connection is answered (20 of 20 after 5 s each, 3 runs of 3) until that program closes
+  its connection; then the shell answers again. `shell_while_a_tunnel_download_is_blocked`
+  records this and passes either way.
 
 One run of the optimised build (`--release`), for the order of magnitude:
 

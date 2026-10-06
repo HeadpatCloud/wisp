@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use tauri::test::MockRuntime;
+use tauri_specta::Event;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -711,6 +712,94 @@ async fn shell_stays_responsive_while_a_tunnel_is_blocked() {
          taken_kib={}",
         taken / 1024
     );
+    tunnel.abort.abort();
+}
+
+// Ends the program a test started inside however the test ends.
+struct Started(&'static str);
+
+impl Drop for Started {
+    fn drop(&mut self) {
+        let script = format!("kill $(cat /tmp/{0}.pid) 2>/dev/null; rm -f /tmp/{0}.pid", self.0);
+        let ran = docker(&["exec", "-u", USER, CONTAINER, "sh", "-c", &script]);
+        if !std::thread::panicking() {
+            assert!(ran.ok, "{} not ended: {}", self.0, text(&ran.err));
+        }
+    }
+}
+
+// The other direction: a service that sends without end to a local client that reads nothing.
+// It records what the shell does then; slow or unanswered echoes do not fail it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn shell_while_a_tunnel_download_is_blocked() {
+    let app = app();
+    let arrived = Arc::new(AtomicU64::new(0));
+    let counter = arrived.clone();
+    TunnelStatus::listen_any(&app, move |status| {
+        counter.store(status.payload.bytes_down, Ordering::Relaxed)
+    });
+    let handle = Arc::new(logged_in(PORT).await);
+    let mut shell = Shell::open(&handle).await;
+    let (quiet_median, quiet_max) = shell.echoes(20).await;
+
+    // exec, so that the pid the guard ends is socat's.
+    let flood = "echo $$ > /tmp/flood.pid; \
+                 exec socat -u OPEN:/dev/zero TCP-LISTEN:7002,bind=127.0.0.1,reuseaddr,fork";
+    let ran = docker(&["exec", "-d", "-u", USER, CONTAINER, "sh", "-c", flood]);
+    assert!(ran.ok, "socat did not start: {}", text(&ran.err));
+    let _flood = Started("flood");
+
+    let port = free_port();
+    let (app_handle, bind) = (app.handle().clone(), format!("{HOST}:{port}"));
+    let tunnel =
+        run_local(app_handle, "live".into(), "live".into(), handle.clone(), bind, HOST.into(), 7002)
+            .unwrap();
+    // A connection made before socat listens is closed again at once.
+    let started = Instant::now();
+    let stream = loop {
+        let mut stream = dial(port).await;
+        let first = timeout(Duration::from_secs(2), stream.read_u8()).await;
+        if matches!(first, Ok(Ok(0))) {
+            break stream;
+        }
+        assert!(started.elapsed() < WAIT, "nothing arrives through the tunnel: {first:?}");
+        sleep(Duration::from_millis(100)).await;
+    };
+
+    // The tunnel reports its counters once a second; the flow has stopped when three reports
+    // in a row are the same.
+    let (mut taken, mut same, started) = (0, 0, Instant::now());
+    while same < 3 {
+        assert!(started.elapsed() < Duration::from_secs(120), "the flow never stopped: {taken}");
+        sleep(Duration::from_secs(1)).await;
+        let now = arrived.load(Ordering::Relaxed);
+        same = if now == taken && now > 0 { same + 1 } else { 0 };
+        taken = now;
+    }
+
+    let mut times = Vec::new();
+    for i in 0..20 {
+        let (command, wanted) = (format!("echo d{i}-$((40+2))"), format!("d{i}-42"));
+        times.extend(shell.answers(&command, &wanted, Duration::from_secs(5)).await);
+    }
+    times.sort();
+    let timed_out = 20 - times.len();
+    let of = |time: Option<&Duration>| match time {
+        Some(time) => format!("{:.1}", ms(*time)),
+        None => "none".to_string(),
+    };
+    println!(
+        "MEASURE shell_while_a_tunnel_download_is_blocked median_ms={} max_ms={} \
+         timed_out={timed_out} quiet_median_ms={quiet_median:.1} quiet_max_ms={quiet_max:.1} \
+         taken_kib={}",
+        of(times.get(times.len() / 2)),
+        of(times.last()),
+        taken / 1024
+    );
+
+    drop(stream);
+    shell.run("echo after-$((6*7))", "after-42").await;
     tunnel.abort.abort();
 }
 

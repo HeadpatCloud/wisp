@@ -161,11 +161,7 @@ fn bridge(
         else {
             return;
         };
-        let (lr, lw) = local.into_split();
-        let (rr, rw) = tokio::io::split(channel.into_stream());
-        let up_task = tokio::spawn(pump(lr, rw, up));
-        let _ = pump(rr, lw, down).await;
-        up_task.abort();
+        relay(channel, local, up, down).await;
     })
     .abort_handle()
 }
@@ -250,11 +246,7 @@ pub fn run_dynamic<R: Runtime>(
                             match handle.channel_open_direct_tcpip(host, port as u32, oa, 0).await {
                                 Ok(channel) => {
                                     if socks::reply(&mut local, 0x00).await.is_err() { return; }
-                                    let (lr, lw) = local.into_split();
-                                    let (rr, rw) = tokio::io::split(channel.into_stream());
-                                    let up_task = tokio::spawn(pump(lr, rw, up));
-                                    let _ = pump(rr, lw, down).await;
-                                    up_task.abort();
+                                    relay(channel, local, up, down).await;
                                 }
                                 Err(_) => { let _ = socks::reply(&mut local, 0x05).await; }
                             }
@@ -317,4 +309,149 @@ pub async fn run_remote<R: Runtime>(
         session_id,
         remote: Some(RemoteCleanup { handle, bind_host, bound_port, registry }),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use tauri::test::MockRuntime;
+    use tokio::net::TcpStream;
+    use tokio::time::{sleep, timeout};
+
+    use super::*;
+    use crate::ssh::client::testing::session;
+
+    const LIMIT: Duration = Duration::from_secs(10);
+
+    // One connection through a forward: the program that connected to the local port, and the
+    // channel as the server holds it for the service behind it.
+    struct Forward {
+        client: TcpStream,
+        service: Channel<russh::server::Msg>,
+        task: AbortHandle,
+        _handle: Arc<SshHandle>,
+        _dynamic: Option<(tauri::App<MockRuntime>, TunnelHandle)>,
+    }
+
+    async fn local() -> Forward {
+        let (handle, _forwards, _server, mut opened) = session().await;
+        let handle = Arc::new(handle);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (accepted, _) = listener.accept().await.unwrap();
+        let counters = (Arc::default(), Arc::default());
+        let task = bridge(handle.clone(), accepted, "service".into(), 80, counters.0, counters.1);
+        let service = timeout(LIMIT, opened.recv()).await.expect("no channel").unwrap();
+        Forward { client, service, task, _handle: handle, _dynamic: None }
+    }
+
+    async fn dynamic() -> Forward {
+        let (handle, _forwards, _server, mut opened) = session().await;
+        let handle = Arc::new(handle);
+        let app = tauri::test::mock_app();
+        tauri_specta::Builder::<MockRuntime>::new()
+            .events(tauri_specta::collect_events![TunnelStatus])
+            .mount_events(&app);
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let app_handle = app.handle().clone();
+        let (bind, session) = (free.to_string(), handle.clone());
+        let tunnel = run_dynamic(app_handle, "t".into(), "s".into(), session, bind).unwrap();
+
+        let started = Instant::now();
+        let mut client = loop {
+            match TcpStream::connect(free).await {
+                Ok(client) => break client,
+                Err(e) => assert!(started.elapsed() < LIMIT, "the tunnel does not listen: {e}"),
+            }
+            sleep(Duration::from_millis(10)).await;
+        };
+        let mut reply = [0u8; 12];
+        let greeting = async {
+            client.write_all(&[5, 1, 0]).await.unwrap();
+            client.read_exact(&mut reply[..2]).await.unwrap();
+            client.write_all(&[5, 1, 0, 1, 10, 0, 0, 1, 0, 80]).await.unwrap();
+            client.read_exact(&mut reply[2..]).await.unwrap();
+        };
+        timeout(LIMIT, greeting).await.expect("no SOCKS5 reply");
+        assert_eq!(reply, [5, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+        let service = timeout(LIMIT, opened.recv()).await.expect("no channel").unwrap();
+        let task = tunnel.conns.lock().unwrap()[0].clone();
+        Forward { client, service, task, _handle: handle, _dynamic: Some((app, tunnel)) }
+    }
+
+    async fn gone(task: &AbortHandle) {
+        let started = Instant::now();
+        while !task.is_finished() {
+            assert!(started.elapsed() < Duration::from_secs(1), "the forward's task lives on");
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    // The service sends, closes its sending side and goes on reading; then it closes.
+    async fn late_data_arrives_and_a_close_ends_it(mut forward: Forward) {
+        forward.service.data(&b"hello"[..]).await.unwrap();
+        forward.service.eof().await.unwrap();
+        let mut got = Vec::new();
+        timeout(LIMIT, forward.client.read_to_end(&mut got)).await.expect("no end").unwrap();
+        assert_eq!(got, b"hello");
+
+        forward.client.write_all(b"late").await.unwrap();
+        loop {
+            match timeout(LIMIT, forward.service.wait()).await.expect("no data") {
+                Some(ChannelMsg::Data { data }) => {
+                    assert_eq!(&data[..], b"late");
+                    break;
+                }
+                Some(_) => {}
+                None => panic!("the channel closed without the client's data"),
+            }
+        }
+
+        forward.service.close().await.unwrap();
+        gone(&forward.task).await;
+        let failing = async { while forward.client.write_all(b"more").await.is_ok() {} };
+        timeout(LIMIT, failing).await.expect("the client's writes still go somewhere");
+    }
+
+    // The client leaves; the forward ends as soon as the service sends into it.
+    async fn ends_once_the_client_has_gone(mut forward: Forward) {
+        drop(forward.client);
+        loop {
+            match timeout(LIMIT, forward.service.wait()).await.expect("no end of input") {
+                Some(ChannelMsg::Eof) => break,
+                Some(_) => {}
+                None => panic!("the channel closed while the service could still answer"),
+            }
+        }
+        let started = Instant::now();
+        while !forward.task.is_finished() {
+            assert!(started.elapsed() < Duration::from_secs(1), "the forward's task lives on");
+            if forward.service.data(&b"answer"[..]).await.is_err() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        gone(&forward.task).await;
+    }
+
+    #[tokio::test]
+    async fn local_forward_carries_what_the_client_sends_after_the_service_half_closed() {
+        late_data_arrives_and_a_close_ends_it(local().await).await;
+    }
+
+    #[tokio::test]
+    async fn local_forward_ends_once_the_client_has_gone() {
+        ends_once_the_client_has_gone(local().await).await;
+    }
+
+    #[tokio::test]
+    async fn dynamic_forward_carries_what_the_client_sends_after_the_service_half_closed() {
+        late_data_arrives_and_a_close_ends_it(dynamic().await).await;
+    }
+
+    #[tokio::test]
+    async fn dynamic_forward_ends_once_the_client_has_gone() {
+        ends_once_the_client_has_gone(dynamic().await).await;
+    }
 }

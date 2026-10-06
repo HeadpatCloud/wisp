@@ -90,8 +90,11 @@ impl Handler for ClientHandler {
             let (lr, lw) = local.into_split();
             let (rr, rw) = tokio::io::split(channel.into_stream());
             let up = tokio::spawn(crate::tunnel::pump(lr, rw, target.up));
-            let _ = crate::tunnel::pump(rr, lw, target.down).await;
-            up.abort();
+            // A far side that is done sending may still wait for its answer, so only an
+            // error here ends the other direction too.
+            if crate::tunnel::pump(rr, lw, target.down).await.is_err() {
+                up.abort();
+            }
         });
         Ok(())
     }
@@ -318,5 +321,81 @@ mod tests {
             super::ppk_to_key(ED25519_ENC_PPK, Some("wrong")),
             Err(AppError::WrongPassphrase)
         ));
+    }
+
+    struct AnyoneServer;
+
+    impl russh::server::Handler for AnyoneServer {
+        type Error = russh::Error;
+
+        async fn auth_none(&mut self, _user: &str) -> Result<russh::server::Auth, Self::Error> {
+            Ok(russh::server::Auth::Accept)
+        }
+    }
+
+    // What `printf request | socat - TCP:...` does behind a remote forward: send, close the
+    // sending side, wait for the answer.
+    #[tokio::test]
+    async fn remote_forward_answers_a_client_that_stopped_sending() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::timeout;
+
+        let limit = Duration::from_secs(10);
+        let host_key = russh::keys::decode_secret_key(ED25519_OPENSSH, None).unwrap();
+        let fingerprint = host_key.public_key().fingerprint(Default::default()).to_string();
+        let config =
+            Arc::new(russh::server::Config { keys: vec![host_key], ..Default::default() });
+        let (client_side, server_side) = tokio::io::duplex(1 << 16);
+        let serving = tokio::spawn(russh::server::run_stream(config, server_side, AnyoneServer));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut known =
+            crate::ssh::known_hosts::KnownHosts::load(dir.path().join("known_hosts.json")).unwrap();
+        known.record("server", 22, &fingerprint).unwrap();
+        let (known, forwards) = (Arc::new(Mutex::new(known)), super::new_forwards());
+        let connecting = super::connect_over(client_side, "server", 22, known, forwards.clone());
+        let mut handle = timeout(limit, connecting).await.expect("connect hung").unwrap();
+        let login = timeout(limit, handle.authenticate_none("me")).await.expect("login hung");
+        assert!(login.unwrap().success());
+        let server = timeout(limit, serving).await.expect("the server hung").unwrap().unwrap();
+
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        forwards.lock().unwrap().insert(
+            ("127.0.0.1".to_string(), 7100),
+            super::RemoteTarget {
+                target_host: "127.0.0.1".into(),
+                target_port: target.local_addr().unwrap().port(),
+                up: Arc::default(),
+                down: Arc::default(),
+            },
+        );
+
+        let server = server.handle();
+        let opening = server.channel_open_forwarded_tcpip("127.0.0.1", 7100, "127.0.0.1", 1);
+        let mut channel = timeout(limit, opening).await.expect("no channel").unwrap();
+        channel.data(&b"ping"[..]).await.unwrap();
+        channel.eof().await.unwrap();
+
+        let accepting = timeout(limit, target.accept()).await.expect("no connection");
+        let (mut stream, _) = accepting.unwrap();
+        let mut asked = Vec::new();
+        // Returns once the client's end of sending has arrived here too.
+        timeout(limit, stream.read_to_end(&mut asked)).await.expect("no end").unwrap();
+        assert_eq!(asked, b"ping");
+        stream.write_all(b"pong").await.unwrap();
+        drop(stream);
+
+        loop {
+            match timeout(limit, channel.wait()).await.expect("no answer") {
+                Some(russh::ChannelMsg::Data { data }) => {
+                    assert_eq!(&data[..], b"pong");
+                    break;
+                }
+                Some(_) => {}
+                None => panic!("the channel closed without the answer"),
+            }
+        }
     }
 }

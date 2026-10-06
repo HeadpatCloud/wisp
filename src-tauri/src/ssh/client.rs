@@ -87,14 +87,7 @@ impl Handler for ClientHandler {
             else {
                 return;
             };
-            let (lr, lw) = local.into_split();
-            let (rr, rw) = tokio::io::split(channel.into_stream());
-            let up = tokio::spawn(crate::tunnel::pump(lr, rw, target.up));
-            // A far side that is done sending may still wait for its answer, so only an
-            // error here ends the other direction too.
-            if crate::tunnel::pump(rr, lw, target.down).await.is_err() {
-                up.abort();
-            }
+            crate::tunnel::relay(channel, local, target.up, target.down).await;
         });
         Ok(())
     }
@@ -245,6 +238,68 @@ pub async fn auth_agent(handle: &mut SshHandle, user: &str) -> AppResult<()> {
     Err(AppError::Auth("no agent identity accepted".into()))
 }
 
+// An in-process server that lets anyone in, for the tests of this module and of the tunnels.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use russh::server::{Auth, Config, Handle, Handler, Msg, Session};
+    use russh::Channel;
+    use tokio::sync::mpsc;
+    use tokio::time::timeout;
+
+    use super::{RemoteForwards, SshHandle};
+    use crate::ssh::known_hosts::KnownHosts;
+
+    struct Anyone(mpsc::UnboundedSender<Channel<Msg>>);
+
+    impl Handler for Anyone {
+        type Error = russh::Error;
+
+        async fn auth_none(&mut self, _user: &str) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+
+        async fn channel_open_direct_tcpip(
+            &mut self,
+            channel: Channel<Msg>,
+            _host_to_connect: &str,
+            _port_to_connect: u32,
+            _originator_address: &str,
+            _originator_port: u32,
+            _session: &mut Session,
+        ) -> Result<bool, Self::Error> {
+            Ok(self.0.send(channel).is_ok())
+        }
+    }
+
+    // A logged-in client, the server's side of it, and the direct-tcpip channels the client
+    // opens as they arrive at the server.
+    pub(crate) async fn session(
+    ) -> (SshHandle, RemoteForwards, Handle, mpsc::UnboundedReceiver<Channel<Msg>>) {
+        let limit = Duration::from_secs(10);
+        let key = include_str!("fixtures/id_ed25519_openssh");
+        let host_key = russh::keys::decode_secret_key(key, None).unwrap();
+        let fingerprint = host_key.public_key().fingerprint(Default::default()).to_string();
+        let config = Arc::new(Config { keys: vec![host_key], ..Default::default() });
+        let (client_side, server_side) = tokio::io::duplex(1 << 16);
+        let (arrived, opened) = mpsc::unbounded_channel();
+        let serving = tokio::spawn(russh::server::run_stream(config, server_side, Anyone(arrived)));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut known = KnownHosts::load(dir.path().join("known_hosts.json")).unwrap();
+        known.record("server", 22, &fingerprint).unwrap();
+        let (known, forwards) = (Arc::new(Mutex::new(known)), super::new_forwards());
+        let connecting = super::connect_over(client_side, "server", 22, known, forwards.clone());
+        let mut handle = timeout(limit, connecting).await.expect("connect hung").unwrap();
+        let login = timeout(limit, handle.authenticate_none("me")).await.expect("login hung");
+        assert!(login.unwrap().success());
+        let server = timeout(limit, serving).await.expect("the server hung").unwrap().unwrap();
+        (handle, forwards, server.handle(), opened)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use russh::keys::{Algorithm, HashAlg};
@@ -323,13 +378,54 @@ mod tests {
         ));
     }
 
-    struct AnyoneServer;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
-    impl russh::server::Handler for AnyoneServer {
-        type Error = russh::Error;
+    use russh::server::Msg;
+    use russh::{Channel, ChannelMsg};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::timeout;
 
-        async fn auth_none(&mut self, _user: &str) -> Result<russh::server::Auth, Self::Error> {
-            Ok(russh::server::Auth::Accept)
+    const LIMIT: Duration = Duration::from_secs(10);
+
+    struct Forwarded {
+        handle: super::SshHandle,
+        far: Channel<Msg>,
+        target: TcpStream,
+        // The forward's tasks hold a clone each for as long as they live.
+        counter: Arc<AtomicU64>,
+        _forwards: super::RemoteForwards,
+    }
+
+    // A remote forward with one connection from the far side open.
+    async fn forwarded() -> Forwarded {
+        let (handle, forwards, server, _opened) = super::testing::session().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let counter = Arc::new(AtomicU64::new(0));
+        forwards.lock().unwrap().insert(
+            ("127.0.0.1".to_string(), 7100),
+            super::RemoteTarget {
+                target_host: "127.0.0.1".into(),
+                target_port: listener.local_addr().unwrap().port(),
+                up: counter.clone(),
+                down: Arc::default(),
+            },
+        );
+        let opening = server.channel_open_forwarded_tcpip("127.0.0.1", 7100, "127.0.0.1", 1);
+        let far = timeout(LIMIT, opening).await.expect("no channel").unwrap();
+        let accepting = timeout(LIMIT, listener.accept()).await.expect("no connection");
+        let target = accepting.unwrap().0;
+        Forwarded { handle, far, target, counter, _forwards: forwards }
+    }
+
+    // The test and the registry keep one each.
+    async fn forward_is_gone(counter: &Arc<AtomicU64>) {
+        let started = Instant::now();
+        while Arc::strong_count(counter) > 2 {
+            assert!(started.elapsed() < Duration::from_secs(1), "a task of the forward lives on");
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -337,59 +433,21 @@ mod tests {
     // sending side, wait for the answer.
     #[tokio::test]
     async fn remote_forward_answers_a_client_that_stopped_sending() {
-        use std::sync::{Arc, Mutex};
-        use std::time::Duration;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::time::timeout;
+        let Forwarded { handle: _handle, mut far, mut target, counter, _forwards } =
+            forwarded().await;
+        far.data(&b"ping"[..]).await.unwrap();
+        far.eof().await.unwrap();
 
-        let limit = Duration::from_secs(10);
-        let host_key = russh::keys::decode_secret_key(ED25519_OPENSSH, None).unwrap();
-        let fingerprint = host_key.public_key().fingerprint(Default::default()).to_string();
-        let config =
-            Arc::new(russh::server::Config { keys: vec![host_key], ..Default::default() });
-        let (client_side, server_side) = tokio::io::duplex(1 << 16);
-        let serving = tokio::spawn(russh::server::run_stream(config, server_side, AnyoneServer));
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut known =
-            crate::ssh::known_hosts::KnownHosts::load(dir.path().join("known_hosts.json")).unwrap();
-        known.record("server", 22, &fingerprint).unwrap();
-        let (known, forwards) = (Arc::new(Mutex::new(known)), super::new_forwards());
-        let connecting = super::connect_over(client_side, "server", 22, known, forwards.clone());
-        let mut handle = timeout(limit, connecting).await.expect("connect hung").unwrap();
-        let login = timeout(limit, handle.authenticate_none("me")).await.expect("login hung");
-        assert!(login.unwrap().success());
-        let server = timeout(limit, serving).await.expect("the server hung").unwrap().unwrap();
-
-        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        forwards.lock().unwrap().insert(
-            ("127.0.0.1".to_string(), 7100),
-            super::RemoteTarget {
-                target_host: "127.0.0.1".into(),
-                target_port: target.local_addr().unwrap().port(),
-                up: Arc::default(),
-                down: Arc::default(),
-            },
-        );
-
-        let server = server.handle();
-        let opening = server.channel_open_forwarded_tcpip("127.0.0.1", 7100, "127.0.0.1", 1);
-        let mut channel = timeout(limit, opening).await.expect("no channel").unwrap();
-        channel.data(&b"ping"[..]).await.unwrap();
-        channel.eof().await.unwrap();
-
-        let accepting = timeout(limit, target.accept()).await.expect("no connection");
-        let (mut stream, _) = accepting.unwrap();
         let mut asked = Vec::new();
         // Returns once the client's end of sending has arrived here too.
-        timeout(limit, stream.read_to_end(&mut asked)).await.expect("no end").unwrap();
+        timeout(LIMIT, target.read_to_end(&mut asked)).await.expect("no end").unwrap();
         assert_eq!(asked, b"ping");
-        stream.write_all(b"pong").await.unwrap();
-        drop(stream);
+        target.write_all(b"pong").await.unwrap();
+        drop(target);
 
         loop {
-            match timeout(limit, channel.wait()).await.expect("no answer") {
-                Some(russh::ChannelMsg::Data { data }) => {
+            match timeout(LIMIT, far.wait()).await.expect("no answer") {
+                Some(ChannelMsg::Data { data }) => {
                     assert_eq!(&data[..], b"pong");
                     break;
                 }
@@ -397,5 +455,49 @@ mod tests {
                 None => panic!("the channel closed without the answer"),
             }
         }
+        far.close().await.unwrap();
+        forward_is_gone(&counter).await;
+    }
+
+    #[tokio::test]
+    async fn remote_forward_ends_when_the_far_side_closes_on_an_idle_target() {
+        let Forwarded { handle: _handle, far, mut target, counter, _forwards } =
+            forwarded().await;
+        far.data(&b"ping"[..]).await.unwrap();
+        far.eof().await.unwrap();
+        far.close().await.unwrap();
+
+        forward_is_gone(&counter).await;
+        let mut seen = Vec::new();
+        let ended = timeout(LIMIT, target.read_to_end(&mut seen)).await;
+        ended.expect("the target was left open").unwrap();
+        assert_eq!(seen, b"ping");
+    }
+
+    #[tokio::test]
+    async fn remote_forward_ends_when_the_far_side_closes_on_a_sending_target() {
+        let Forwarded { handle: _handle, far, mut target, counter, _forwards } =
+            forwarded().await;
+        let writing = tokio::spawn(async move {
+            let chunk = [0x55u8; 64 * 1024];
+            while target.write_all(&chunk).await.is_ok() {}
+        });
+        far.data(&b"ping"[..]).await.unwrap();
+        far.eof().await.unwrap();
+        far.close().await.unwrap();
+
+        forward_is_gone(&counter).await;
+        timeout(LIMIT, writing).await.expect("the target's writes hang").unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_forward_ends_with_the_session() {
+        let Forwarded { handle, far: _far, mut target, counter, _forwards } = forwarded().await;
+        handle.disconnect(russh::Disconnect::ByApplication, "", "en").await.unwrap();
+
+        forward_is_gone(&counter).await;
+        let mut seen = Vec::new();
+        let ended = timeout(LIMIT, target.read_to_end(&mut seen)).await;
+        ended.expect("the target was left open").unwrap();
     }
 }

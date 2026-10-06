@@ -1,9 +1,11 @@
 pub mod socks;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use russh::client::Msg;
+use russh::{Channel, ChannelMsg, ChannelWriteHalf};
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri::{AppHandle, Runtime};
@@ -55,6 +57,72 @@ where
     }
     let _ = w.shutdown().await;
     Ok(())
+}
+
+// The halves of a split channel do not close it when they go, and a relay's task can be
+// aborted at any point.
+struct CloseOnDrop(Option<ChannelWriteHalf<Msg>>);
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        if let Some(half) = self.0.take() {
+            tokio::spawn(async move {
+                // Fails only when the session is gone, and the channel with it.
+                let _ = half.close().await;
+            });
+        }
+    }
+}
+
+// Carries one forwarded connection. A far side that is done sending (EOF) may still wait for
+// its answer, so that only ends its own direction; a CLOSE, the end of the session or an
+// error on either side ends both.
+pub async fn relay(
+    channel: Channel<Msg>,
+    local: tokio::net::TcpStream,
+    up: Arc<AtomicU64>,
+    down: Arc<AtomicU64>,
+) {
+    let (lr, mut lw) = local.into_split();
+    let (mut far, near) = channel.split();
+    let writer = near.make_writer();
+    let _close = CloseOnDrop(Some(near));
+    let (sent, received) = (AtomicBool::new(false), AtomicBool::new(false));
+
+    let sending = async {
+        let ended = pump(lr, writer, up).await.is_ok();
+        sent.store(ended, Ordering::Relaxed);
+        ended
+    };
+    let receiving = async {
+        loop {
+            match far.wait().await {
+                Some(ChannelMsg::Data { data }) => {
+                    if lw.write_all(&data).await.is_err() {
+                        return;
+                    }
+                    down.fetch_add(data.len() as u64, Ordering::Relaxed);
+                }
+                Some(ChannelMsg::Eof) => {
+                    received.store(true, Ordering::Relaxed);
+                    if lw.shutdown().await.is_err() || sent.load(Ordering::Relaxed) {
+                        return;
+                    }
+                }
+                Some(ChannelMsg::Close) | None => return,
+                Some(_) => {}
+            }
+        }
+    };
+    tokio::pin!(receiving);
+    tokio::select! {
+        _ = &mut receiving => {}
+        ended = sending => {
+            if ended && !received.load(Ordering::Relaxed) {
+                receiving.await;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Type, Event)]

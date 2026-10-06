@@ -158,3 +158,21 @@ test('the other fields stay as typed while the closed dialog is still fading out
   expect(screen.getByLabelText('Username (optional)')).toHaveValue('')
   expect(screen.getByLabelText('Password')).toHaveValue('')
 })
+
+test('a second click on Connect while the dialog closes connects nothing more', async () => {
+  keepClosingDialog()
+  const onConnect = vi.fn()
+  const user = userEvent.setup()
+  render(<Reopenable onConnect={onConnect} />)
+  await user.type(screen.getByLabelText('Host'), 'mac')
+  await user.type(screen.getByLabelText('Password'), 'hunter2')
+  const connect = screen.getByRole('button', { name: 'Connect' })
+  await user.click(connect)
+  const content = document.querySelector('[data-slot="dialog-content"]')
+  expect(content).toHaveAttribute('data-state', 'closed')
+  expect(connect).toBeDisabled()
+  expect(content).not.toContainElement(document.activeElement as HTMLElement)
+
+  fireEvent.click(connect)
+  expect(onConnect.mock.calls).toEqual([['mac', 5900, '', 'hunter2']])
+})

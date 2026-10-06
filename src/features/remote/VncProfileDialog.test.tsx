@@ -447,3 +447,32 @@ test('the other fields stay as typed while the closed dialog is still fading out
   expect(field('Port')).toHaveValue(5901)
   expect(field('Username (optional)')).toHaveValue('faye')
 })
+
+async function saveTwiceAcrossTheClose() {
+  fireEvent.click(saveButton())
+  const content = document.querySelector('[data-slot="dialog-content"]')
+  await waitFor(() => expect(content).toHaveAttribute('data-state', 'closed'))
+  expect(saveButton()).toBeDisabled()
+  fireEvent.click(saveButton())
+  await new Promise((resolve) => setTimeout(resolve, 20))
+}
+
+test('a second click on Save while the dialog closes saves a new profile once', async () => {
+  keepClosingDialog()
+  render(<Reopenable editing={null} />)
+  fireEvent.change(field('Host'), { target: { value: 'mac' } })
+  fireEvent.change(field('Password'), { target: { value: 'hunter2' } })
+  await saveTwiceAcrossTheClose()
+
+  expect(calls).toEqual(['setSecret', 'save vault-new'])
+})
+
+test('a second click on Save while the dialog closes leaves an edited profile its new password', async () => {
+  keepClosingDialog()
+  render(<Reopenable editing={desk} />)
+  fireEvent.change(field('Password'), { target: { value: 'hunter3' } })
+  await saveTwiceAcrossTheClose()
+
+  expect(calls).toEqual(['setSecret', 'save vault-new', 'deleteSecret vault-old'])
+  expect(saved()).toEqual({ ...desk, secretId: 'vault-new' })
+})

@@ -86,10 +86,14 @@ export function VncConnectDialog({
           </Button>
           <Button
             type="button"
-            disabled={!host || !portValid}
-            onClick={() => {
+            disabled={!open || !host || !portValid}
+            onClick={(e) => {
+              // The closing dialog can still be clicked while it fades out.
+              if (!open) return
               onConnect(host, portNumber, username, password)
               onOpenChange(false)
+              // Otherwise the fading button keeps the focus the new tab's view looks for.
+              e.currentTarget.blur()
             }}
           >
             Connect

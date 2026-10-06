@@ -52,6 +52,8 @@ export function VncProfileDialog({
   const savedSecret = editing?.secretId ?? null
 
   const submit = async () => {
+    // The closing dialog can still be clicked while it fades out.
+    if (!open) return
     setError(null)
     // Save is disabled meanwhile: a second run would store another secret and another profile.
     setSaving(true)
@@ -153,7 +155,11 @@ export function VncProfileDialog({
           <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
             Cancel
           </Button>
-          <Button type="button" disabled={!target || !portValid || saving} onClick={submit}>
+          <Button
+            type="button"
+            disabled={!open || !target || !portValid || saving}
+            onClick={submit}
+          >
             Save
           </Button>
         </DialogFooter>

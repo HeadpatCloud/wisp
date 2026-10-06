@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
-use tauri::AppHandle;
+use tauri::{AppHandle, Runtime};
 use tauri_specta::Event;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -69,7 +69,7 @@ pub struct TunnelStatus {
     pub message: Option<String>,
 }
 
-fn emit(app: &AppHandle, status: TunnelStatus) {
+fn emit<R: Runtime>(app: &AppHandle<R>, status: TunnelStatus) {
     let _ = status.emit(app);
 }
 
@@ -102,8 +102,8 @@ fn bridge(
     .abort_handle()
 }
 
-pub fn run_local(
-    app: AppHandle,
+pub fn run_local<R: Runtime>(
+    app: AppHandle<R>,
     tunnel_id: String,
     session_id: String,
     handle: Arc<SshHandle>,
@@ -146,8 +146,8 @@ pub fn run_local(
     Ok(TunnelHandle { abort: task.abort_handle(), conns, session_id, remote: None })
 }
 
-pub fn run_dynamic(
-    app: AppHandle,
+pub fn run_dynamic<R: Runtime>(
+    app: AppHandle<R>,
     tunnel_id: String,
     session_id: String,
     handle: Arc<SshHandle>,
@@ -205,8 +205,8 @@ pub fn run_dynamic(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn run_remote(
-    app: AppHandle,
+pub async fn run_remote<R: Runtime>(
+    app: AppHandle<R>,
     tunnel_id: String,
     session_id: String,
     handle: Arc<SshHandle>,

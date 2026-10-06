@@ -70,3 +70,13 @@ services:
     init: true
     ports:
       - "127.0.0.1:5906:5900"
+
+  openssh:
+    build:
+      context: .
+      dockerfile: openssh/Dockerfile
+    container_name: wisp-test-openssh
+    init: true
+    ports:
+      - "127.0.0.1:2201:22"
+      - "127.0.0.1:2202:2222"

@@ -21,6 +21,17 @@ pub use vnc::decode::ENCODINGS;
 pub use vnc::handshake::Login;
 pub use vnc::session::Session;
 
+// Public for the live tests in tests/live_ssh.rs.
+pub mod live_ssh {
+    pub use crate::sftp::transfer::{download, upload};
+    pub use crate::sftp::{list, mkdir, open_sftp, remove, rename, stat, Sftp};
+    pub use crate::ssh::client::{
+        auth_key, auth_password, connect, connect_over, new_forwards, SshHandle,
+    };
+    pub use crate::ssh::session::{open_pty, run_session};
+    pub use crate::tunnel::{run_dynamic, run_local, run_remote, TunnelStatus};
+}
+
 use std::sync::{Arc, Mutex};
 
 use commands::ftp_cmds;

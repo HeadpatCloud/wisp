@@ -12,6 +12,8 @@ pub enum PtyMsg {
     Close,
 }
 
+// Reachable from outside only for tests/live_ssh.rs; nothing else implements it.
+#[allow(async_fn_in_trait)]
 pub trait PtyChannel {
     async fn next(&mut self) -> Option<PtyMsg>;
     async fn write(&mut self, data: &[u8]) -> AppResult<()>;

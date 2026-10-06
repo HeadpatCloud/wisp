@@ -1,8 +1,8 @@
-# VNC test servers
+# Test servers
 
-Seven VNC servers in Docker for the live VNC tests. Every port is published on `127.0.0.1`
-only. The passwords are fixed and written down here, so none of this may ever be reachable
-from a network.
+Seven VNC servers and one OpenSSH server in Docker for the live tests. Every port is
+published on `127.0.0.1` only. The passwords are fixed and written down here, so none of this
+may ever be reachable from a network.
 
 ## Start and stop
 
@@ -264,3 +264,102 @@ All servers
 - If `up` builds the images and then fails to create some containers because their image is
   gone, the Docker host is deleting unused images. Docker Desktop with Kubernetes enabled
   does that while its disk is nearly full. Run the same command again.
+
+## OpenSSH server
+
+`openssh` (container `wisp-test-openssh`) is OpenSSH 10.0p2 on the same Debian 13.7, with two
+`sshd` on the same host keys:
+
+| address | sshd | for |
+|---|---|---|
+| `127.0.0.1:2201` | Debian's `sshd_config` plus `/etc/ssh/sshd_config.d/wisp.conf` | normal sessions |
+| `127.0.0.1:2202` | the same, with `openssh/sshd_rekey.conf` in front: `RekeyLimit 1M 10s`, `LogLevel DEBUG1` | new keys after every mebibyte |
+
+Both send `SSH-2.0-OpenSSH_10.0p2 Debian-7+deb13u4`. `docker logs wisp-test-openssh` has the
+log of both.
+
+- User `wisp`, password `wisptest`, shell `bash`, home `/home/wisp`. Password and public key
+  login are on, keyboard-interactive is off, TCP forwarding is on, `GatewayPorts` is off.
+- Client keys in `/etc/wisp/keys/`, all three in `~wisp/.ssh/authorized_keys`: `id_ed25519`,
+  `id_rsa` (3072 bit) and `id_ed25519_enc` (passphrase `wisptest`). They are readable by root
+  only: `docker exec wisp-test-openssh cat /etc/wisp/keys/id_ed25519`.
+- The host keys and the client keys are made when the image is built, so they stay the same
+  until that image layer is built again. What a client is shown:
+
+  ```bash
+  docker exec wisp-test-openssh ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+  ```
+- Inside, `socat` echoes on `127.0.0.1:7000`, and on `127.0.0.1:7001` it accepts connections
+  and reads nothing from them (each is held for 10 minutes by a `sleep`, also after the
+  client has gone). `socat`, `sha256sum`, `dd` and `head` are there for checks from inside.
+- `docker exec` runs as root; add `-u wisp` to act as the user.
+
+### Live tests
+
+`src-tauri/tests/live_ssh.rs` drives the app's own SSH, SFTP and tunnel functions against this
+server. A plain `cargo test` skips them.
+
+```bash
+docker compose -f test-env/docker-compose.yml up -d openssh
+cargo test --manifest-path src-tauri/Cargo.toml --test live_ssh -- --ignored --test-threads=1 --nocapture
+```
+
+A run takes about three minutes, 90 s of it in `idle_session_survives`. It writes up to
+1.3 GB into the system's temporary folder and 2.5 GB into the container, and removes both.
+Every test that measures prints one line `MEASURE <test> <name>=<value> ...`.
+
+### Measured with russh 0.61.2
+
+Three runs on 2026-10-06, test binary built with the `test` profile (not optimised), server
+and client on the same machine. russh and the server agreed on `mlkem768x25519-sha256`,
+host key `ssh-ed25519` and `chacha20-poly1305@openssh.com`.
+
+| test | value | run 1 | run 2 | run 3 |
+|---|---|---|---|---|
+| `sftp_round_trip` (64 MiB) | upload MiB/s | 139.4 | 151.1 | 144.6 |
+| | download MiB/s | 60.1 | 59.2 | 69.8 |
+| `sftp_through_forced_rekeys` (64 MiB, port 2202) | upload MiB/s | 76.7 | 75.6 | 75.3 |
+| | download MiB/s | 26.8 | 27.3 | 28.8 |
+| | key exchanges during the upload | 29 | 31 | 26 |
+| | key exchanges during the download | 85 | 85 | 85 |
+| `sftp_past_one_gibibyte` (1200 MiB) | download s | 17.4 | 18.5 | 18.7 |
+| | upload s | 6.1 | 6.0 | 6.2 |
+| | download MiB/s | 68.8 | 64.8 | 64.3 |
+| | upload MiB/s | 197.3 | 200.3 | 194.9 |
+| `local_forward_carries_bulk_both_ways` (8 MiB) | MiB/s | 32.7 | 39.5 | 37.7 |
+| `shell_stays_responsive_while_a_tunnel_is_blocked` | echo median ms | 0.6 | 0.6 | 0.5 |
+| | echo maximum ms | 1.3 | 1.5 | 1.3 |
+| | the same before the tunnel, median / maximum ms | 0.5 / 0.7 | 0.5 / 0.6 | 0.6 / 0.7 |
+| | KiB written before the write blocked | 5248 | 4800 | 4480 |
+| `shell_stays_responsive_during_a_transfer` (256 MiB) | echo median ms | 9.6 | 7.7 | 8.6 |
+| | echo maximum ms | 24.7 | 10.2 | 11.3 |
+| | the same before the upload, median / maximum ms | 0.5 / 0.7 | 0.5 / 0.6 | 0.5 / 0.9 |
+| | upload MiB/s | 162.6 | 173.4 | 167.3 |
+| | MiB sent when the echoes began / ended | 16 / 53 | 17 / 53 | 17 / 54 |
+| `shell_echo_and_resize` | echo ms | 0.7 | 0.7 | 0.7 |
+| `idle_session_survives` | echo after 90 s, ms | 1.3 | 1.4 | 1.3 |
+| `password_login` | connect ms | 24.2 | 21.9 | 24.5 |
+| | wrong password refused after ms | 4284.7 | 2142.9 | 2142.9 |
+| | login ms | 19.1 | 19.6 | 36.0 |
+| `key_login` | ed25519 ms | 19.9 | 19.6 | 19.9 |
+| | RSA ms | 30.8 | 39.3 | 42.6 |
+| | ed25519 with passphrase ms | 422.1 | 359.7 | 414.1 |
+| `jump_host` | channel, connect and login of the second hop, ms | 232.8 | 245.7 | 242.0 |
+| | echo ms | 0.7 | 0.8 | 0.7 |
+| `dynamic_forward` | SOCKS5 greeting to reply, ms | 1.4 | 3.5 | 4.4 |
+| `remote_forward` | `docker exec` of `socat` with the exchange, ms | 180.1 | 180.2 | 181.1 |
+
+### Quirks
+
+- A download gets one key exchange per 789,196 bytes `sshd` sent. During a 64 MiB upload
+  `sshd` had received 1.7 to 3.1 MB between two exchanges, so an upload sees about a third
+  as many.
+- `sshd` logs a line with `rekeying out` for every exchange at `DEBUG1`.
+- A wrong password is refused after 2.14 s or after 4.28 s, with one `Failed password` line
+  in the log either way.
+- `sshd` counts connections that end without a login against the client's address
+  (`PerSourcePenalties`, logged as `srclimit_penalise`), and all clients come from the Docker
+  gateway. A probe of the banner costs 1 s and a failed login 5 s; the address is refused
+  once 15 s have added up. A run of the suite does not get there.
+- `printf 'ping\n' | socat - TCP:127.0.0.1:7100` closes its sending side as soon as `ping`
+  is out and then waits for the answer.

@@ -1,6 +1,6 @@
 pub mod socks;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,7 +12,7 @@ use tauri::{AppHandle, Runtime};
 use tauri_specta::Event;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::task::AbortHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::error::{AppError, AppResult};
 use crate::ssh::client::{RemoteForwards, RemoteTarget, SshHandle};
@@ -74,52 +74,79 @@ impl Drop for CloseOnDrop {
     }
 }
 
+struct AbortOnDrop(JoinHandle<std::io::Result<()>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 // Carries one forwarded connection. A far side that is done sending (EOF) may still wait for
 // its answer, so that only ends its own direction; a CLOSE, the end of the session or an
-// error on either side ends both.
+// error on either side ends both. `over` tells whether the session has ended.
 pub async fn relay(
     channel: Channel<Msg>,
     local: tokio::net::TcpStream,
     up: Arc<AtomicU64>,
     down: Arc<AtomicU64>,
+    over: impl Fn() -> bool + Send + Sync,
 ) {
     let (lr, mut lw) = local.into_split();
     let (mut far, near) = channel.split();
     let writer = near.make_writer();
     let _close = CloseOnDrop(Some(near));
-    let (sent, received) = (AtomicBool::new(false), AtomicBool::new(false));
+    // In a task of its own: sharing one with the receiving side, the local peer is read too
+    // slowly when much arrives for it, and the session stalls more often when a peer sends
+    // back what it gets.
+    let mut sending = AbortOnDrop(tokio::spawn(pump(lr, writer, up)));
+    let (mut sent, mut received) = (false, false);
 
-    let sending = async {
-        let ended = pump(lr, writer, up).await.is_ok();
-        sent.store(ended, Ordering::Relaxed);
-        ended
-    };
-    let receiving = async {
-        loop {
-            match far.wait().await {
+    while !(sent && received) {
+        tokio::select! {
+            ended = &mut sending.0, if !sent => {
+                if !matches!(ended, Ok(Ok(()))) {
+                    return;
+                }
+                sent = true;
+            }
+            msg = far.wait() => match msg {
                 Some(ChannelMsg::Data { data }) => {
-                    if lw.write_all(&data).await.is_err() {
+                    if !deliver(&mut lw, &data, &over).await {
                         return;
                     }
                     down.fetch_add(data.len() as u64, Ordering::Relaxed);
                 }
                 Some(ChannelMsg::Eof) => {
-                    received.store(true, Ordering::Relaxed);
-                    if lw.shutdown().await.is_err() || sent.load(Ordering::Relaxed) {
+                    received = true;
+                    if lw.shutdown().await.is_err() {
                         return;
                     }
                 }
                 Some(ChannelMsg::Close) | None => return,
                 Some(_) => {}
-            }
+            },
         }
-    };
-    tokio::pin!(receiving);
-    tokio::select! {
-        _ = &mut receiving => {}
-        ended = sending => {
-            if ended && !received.load(Ordering::Relaxed) {
-                receiving.await;
+    }
+}
+
+// False when the local peer is gone, or when the session ended while that peer was not
+// reading: what the channel still holds for it then hides the channel's end.
+async fn deliver(
+    local: &mut tokio::net::tcp::OwnedWriteHalf,
+    data: &[u8],
+    over: &(impl Fn() -> bool + Sync),
+) -> bool {
+    let writing = local.write_all(data);
+    tokio::pin!(writing);
+    loop {
+        tokio::select! {
+            biased;
+            written = &mut writing => return written.is_ok(),
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                if over() {
+                    return false;
+                }
             }
         }
     }
@@ -161,7 +188,7 @@ fn bridge(
         else {
             return;
         };
-        relay(channel, local, up, down).await;
+        relay(channel, local, up, down, || handle.is_closed()).await;
     })
     .abort_handle()
 }
@@ -246,7 +273,7 @@ pub fn run_dynamic<R: Runtime>(
                             match handle.channel_open_direct_tcpip(host, port as u32, oa, 0).await {
                                 Ok(channel) => {
                                     if socks::reply(&mut local, 0x00).await.is_err() { return; }
-                                    relay(channel, local, up, down).await;
+                                    relay(channel, local, up, down, || handle.is_closed()).await;
                                 }
                                 Err(_) => { let _ = socks::reply(&mut local, 0x05).await; }
                             }
@@ -330,7 +357,7 @@ mod tests {
         client: TcpStream,
         service: Channel<russh::server::Msg>,
         task: AbortHandle,
-        _handle: Arc<SshHandle>,
+        handle: Arc<SshHandle>,
         _dynamic: Option<(tauri::App<MockRuntime>, TunnelHandle)>,
     }
 
@@ -343,7 +370,7 @@ mod tests {
         let counters = (Arc::default(), Arc::default());
         let task = bridge(handle.clone(), accepted, "service".into(), 80, counters.0, counters.1);
         let service = timeout(LIMIT, opened.recv()).await.expect("no channel").unwrap();
-        Forward { client, service, task, _handle: handle, _dynamic: None }
+        Forward { client, service, task, handle, _dynamic: None }
     }
 
     async fn dynamic() -> Forward {
@@ -377,7 +404,7 @@ mod tests {
         assert_eq!(reply, [5, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
         let service = timeout(LIMIT, opened.recv()).await.expect("no channel").unwrap();
         let task = tunnel.conns.lock().unwrap()[0].clone();
-        Forward { client, service, task, _handle: handle, _dynamic: Some((app, tunnel)) }
+        Forward { client, service, task, handle, _dynamic: Some((app, tunnel)) }
     }
 
     async fn gone(task: &AbortHandle) {
@@ -433,6 +460,30 @@ mod tests {
             sleep(Duration::from_millis(10)).await;
         }
         gone(&forward.task).await;
+    }
+
+    // More arrives than the client's socket takes unread, in fewer packets than the channel's
+    // queue holds: with that queue full the session itself would hang.
+    async fn ends_with_the_session_while_the_client_does_not_read(forward: Forward) {
+        let Forward { client: _client, service, task, handle, _dynamic } = forward;
+        let sending = tokio::spawn(async move {
+            service.data_bytes(vec![0x55u8; 2 * 1024 * 1024]).await.unwrap();
+            service
+        });
+        let _service = timeout(LIMIT, sending).await.expect("the service could not send").unwrap();
+        sleep(Duration::from_millis(200)).await;
+        handle.disconnect(russh::Disconnect::ByApplication, "", "en").await.unwrap();
+        gone(&task).await;
+    }
+
+    #[tokio::test]
+    async fn local_forward_ends_with_the_session_while_the_client_does_not_read() {
+        ends_with_the_session_while_the_client_does_not_read(local().await).await;
+    }
+
+    #[tokio::test]
+    async fn dynamic_forward_ends_with_the_session_while_the_client_does_not_read() {
+        ends_with_the_session_while_the_client_does_not_read(dynamic().await).await;
     }
 
     #[tokio::test]

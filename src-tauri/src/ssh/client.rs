@@ -32,6 +32,8 @@ pub struct ClientHandler {
     host: String,
     port: u16,
     remote_forwards: RemoteForwards,
+    // Goes with the session; its forwards watch for that.
+    alive: Arc<()>,
 }
 
 impl Handler for ClientHandler {
@@ -81,13 +83,15 @@ impl Handler for ClientHandler {
         let Some(target) = target else {
             return Ok(());
         };
+        let session = Arc::downgrade(&self.alive);
         tokio::spawn(async move {
             let Ok(local) =
                 tokio::net::TcpStream::connect((target.target_host.as_str(), target.target_port)).await
             else {
                 return;
             };
-            crate::tunnel::relay(channel, local, target.up, target.down).await;
+            let over = move || session.strong_count() == 0;
+            crate::tunnel::relay(channel, local, target.up, target.down, over).await;
         });
         Ok(())
     }
@@ -101,8 +105,13 @@ pub async fn connect(
 ) -> AppResult<SshHandle> {
     let config = client_config();
     let host = crate::net::normalize_host(host);
-    let handler =
-        ClientHandler { known_hosts, host: host.clone(), port, remote_forwards };
+    let handler = ClientHandler {
+        known_hosts,
+        host: host.clone(),
+        port,
+        remote_forwards,
+        alive: Arc::default(),
+    };
     let handle = client::connect(config, (host.as_str(), port), handler).await?;
     Ok(handle)
 }
@@ -118,7 +127,13 @@ where
     R: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let config = client_config();
-    let handler = ClientHandler { known_hosts, host: host.to_string(), port, remote_forwards };
+    let handler = ClientHandler {
+        known_hosts,
+        host: host.to_string(),
+        port,
+        remote_forwards,
+        alive: Arc::default(),
+    };
     let handle = client::connect_stream(config, stream, handler).await?;
     Ok(handle)
 }
@@ -499,5 +514,21 @@ mod tests {
         let mut seen = Vec::new();
         let ended = timeout(LIMIT, target.read_to_end(&mut seen)).await;
         ended.expect("the target was left open").unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_forward_ends_with_the_session_while_the_target_does_not_read() {
+        let Forwarded { handle, far, target: _target, counter, _forwards } = forwarded().await;
+        // More than a socket takes unread, in fewer packets than the channel's queue holds:
+        // with that queue full the session itself would hang.
+        let sending = tokio::spawn(async move {
+            far.data_bytes(vec![0x55u8; 2 * 1024 * 1024]).await.unwrap();
+            far
+        });
+        let _far = timeout(LIMIT, sending).await.expect("the far side could not send").unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        handle.disconnect(russh::Disconnect::ByApplication, "", "en").await.unwrap();
+
+        forward_is_gone(&counter).await;
     }
 }

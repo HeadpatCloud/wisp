@@ -2,7 +2,6 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::error::TrySendError;
@@ -18,7 +17,7 @@ use super::proto::{
 use super::{err, MAX_TEXT, PIXEL_FORMAT};
 use crate::commands::ssh_cmds::KnownHostsState;
 use crate::error::{AppError, AppResult};
-use crate::remote::FrameOp;
+use crate::remote::{keep_alive, FrameOp};
 
 pub struct Session {
     pub width: u16,
@@ -55,10 +54,7 @@ impl Session {
         let opening = async {
             let tcp = TcpStream::connect((crate::net::normalize_host(host).as_str(), port)).await?;
             tcp.set_nodelay(true)?;
-            let keepalive = TcpKeepalive::new()
-                .with_time(Duration::from_secs(30))
-                .with_interval(Duration::from_secs(10));
-            SockRef::from(&tcp).set_tcp_keepalive(&keepalive)?;
+            keep_alive(&tcp)?;
             handshake(Box::new(tcp), login, &TlsContext { host, port, known }).await
         };
         let (mut stream, init) = tokio::time::timeout(limit, opening)

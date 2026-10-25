@@ -34,7 +34,6 @@ use ironrdp_session::{
     fast_path, ActiveStage, ActiveStageBuilder, ActiveStageOutput, SessionError, SessionErrorKind,
 };
 use ironrdp_tokio::{split_tokio_framed, FramedWrite as _, TokioFramed};
-use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::error::TrySendError;
@@ -51,7 +50,7 @@ use super::err;
 use super::input::{Input, Translator};
 use crate::commands::ssh_cmds::KnownHostsState;
 use crate::error::{AppError, AppResult};
-use crate::remote::FrameOp;
+use crate::remote::{keep_alive, FrameOp};
 
 pub(crate) const CONNECT_LIMIT: Duration = Duration::from_secs(10);
 const REACTIVATE_LIMIT: Duration = Duration::from_secs(10);
@@ -68,8 +67,6 @@ const FIRST_RESIZE_LIMIT: Duration = Duration::from_secs(1);
 const MAX_CHANNEL_MESSAGE: usize = 16 << 20;
 const MAX_DYNAMIC_MESSAGE: usize = 64 << 10;
 const HEADER_SIZE: usize = 8;
-const KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
 pub struct Session {
     pub width: u16,
@@ -291,15 +288,6 @@ impl Session {
         }
         task.shutdown().await;
     }
-}
-
-fn keep_alive(tcp: &TcpStream) -> std::io::Result<()> {
-    // Windows sends 10 probes unless told otherwise: 130 s for a link that is gone.
-    let keepalive = TcpKeepalive::new()
-        .with_time(KEEPALIVE_IDLE)
-        .with_interval(KEEPALIVE_INTERVAL)
-        .with_retries(2);
-    SockRef::from(tcp).set_tcp_keepalive(&keepalive)
 }
 
 struct Task<S, F> {
@@ -2778,18 +2766,6 @@ mod tests {
         let refused = session.err().expect("the connect worked");
         assert!(matches!(&refused, AppError::Io(os) if !os.is_empty()), "{refused:?}");
         assert_eq!(rest(&mut ops).await, []);
-    }
-
-    // A server that is gone without a word (a VM turned off) leaves only the keepalive to notice.
-    #[tokio::test]
-    async fn the_keepalive_gives_up_on_a_dead_link_within_a_minute() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let tcp = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
-        keep_alive(&tcp).unwrap();
-        // socket2 has no getter for the other two on Windows.
-        let probes = SockRef::from(&tcp).tcp_keepalive_retries().unwrap();
-        let limit = KEEPALIVE_IDLE + KEEPALIVE_INTERVAL * probes;
-        assert!(limit < Duration::from_secs(60), "{probes} probes: {limit:?}");
     }
 
     async fn after_login(bytes: Vec<u8>, hang_up: bool) -> Option<Vec<FrameOp>> {

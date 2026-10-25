@@ -13,6 +13,7 @@ import {
 } from '@/lib/transfer'
 import { cn } from '@/lib/utils'
 import { useProfileStore } from '@/stores/profileStore'
+import { useRdpProfileStore } from '@/stores/rdpProfileStore'
 import { useS3ProfileStore } from '@/stores/s3ProfileStore'
 import { useSessionStore } from '@/stores/sessionStore'
 import { useSftpProfileStore } from '@/stores/sftpProfileStore'
@@ -35,6 +36,7 @@ const KIND: Record<ItemKind, string> = {
   sftp: 'SFTP',
   s3: 'S3',
   vnc: 'VNC',
+  rdp: 'RDP',
 }
 
 function errorText(e: unknown): string {
@@ -47,6 +49,7 @@ export function ImportReviewPage({ tabId, path }: { tabId: string; path: string 
   const reloadSftp = useSftpProfileStore((s) => s.load)
   const reloadS3 = useS3ProfileStore((s) => s.load)
   const reloadVnc = useVncProfileStore((s) => s.load)
+  const reloadRdp = useRdpProfileStore((s) => s.load)
   const [stage, setStage] = useState<'loading' | 'password' | 'review' | 'done'>('loading')
   const [password, setPassword] = useState('')
   const [wrongPassword, setWrongPassword] = useState(false)
@@ -142,7 +145,7 @@ export function ImportReviewPage({ tabId, path }: { tabId: string; path: string 
       reviewIdRef.current = null
       setSummary(result)
       setStage('done')
-      await Promise.all([reloadProfiles(), reloadSftp(), reloadS3(), reloadVnc()])
+      await Promise.all([reloadProfiles(), reloadSftp(), reloadS3(), reloadVnc(), reloadRdp()])
     } catch (e) {
       failedRef.current = decisions
       setError(errorText(e))

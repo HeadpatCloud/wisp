@@ -1,9 +1,6 @@
 use std::sync::Arc;
 
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, WebPkiSupportedAlgorithms};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{CertificateError, ClientConfig, DigitallySignedStruct, SignatureScheme};
+use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_rustls::TlsConnector;
 use zeroize::Zeroizing;
@@ -12,6 +9,7 @@ use super::err;
 use super::handshake::{Login, Stream, TlsContext, NEEDS_PASSWORD};
 use super::proto::vnc_auth_response;
 use crate::error::{AppError, AppResult};
+use crate::remote::tls;
 use crate::remote::trust::{self, Scheme};
 
 const NONE: u32 = 1;
@@ -62,70 +60,8 @@ fn choose_subtype(offered: &[u32], login: &Login<'_>) -> Result<u32, String> {
     Err(format!("the server offers only: {}", names.join(", ")))
 }
 
-// Accepts any chain and name: trust comes from the pinned fingerprint, checked after the handshake.
-#[derive(Debug)]
-struct PinnedLater(WebPkiSupportedAlgorithms);
-
-impl ServerCertVerifier for PinnedLater {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        verify_tls12_signature(message, cert, dss, &self.0)
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        verify_tls13_signature(message, cert, dss, &self.0)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.0.supported_schemes()
-    }
-}
-
-// rustls has only a Debug dump for a certificate it cannot read.
 fn tls_failure(e: std::io::Error) -> AppError {
-    let unsupported = match e.get_ref().and_then(|inner| inner.downcast_ref::<rustls::Error>()) {
-        // An RSA key rustls finds too small is reported exactly as a forged signature is.
-        Some(rustls::Error::InvalidCertificate(CertificateError::BadSignature)) => {
-            return err(
-                "the server's certificate could not be verified \
-                 (bad signature, or an RSA key under 2048 bits)",
-            );
-        }
-        Some(rustls::Error::InvalidCertificate(CertificateError::Other(other)))
-            if other.to_string() == "UnsupportedCertVersion" =>
-        {
-            Some("not X.509 version 3")
-        }
-        Some(rustls::Error::InvalidCertificate(
-            CertificateError::UnsupportedSignatureAlgorithmContext { .. }
-            | CertificateError::UnsupportedSignatureAlgorithmForPublicKeyContext { .. },
-        )) => Some("signature algorithm"),
-        _ => None,
-    };
-    match unsupported {
-        Some(reason) => err(format!("the server's certificate is not supported ({reason})")),
-        None => err(format!("TLS handshake failed: {e}")),
-    }
+    err(tls::failure(&e))
 }
 
 async fn answer_challenge(
@@ -185,15 +121,7 @@ pub async fn negotiate(
         return Err(err(format!("the server refused {}", subtype_name(subtype))));
     }
 
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let verifier = PinnedLater(provider.signature_verification_algorithms);
-    let config = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| err(e.to_string()))?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(verifier))
-        .with_no_client_auth();
-    let mut stream = TlsConnector::from(Arc::new(config))
+    let mut stream = TlsConnector::from(Arc::new(tls::client_config()))
         .connect(name, stream)
         .await
         .map_err(tls_failure)?;
@@ -234,7 +162,7 @@ mod tests {
 
     use rustls::crypto::ring::default_provider;
     use rustls::pki_types::pem::PemObject;
-    use rustls::pki_types::PrivateKeyDer;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use rustls::sign::{CertifiedKey, SingleCertAndKey};
     use rustls::version::{TLS12, TLS13};
     use rustls::{ServerConfig, SupportedProtocolVersion};

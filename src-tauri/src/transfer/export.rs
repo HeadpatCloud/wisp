@@ -70,6 +70,7 @@ pub fn build(
     let sftp_ids: HashSet<&str> = sel.sftp_ids.iter().map(String::as_str).collect();
     let s3_ids: HashSet<&str> = sel.s3_ids.iter().map(String::as_str).collect();
     let vnc_ids: HashSet<&str> = sel.vnc_ids.iter().map(String::as_str).collect();
+    let rdp_ids: HashSet<&str> = sel.rdp_ids.iter().map(String::as_str).collect();
     let mut payload = Payload {
         groups: data.groups.iter().filter(|g| group_ids.contains(g.id.as_str())).cloned().collect(),
         profiles: data
@@ -96,6 +97,12 @@ pub fn build(
             .filter(|p| vnc_ids.contains(p.id.as_str()))
             .cloned()
             .collect(),
+        rdp_profiles: data
+            .rdp_profiles
+            .iter()
+            .filter(|p| rdp_ids.contains(p.id.as_str()))
+            .cloned()
+            .collect(),
         ..Default::default()
     };
 
@@ -110,6 +117,9 @@ pub fn build(
         owners.push((&p.name, p.secret_id.as_deref(), &[]));
     }
     for p in &payload.vnc_profiles {
+        owners.push((&p.name, p.secret_id.as_deref(), &[]));
+    }
+    for p in &payload.rdp_profiles {
         owners.push((&p.name, p.secret_id.as_deref(), &[]));
     }
 
@@ -149,7 +159,9 @@ pub fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::model::{AuthMethod, Group, IconRef, Profile, ProfileKey, VncProfile};
+    use crate::store::model::{
+        AuthMethod, Group, IconRef, Profile, ProfileKey, RdpProfile, VncProfile,
+    };
     use crate::transfer::MapEnv;
 
     fn group(id: &str, parent: Option<&str>) -> Group {
@@ -159,6 +171,7 @@ mod tests {
             parent_id: parent.map(Into::into),
             icon: IconRef::default(),
             order: 0,
+            extra: Default::default(),
         }
     }
 
@@ -182,6 +195,7 @@ mod tests {
             jump_host_id: jump.map(Into::into),
             tunnels: vec![],
             appearance: None,
+            extra: Default::default(),
         }
     }
 
@@ -196,6 +210,7 @@ mod tests {
             sftp_profiles: vec![],
             s3_profiles: vec![],
             vnc_profiles: vec![],
+            rdp_profiles: vec![],
             unknown: Default::default(),
         }
     }
@@ -210,6 +225,23 @@ mod tests {
             secret_id: secret.map(Into::into),
             icon: IconRef::default(),
             order: 0,
+            extra: Default::default(),
+        }
+    }
+
+    fn rdp(id: &str, secret: Option<&str>) -> RdpProfile {
+        RdpProfile {
+            id: id.into(),
+            name: id.into(),
+            host: "h".into(),
+            port: 3389,
+            username: "u".into(),
+            domain: Some("CORP".into()),
+            secret_id: secret.map(Into::into),
+            keyboard_layout: Some(0x407),
+            icon: IconRef::default(),
+            order: 0,
+            extra: Default::default(),
         }
     }
 
@@ -328,5 +360,39 @@ mod tests {
         assert_eq!(payload.vnc_profiles.len(), 2);
         assert!(payload.secrets.is_empty());
         assert_eq!(warnings, ["Couldn't read a saved password for \"desk\""]);
+    }
+
+    #[test]
+    fn selected_rdp_profile_is_exported_with_its_password_only_when_asked() {
+        let mut data = store();
+        data.rdp_profiles = vec![rdp("office", Some("rdp-pw")), rdp("lab", None)];
+        let sel = ExportSelection { rdp_ids: vec!["office".into()], ..Default::default() };
+        let mut env = MapEnv::default();
+        env.secrets.insert("rdp-pw".into(), b"pass".to_vec());
+
+        let (plain, warnings) = build(&data, &env, &sel, &ExportOptions::default());
+        assert_eq!(plain.rdp_profiles, [data.rdp_profiles[0].clone()]);
+        assert!(plain.groups.is_empty() && plain.profiles.is_empty());
+        assert!(plain.secrets.is_empty() && warnings.is_empty());
+
+        let opts = ExportOptions { include_secrets: true, include_keys: true };
+        let (full, warnings) = build(&data, &env, &sel, &opts);
+        assert_eq!(full.rdp_profiles, plain.rdp_profiles);
+        assert_eq!(full.secrets.len(), 1);
+        assert_eq!(full.secrets.get("rdp-pw").map(|v| v.as_str()), Some("pass"));
+        assert!(full.key_files.is_empty() && warnings.is_empty());
+    }
+
+    #[test]
+    fn unreadable_rdp_password_becomes_a_warning() {
+        let mut data = store();
+        data.rdp_profiles = vec![rdp("office", Some("rdp-pw")), rdp("lab", None)];
+        let sel =
+            ExportSelection { rdp_ids: vec!["office".into(), "lab".into()], ..Default::default() };
+        let opts = ExportOptions { include_secrets: true, include_keys: false };
+        let (payload, warnings) = build(&data, &MapEnv::default(), &sel, &opts);
+        assert_eq!(payload.rdp_profiles.len(), 2);
+        assert!(payload.secrets.is_empty());
+        assert_eq!(warnings, ["Couldn't read a saved password for \"office\""]);
     }
 }

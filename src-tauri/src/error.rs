@@ -38,6 +38,9 @@ pub enum AppError {
     Import(String),
     #[error("internal error: {0}")]
     Internal(String),
+    // The caller closed what it was waiting for.
+    #[error("cancelled")]
+    Cancelled,
 }
 
 pub type AppResult<T> = Result<T, AppError>;

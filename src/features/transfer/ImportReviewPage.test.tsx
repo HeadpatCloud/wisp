@@ -4,8 +4,9 @@ import { StrictMode } from 'react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
 const listVncProfiles = vi.hoisted(() => vi.fn())
+const listRdpProfiles = vi.hoisted(() => vi.fn())
 
-vi.mock('@/bindings', () => ({ commands: { listVncProfiles } }))
+vi.mock('@/bindings', () => ({ commands: { listVncProfiles, listRdpProfiles } }))
 vi.mock('@/lib/transfer', () => ({
   readBundle: vi.fn(),
   validateImport: vi.fn().mockResolvedValue([]),
@@ -13,7 +14,7 @@ vi.mock('@/lib/transfer', () => ({
   discardImport: vi.fn().mockResolvedValue(undefined),
 }))
 
-import type { ImportReview, ItemProblem, VncProfile } from '@/bindings'
+import type { ImportReview, ItemProblem, RdpProfile, VncProfile } from '@/bindings'
 import {
   applyImport,
   discardImport,
@@ -22,6 +23,7 @@ import {
   validateImport,
 } from '@/lib/transfer'
 import { useProfileStore } from '@/stores/profileStore'
+import { useRdpProfileStore } from '@/stores/rdpProfileStore'
 import { useS3ProfileStore } from '@/stores/s3ProfileStore'
 import { useSessionStore } from '@/stores/sessionStore'
 import { useSftpProfileStore } from '@/stores/sftpProfileStore'
@@ -77,6 +79,7 @@ beforeEach(() => {
   useSftpProfileStore.setState({ load } as never)
   useS3ProfileStore.setState({ load } as never)
   useVncProfileStore.setState({ load } as never)
+  useRdpProfileStore.setState({ load } as never)
   useSessionStore.setState({ removeTab } as never)
 })
 
@@ -114,7 +117,7 @@ test('field toggles, apply payload, reload and summary', async () => {
     { key: 'ssh:n', accept: true, asNew: false, fields: [] },
   ])
   expect(await screen.findByText('Imported: 1 added, 1 updated.')).toBeInTheDocument()
-  expect(load).toHaveBeenCalledTimes(4)
+  expect(load).toHaveBeenCalledTimes(5)
 })
 
 test('a VNC profile is labelled VNC in the list and in its details', async () => {
@@ -176,6 +179,78 @@ test('an imported VNC profile is in the VNC store once the import is applied', a
   expect(await screen.findByText('Imported: 1 added, 0 updated.')).toBeInTheDocument()
   await waitFor(() => expect(useVncProfileStore.getState().profiles).toEqual([desk]))
   expect(listVncProfiles).toHaveBeenCalledTimes(1)
+})
+
+test('an RDP profile is labelled RDP in the list and in its details', async () => {
+  vi.mocked(readBundle).mockResolvedValue({
+    kind: 'review',
+    review: {
+      ...review,
+      items: [
+        {
+          key: 'rdp:m',
+          kind: 'rdp',
+          name: 'office',
+          status: 'conflict',
+          matched: { id: 'pc', name: 'tower' },
+          fields: [
+            {
+              field: 'keyboardLayout',
+              label: 'Keyboard layout',
+              local: 'Automatic',
+              incoming: 'German',
+            },
+          ],
+          notes: [],
+          notesAsNew: [],
+        },
+        { ...review.items[1], key: 'rdp:n', kind: 'rdp', name: 'lab' },
+      ],
+    },
+  })
+  const user = userEvent.setup()
+  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  expect(await screen.findByText('Matches your RDP "tower"')).toBeInTheDocument()
+  expect(screen.getAllByText('RDP')).toHaveLength(2)
+  expect(screen.getByText('German')).toBeInTheDocument()
+  await user.click(screen.getByRole('button', { name: 'lab' }))
+  expect(screen.getByText('New RDP')).toBeInTheDocument()
+})
+
+test('an imported RDP profile is in the RDP store once the import is applied', async () => {
+  const office: RdpProfile = {
+    id: 'r',
+    name: 'office',
+    host: 'h',
+    port: 3389,
+    username: 'u',
+    domain: null,
+    secretId: null,
+    keyboardLayout: 0x407,
+    icon: { kind: 'builtin', name: 'server' },
+    order: 0,
+  }
+  vi.mocked(readBundle).mockResolvedValue({
+    kind: 'review',
+    review: {
+      ...review,
+      items: [{ ...review.items[1], key: 'rdp:r', kind: 'rdp', name: 'office' }],
+    },
+  })
+  vi.mocked(applyImport).mockResolvedValueOnce({ added: 1, updated: 0 })
+  listRdpProfiles.mockResolvedValueOnce({ status: 'ok', data: [office] })
+  useRdpProfileStore.setState(useRdpProfileStore.getInitialState())
+  const user = userEvent.setup()
+  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  const apply = await screen.findByRole('button', { name: 'Apply' })
+  expect(useRdpProfileStore.getState().profiles).toEqual([])
+  await user.click(apply)
+  expect(applyImport).toHaveBeenCalledWith('r1', [
+    { key: 'rdp:r', accept: true, asNew: false, fields: [] },
+  ])
+  expect(await screen.findByText('Imported: 1 added, 0 updated.')).toBeInTheDocument()
+  await waitFor(() => expect(useRdpProfileStore.getState().profiles).toEqual([office]))
+  expect(listRdpProfiles).toHaveBeenCalledTimes(1)
 })
 
 test('the first changed profile is selected even when a new one comes first', async () => {
@@ -403,7 +478,7 @@ test('a failed profile reload still shows the import summary', async () => {
   expect(
     await screen.findByText('The profile list could not be refreshed: io: denied'),
   ).toBeInTheDocument()
-  expect(load).toHaveBeenCalledTimes(4)
+  expect(load).toHaveBeenCalledTimes(5)
   expect(screen.queryByRole('button', { name: 'Apply' })).not.toBeInTheDocument()
   unmount()
   expect(discardImport).not.toHaveBeenCalled()

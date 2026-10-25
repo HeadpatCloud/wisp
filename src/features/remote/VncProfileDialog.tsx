@@ -149,7 +149,11 @@ export function VncProfileDialog({
               Remove saved password
             </label>
           )}
-          {error && <p className="text-destructive text-xs">{error}</p>}
+          {error && (
+            <p role="alert" className="text-destructive text-xs">
+              {error}
+            </p>
+          )}
         </div>
         <DialogFooter>
           <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>

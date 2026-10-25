@@ -1,5 +1,5 @@
 import { beforeEach, expect, test } from 'vitest'
-import type { SessionTab, VncTab } from './sessionStore'
+import type { RdpTab, SessionTab, VncTab } from './sessionStore'
 import { tabSecretIds, useSessionStore } from './sessionStore'
 
 const session = (id: string, profileId = 'p1') => ({
@@ -83,6 +83,76 @@ test('a quick-connect VNC tab owns its secret', () => {
 
 test('a VNC tab of a saved profile owns no secret', () => {
   expect(tabSecretIds({ ...vncTab, profileId: 'vnc-1' })).toEqual([])
+})
+
+test('openRdp adds an active tab titled host:port', () => {
+  useSessionStore.getState().openRdp({
+    host: 'pc',
+    port: 3390,
+    username: 'CORPalice',
+    domain: null,
+    secretId: 'vault-1',
+    profileId: null,
+    keyboardLayout: null,
+  })
+  const st = useSessionStore.getState()
+  expect(st.tabs).toEqual([
+    {
+      id: st.tabs[0].id,
+      kind: 'rdp',
+      title: 'pc:3390',
+      host: 'pc',
+      port: 3390,
+      username: 'CORPalice',
+      domain: null,
+      secretId: 'vault-1',
+      profileId: null,
+      keyboardLayout: null,
+    },
+  ])
+  expect(st.activeTabId).toBe(st.tabs[0].id)
+})
+
+test('openRdp uses the given title and keeps the domain and layout', () => {
+  useSessionStore.getState().openRdp({
+    host: 'pc',
+    port: 3389,
+    username: 'alice',
+    domain: 'CORP',
+    secretId: null,
+    profileId: 'rdp-1',
+    keyboardLayout: 0x407,
+    title: 'Office PC',
+  })
+  expect(useSessionStore.getState().tabs[0]).toMatchObject({
+    kind: 'rdp',
+    title: 'Office PC',
+    domain: 'CORP',
+    profileId: 'rdp-1',
+    keyboardLayout: 0x407,
+  })
+})
+
+const rdpTab: RdpTab = {
+  id: 'r1',
+  kind: 'rdp',
+  title: 'pc:3389',
+  host: 'pc',
+  port: 3389,
+  username: 'alice',
+  domain: null,
+  secretId: 'vault-1',
+  profileId: null,
+  keyboardLayout: null,
+}
+
+test('a quick-connect RDP tab owns its secret', () => {
+  expect(tabSecretIds(rdpTab)).toEqual(['vault-1'])
+  expect(tabSecretIds({ ...rdpTab, secretId: null })).toEqual([])
+})
+
+test('an RDP tab of a saved profile owns no secret', () => {
+  expect(tabSecretIds({ ...rdpTab, profileId: 'rdp-1' })).toEqual([])
 })
 
 test('duplicateTab on a session opens a new session tab with the same profile', () => {

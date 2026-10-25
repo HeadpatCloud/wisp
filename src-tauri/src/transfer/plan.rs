@@ -7,8 +7,8 @@ use sha2::{Digest, Sha256};
 use super::bundle::Payload;
 use super::{Env, FieldDiff, ItemKind, ItemStatus, LocalMatch, ReviewItem};
 use crate::store::model::{
-    AuthMethod, Group, IconRef, Profile, ProfileAppearance, ProfileKey, ProfileStore, S3Profile,
-    SftpProfile, Tunnel, TunnelKind, VncProfile,
+    AuthMethod, Group, IconRef, Profile, ProfileAppearance, ProfileKey, ProfileStore, RdpProfile,
+    S3Profile, SftpProfile, Tunnel, TunnelKind, VncProfile,
 };
 use crate::store::normalize_keys;
 
@@ -40,7 +40,37 @@ pub mod field {
     pub const PATH_STYLE: &str = "pathStyle";
     pub const ACCESS_KEY_ID: &str = "accessKeyId";
     pub const BUCKET: &str = "bucket";
+    pub const DOMAIN: &str = "domain";
+    pub const KEYBOARD_LAYOUT: &str = "keyboardLayout";
 }
+
+// The same list as the profile dialog offers; a test keeps them equal.
+const RDP_LAYOUTS: &[(u32, &str)] = &[
+    (0x409, "English (US)"),
+    (0x20409, "English (US International)"),
+    (0x809, "English (UK)"),
+    (0x407, "German"),
+    (0x807, "German (Switzerland)"),
+    (0x40c, "French"),
+    (0x80c, "French (Belgium)"),
+    (0x100c, "French (Switzerland)"),
+    (0x413, "Dutch"),
+    (0x813, "Belgian (Period)"),
+    (0x40a, "Spanish"),
+    (0x410, "Italian"),
+    (0x816, "Portuguese"),
+    (0x416, "Portuguese (Brazil)"),
+    (0x406, "Danish"),
+    (0x414, "Norwegian"),
+    (0x41d, "Swedish"),
+    (0x40b, "Finnish"),
+    (0x415, "Polish (Programmers)"),
+    (0x405, "Czech"),
+    (0x40e, "Hungarian"),
+    (0x41f, "Turkish Q"),
+    (0x419, "Russian"),
+    (0x411, "Japanese"),
+];
 
 pub fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -120,6 +150,16 @@ fn push(fields: &mut Vec<FieldDiff>, field: &str, label: &str, local: String, in
 
 fn text(v: Option<&str>) -> String {
     v.filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| "(none)".into())
+}
+
+fn layout_label(layout: Option<u32>) -> String {
+    match layout {
+        None => "Automatic".into(),
+        Some(id) => match RDP_LAYOUTS.iter().find(|(known, _)| *known == id) {
+            Some((_, name)) => (*name).into(),
+            None => format!("0x{id:x}"),
+        },
+    }
 }
 
 fn auth(a: AuthMethod) -> String {
@@ -596,6 +636,50 @@ impl Collector<'_> {
         );
         fields
     }
+
+    fn rdp_fields(
+        &self,
+        l: &RdpProfile,
+        inc: &RdpProfile,
+        env: &dyn Env,
+        notes: &mut Vec<String>,
+    ) -> Vec<FieldDiff> {
+        let mut fields = vec![];
+        push(&mut fields, field::NAME, "Name", l.name.clone(), inc.name.clone());
+        push(&mut fields, field::HOST, "Host", l.host.clone(), inc.host.clone());
+        push(&mut fields, field::PORT, "Port", l.port.to_string(), inc.port.to_string());
+        push(
+            &mut fields,
+            field::USERNAME,
+            "Username",
+            text(Some(&l.username)),
+            text(Some(&inc.username)),
+        );
+        push(
+            &mut fields,
+            field::DOMAIN,
+            "Domain",
+            text(l.domain.as_deref()),
+            text(inc.domain.as_deref()),
+        );
+        push(
+            &mut fields,
+            field::KEYBOARD_LAYOUT,
+            "Keyboard layout",
+            layout_label(l.keyboard_layout),
+            layout_label(inc.keyboard_layout),
+        );
+        icon_field(&l.icon, &inc.icon, env, &mut fields, notes);
+        password_field(
+            "Password",
+            l.secret_id.as_deref(),
+            inc.secret_id.as_deref(),
+            self.payload,
+            env,
+            &mut fields,
+        );
+        fields
+    }
 }
 
 // Where an incoming group reference lands locally: the matched group, a group arriving in the
@@ -784,6 +868,31 @@ pub fn plan(local: &ProfileStore, payload: &Payload, env: &dyn Env) -> Plan {
         }
     }
 
+    let (found, _) = match_items(
+        &local.rdp_profiles,
+        &payload.rdp_profiles,
+        |l| (l.id.as_str(), l.name.as_str()),
+        |p| (p.id.as_str(), p.name.as_str()),
+        |l, p, _| {
+            l.host.eq_ignore_ascii_case(&p.host)
+                && l.port == p.port
+                && l.username == p.username
+                && l.domain.as_deref().unwrap_or("") == p.domain.as_deref().unwrap_or("")
+        },
+    );
+    for (inc, found) in payload.rdp_profiles.iter().zip(found) {
+        let key = ItemKind::Rdp.key(&inc.id);
+        let as_new = vec![];
+        match found {
+            Some(l) => {
+                let mut notes = vec![];
+                let fields = c.rdp_fields(l, inc, env, &mut notes);
+                c.matched(key, ItemKind::Rdp, &inc.name, (&l.id, &l.name), fields, (notes, as_new));
+            }
+            None => c.added(key, ItemKind::Rdp, &inc.name, as_new),
+        }
+    }
+
     Plan { items: c.items, unchanged: c.unchanged, matches: c.matches }
 }
 
@@ -791,7 +900,7 @@ pub fn plan(local: &ProfileStore, payload: &Payload, env: &dyn Env) -> Plan {
 mod tests {
     use super::*;
     use crate::store::model::{
-        AuthMethod, Group, IconRef, Profile, ProfileKey, SftpProfile, VncProfile,
+        AuthMethod, Group, IconRef, Profile, ProfileKey, RdpProfile, SftpProfile, VncProfile,
     };
     use crate::transfer::bundle::KeyFile;
     use crate::transfer::MapEnv;
@@ -814,6 +923,7 @@ mod tests {
             jump_host_id: None,
             tunnels: vec![],
             appearance: None,
+            extra: Default::default(),
         }
     }
 
@@ -825,6 +935,7 @@ mod tests {
             sftp_profiles: vec![],
             s3_profiles: vec![],
             vnc_profiles: vec![],
+            rdp_profiles: vec![],
             unknown: Default::default(),
         }
     }
@@ -843,7 +954,32 @@ mod tests {
             secret_id: None,
             icon: IconRef::default(),
             order: 0,
+            extra: Default::default(),
         }
+    }
+
+    fn rdp(id: &str, name: &str, host: &str) -> RdpProfile {
+        RdpProfile {
+            id: id.into(),
+            name: name.into(),
+            host: host.into(),
+            port: 3389,
+            username: "faye".into(),
+            domain: None,
+            secret_id: None,
+            keyboard_layout: None,
+            icon: IconRef::default(),
+            order: 0,
+            extra: Default::default(),
+        }
+    }
+
+    fn local_rdp(rdp_profiles: Vec<RdpProfile>) -> ProfileStore {
+        ProfileStore { rdp_profiles, ..local(vec![]) }
+    }
+
+    fn incoming_rdp(rdp_profiles: Vec<RdpProfile>) -> Payload {
+        Payload { rdp_profiles, ..Default::default() }
     }
 
     fn local_vnc(vnc_profiles: Vec<VncProfile>) -> ProfileStore {
@@ -941,6 +1077,7 @@ mod tests {
             secret_id: None,
             icon: IconRef::default(),
             order: 0,
+            extra: Default::default(),
         };
         let mac = SftpProfile {
             id: "mac".into(),
@@ -1031,6 +1168,7 @@ mod tests {
             parent_id: None,
             icon: IconRef::default(),
             order: 0,
+            extra: Default::default(),
         }];
         l.profiles[0].group_id = Some("g-pc".into());
         let mut mac = profile("mac", "web", "h1");
@@ -1042,6 +1180,7 @@ mod tests {
             parent_id: None,
             icon: IconRef::default(),
             order: 3,
+            extra: Default::default(),
         }];
         let p = plan(&l, &payload, &MapEnv::default());
         assert!(p.items.is_empty());
@@ -1135,6 +1274,7 @@ mod tests {
             parent_id: parent.map(Into::into),
             icon: IconRef::default(),
             order: 0,
+            extra: Default::default(),
         };
         let mut l = local(vec![]);
         l.groups = vec![group("pc-prod", "Prod", None), group("pc-web", "Web", Some("pc-prod"))];
@@ -1314,6 +1454,213 @@ mod tests {
             ..pc.clone()
         };
         let (l, payload) = (local_vnc(vec![pc]), incoming_vnc(vec![mac]));
+
+        let p = plan(&l, &payload, &MapEnv::default());
+        let fields: Vec<_> = p.items[0].fields.iter().map(|f| f.field.as_str()).collect();
+        assert_eq!(fields, ["name"]);
+        assert_eq!(p.items[0].notes, ["Kept your icon; the custom image isn't on this machine"]);
+
+        let mut env = MapEnv::default();
+        env.icons.insert(path.into());
+        let p = plan(&l, &payload, &env);
+        let row = &p.items[0].fields[1];
+        assert_eq!(
+            (row.field.as_str(), row.local.as_str(), row.incoming.as_str()),
+            ("icon", "server", "custom image")
+        );
+        assert!(p.items[0].notes.is_empty());
+    }
+
+    #[test]
+    fn rdp_profile_is_new_until_it_is_here_and_then_unchanged() {
+        let office = RdpProfile { domain: Some("CORP".into()), ..rdp("r1", "office", "h1") };
+        let payload = incoming_rdp(vec![office.clone()]);
+
+        let p = plan(&local_rdp(vec![]), &payload, &MapEnv::default());
+        assert_eq!(p.unchanged, 0);
+        assert_eq!(p.items.len(), 1);
+        let item = &p.items[0];
+        assert_eq!(
+            (item.key.as_str(), item.kind, item.name.as_str(), item.status),
+            ("rdp:r1", ItemKind::Rdp, "office", ItemStatus::New)
+        );
+        assert!(item.matched.is_none() && item.fields.is_empty());
+        assert!(item.notes.is_empty() && item.notes_as_new.is_empty());
+
+        let p = plan(&local_rdp(vec![office]), &payload, &MapEnv::default());
+        assert!(p.items.is_empty());
+        assert_eq!(p.unchanged, 1);
+        assert_eq!(p.matches.get("rdp:r1").map(String::as_str), Some("r1"));
+    }
+
+    #[test]
+    fn changed_rdp_profile_lists_its_fields_in_order() {
+        let pc = RdpProfile { secret_id: Some("local-sec".into()), ..rdp("r1", "office", "h1") };
+        let mac = RdpProfile {
+            name: "office (mac)".into(),
+            host: "h2".into(),
+            port: 3390,
+            username: "CORP\\faye".into(),
+            domain: Some("CORP".into()),
+            keyboard_layout: Some(0x407),
+            secret_id: Some("mac-sec".into()),
+            icon: IconRef::Builtin { name: "monitor".into() },
+            ..pc.clone()
+        };
+        let mut payload = incoming_rdp(vec![mac]);
+        payload.secrets.insert("mac-sec".into(), Zeroizing::new("other".into()));
+        let mut env = MapEnv::default();
+        env.secrets.insert("local-sec".into(), b"mine".to_vec());
+
+        let p = plan(&local_rdp(vec![pc]), &payload, &env);
+        let item = &p.items[0];
+        assert_eq!((item.kind, item.status), (ItemKind::Rdp, ItemStatus::Conflict));
+        assert_eq!(item.matched, Some(LocalMatch { id: "r1".into(), name: "office".into() }));
+        let rows: Vec<_> = item
+            .fields
+            .iter()
+            .map(|f| (f.field.as_str(), f.label.as_str(), f.local.as_str(), f.incoming.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("name", "Name", "office", "office (mac)"),
+                ("host", "Host", "h1", "h2"),
+                ("port", "Port", "3389", "3390"),
+                ("username", "Username", "faye", "CORP\\faye"),
+                ("domain", "Domain", "(none)", "CORP"),
+                ("keyboardLayout", "Keyboard layout", "Automatic", "German"),
+                ("icon", "Icon", "server", "monitor"),
+                ("password", "Password", "••••", "•••• (different)"),
+            ]
+        );
+    }
+
+    #[test]
+    fn rdp_keyboard_layout_is_shown_by_name() {
+        let pc = rdp("r1", "office", "h1");
+        let shown = |layout: Option<u32>, other: Option<u32>| {
+            let l = local_rdp(vec![RdpProfile { keyboard_layout: layout, ..pc.clone() }]);
+            let inc = RdpProfile { keyboard_layout: other, ..pc.clone() };
+            let p = plan(&l, &incoming_rdp(vec![inc]), &MapEnv::default());
+            let row = &p.items[0].fields[0];
+            assert_eq!(row.field, "keyboardLayout");
+            (row.local.clone(), row.incoming.clone())
+        };
+        assert_eq!(shown(None, Some(0x407)), ("Automatic".into(), "German".into()));
+        assert_eq!(
+            shown(Some(0x20409), Some(0x40d)),
+            ("English (US International)".into(), "0x40d".into())
+        );
+        assert_eq!(shown(Some(0x10407), None), ("0x10407".into(), "Automatic".into()));
+    }
+
+    #[test]
+    fn rdp_layout_names_are_the_ones_the_profile_dialog_offers() {
+        let dialog = include_str!("../../../src/features/remote/RdpProfileDialog.tsx");
+        let table = dialog.split("const LAYOUTS").nth(1).unwrap().split("\n]\n").next().unwrap();
+        let offered: Vec<(u32, &str)> = table
+            .lines()
+            .filter_map(|line| {
+                let entry = line.trim().strip_prefix("[0x")?.strip_suffix("'],")?;
+                let (id, name) = entry.split_once(", '")?;
+                Some((u32::from_str_radix(id, 16).unwrap(), name))
+            })
+            .collect();
+        assert_eq!(offered.len(), 24);
+        assert_eq!(offered, RDP_LAYOUTS);
+    }
+
+    #[test]
+    fn rdp_password_row_only_when_bundle_carries_a_different_one() {
+        let mut pc = rdp("pc", "office", "h1");
+        let mut payload = incoming_rdp(vec![pc.clone()]);
+        let mut env = MapEnv::default();
+        env.secrets.insert("local-sec".into(), b"same".to_vec());
+        let unchanged = |pc: &RdpProfile, payload: &Payload| {
+            let p = plan(&local_rdp(vec![pc.clone()]), payload, &env);
+            p.items.is_empty() && p.unchanged == 1
+        };
+
+        assert!(unchanged(&pc, &payload), "neither side has a password");
+        pc.secret_id = Some("local-sec".into());
+        assert!(unchanged(&pc, &payload), "only this machine has one");
+        payload.rdp_profiles[0].secret_id = Some("mac-sec".into());
+        assert!(unchanged(&pc, &payload), "exported without passwords");
+        payload.secrets.insert("mac-sec".into(), Zeroizing::new("same".into()));
+        assert!(unchanged(&pc, &payload), "the same password");
+
+        payload.secrets.insert("mac-sec".into(), Zeroizing::new("other".into()));
+        let p = plan(&local_rdp(vec![pc.clone()]), &payload, &env);
+        let row = &p.items[0].fields[0];
+        assert_eq!(row.field, "password");
+        assert_eq!((row.local.as_str(), row.incoming.as_str()), ("••••", "•••• (different)"));
+
+        pc.secret_id = None;
+        let p = plan(&local_rdp(vec![pc]), &payload, &env);
+        let row = &p.items[0].fields[0];
+        assert_eq!((row.local.as_str(), row.incoming.as_str()), ("(none)", "••••"));
+    }
+
+    #[test]
+    fn rdp_profile_with_another_id_matches_on_the_same_server() {
+        let l = local_rdp(vec![
+            RdpProfile { domain: Some(String::new()), ..rdp("pc", "office", "Office.Lan") },
+            RdpProfile { domain: Some("CORP".into()), ..rdp("pc2", "tower", "tower.lan") },
+        ]);
+        let mac = rdp("mac", "office (mac)", "office.lan");
+
+        let p = plan(&l, &incoming_rdp(vec![mac.clone()]), &MapEnv::default());
+        assert_eq!(p.matches.get("rdp:mac").map(String::as_str), Some("pc"));
+        assert_eq!(p.items[0].matched.as_ref().unwrap().id, "pc");
+        let fields: Vec<_> = p.items[0].fields.iter().map(|f| f.field.as_str()).collect();
+        assert_eq!(fields, ["name", "host"]);
+
+        let tower = RdpProfile { domain: Some("CORP".into()), ..rdp("mac2", "tower", "tower.lan") };
+        let p = plan(&l, &incoming_rdp(vec![tower]), &MapEnv::default());
+        assert_eq!(p.matches.get("rdp:mac2").map(String::as_str), Some("pc2"));
+
+        for other in [
+            RdpProfile { port: 3390, ..mac.clone() },
+            RdpProfile { username: "Faye".into(), ..mac.clone() },
+            RdpProfile { domain: Some("CORP".into()), ..mac.clone() },
+            RdpProfile { host: "office2.lan".into(), ..mac.clone() },
+            rdp("mac3", "tower", "tower.lan"),
+        ] {
+            let p = plan(&l, &incoming_rdp(vec![other.clone()]), &MapEnv::default());
+            assert_eq!(p.items[0].status, ItemStatus::New, "{other:?}");
+            assert!(p.matches.is_empty(), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn rdp_profile_matches_by_id_first_then_by_name_on_a_shared_server() {
+        let l = local_rdp(vec![rdp("x", "office", "h1")]);
+        let moved = incoming_rdp(vec![rdp("a", "office", "h1"), rdp("x", "office", "h2")]);
+        let p = plan(&l, &moved, &MapEnv::default());
+        assert_eq!(p.matches.get("rdp:x").map(String::as_str), Some("x"));
+        assert_eq!(p.matches.get("rdp:a"), None);
+        let items: Vec<_> = p.items.iter().map(|i| (i.key.as_str(), i.status)).collect();
+        assert_eq!(items, [("rdp:a", ItemStatus::New), ("rdp:x", ItemStatus::Conflict)]);
+
+        let l = local_rdp(vec![rdp("a", "test", "h1"), rdp("b", "prod", "h1")]);
+        let p = plan(&l, &incoming_rdp(vec![rdp("x", "prod", "h1")]), &MapEnv::default());
+        assert_eq!(p.matches.get("rdp:x").map(String::as_str), Some("b"));
+        assert_eq!(p.unchanged, 1);
+        let p = plan(&l, &incoming_rdp(vec![rdp("x", "staging", "h1")]), &MapEnv::default());
+        assert_eq!(p.items[0].status, ItemStatus::New);
+    }
+
+    #[test]
+    fn rdp_custom_icon_is_offered_only_when_it_is_on_this_machine() {
+        let path = "icons/6f1c2a9e-8d0b-4c57-9a3e-2b7d5e41f0c8.png";
+        let pc = rdp("r1", "office", "h1");
+        let mac = RdpProfile {
+            name: "office (mac)".into(),
+            icon: IconRef::Custom { path: path.into() },
+            ..pc.clone()
+        };
+        let (l, payload) = (local_rdp(vec![pc]), incoming_rdp(vec![mac]));
 
         let p = plan(&l, &payload, &MapEnv::default());
         let fields: Vec<_> = p.items[0].fields.iter().map(|f| f.field.as_str()).collect();

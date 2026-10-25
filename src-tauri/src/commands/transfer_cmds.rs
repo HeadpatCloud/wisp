@@ -65,15 +65,20 @@ pub fn transfer_export(
     };
     let bytes = bundle::write(&payload, password.as_deref().map(String::as_str))?;
     std::fs::write(&path, bytes).map_err(|e| AppError::Io(format!("{path}: {e}")))?;
-    Ok(ExportSummary {
+    Ok(summary(&payload, warnings))
+}
+
+fn summary(payload: &Payload, warnings: Vec<String>) -> ExportSummary {
+    ExportSummary {
         profiles: (payload.profiles.len()
             + payload.sftp_profiles.len()
             + payload.s3_profiles.len()
-            + payload.vnc_profiles.len()) as u32,
+            + payload.vnc_profiles.len()
+            + payload.rdp_profiles.len()) as u32,
         secrets: payload.secrets.len() as u32,
         key_files: payload.key_files.len() as u32,
         warnings,
-    })
+    }
 }
 
 #[tauri::command]
@@ -170,4 +175,44 @@ pub fn transfer_apply(
 pub fn transfer_discard(pending: State<'_, PendingImports>, review_id: String) -> AppResult<()> {
     pending.0.lock().map_err(|_| poisoned())?.remove(&review_id);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::model::{IconRef, RdpProfile, VncProfile};
+
+    #[test]
+    fn the_export_summary_counts_vnc_and_rdp_profiles() {
+        let vnc = |id: &str| VncProfile {
+            id: id.into(),
+            name: id.into(),
+            host: "h".into(),
+            port: 5900,
+            username: None,
+            secret_id: None,
+            icon: IconRef::default(),
+            order: 0,
+            extra: Default::default(),
+        };
+        let rdp = |id: &str| RdpProfile {
+            id: id.into(),
+            name: id.into(),
+            host: "h".into(),
+            port: 3389,
+            username: "faye".into(),
+            domain: None,
+            secret_id: None,
+            keyboard_layout: None,
+            icon: IconRef::default(),
+            order: 0,
+            extra: Default::default(),
+        };
+        let payload = Payload {
+            vnc_profiles: vec![vnc("v1"), vnc("v2")],
+            rdp_profiles: vec![rdp("r1"), rdp("r2"), rdp("r3")],
+            ..Default::default()
+        };
+        assert_eq!(summary(&payload, vec![]).profiles, 5);
+    }
 }

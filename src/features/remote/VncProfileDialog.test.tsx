@@ -282,6 +282,16 @@ test('a failed save keeps the dialog open, shows the error and keeps the old pas
   ])
 })
 
+test('a failed save is announced as an alert', async () => {
+  save.mockRejectedValueOnce(new Error('io: disk full'))
+  const user = userEvent.setup()
+  render(<VncProfileDialog open onOpenChange={vi.fn()} editing={desk} />)
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  await user.click(saveButton())
+
+  expect(await screen.findByRole('alert')).toHaveTextContent('io: disk full')
+})
+
 test('a failed save while removing the password deletes nothing', async () => {
   save.mockRejectedValue(new Error('io: disk full'))
   const onOpenChange = vi.fn()

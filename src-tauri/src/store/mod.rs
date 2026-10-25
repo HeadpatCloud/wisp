@@ -1,14 +1,15 @@
 pub mod io;
 pub mod model;
 
+use std::mem;
 use std::path::PathBuf;
 
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 use model::{
-    AuthMethod, Group, Profile, ProfileKey, ProfileStore, S3Profile, SftpProfile, Settings,
-    VncProfile,
+    AuthMethod, Group, Profile, ProfileKey, ProfileStore, RdpProfile, S3Profile, SftpProfile,
+    Settings, VncProfile,
 };
 
 pub struct Store {
@@ -91,10 +92,13 @@ impl Store {
         self.settings.clone()
     }
 
+    // The dialogs send only the fields they know, so what a later version added to an entry is
+    // kept as it was stored, here and in the other upserts. A new entry starts without any: a
+    // duplicate is sent as a copy of what the store gave, and could share a vault reference.
     pub fn upsert_group(&mut self, group: Group) -> AppResult<()> {
         match self.data.groups.iter_mut().find(|g| g.id == group.id) {
-            Some(existing) => *existing = group,
-            None => self.data.groups.push(group),
+            Some(existing) => *existing = Group { extra: mem::take(&mut existing.extra), ..group },
+            None => self.data.groups.push(Group { extra: Default::default(), ..group }),
         }
         self.persist_profiles()
     }
@@ -116,8 +120,10 @@ impl Store {
     pub fn upsert_profile(&mut self, mut profile: Profile) -> AppResult<()> {
         normalize_keys(&mut profile);
         match self.data.profiles.iter_mut().find(|p| p.id == profile.id) {
-            Some(existing) => *existing = profile,
-            None => self.data.profiles.push(profile),
+            Some(existing) => {
+                *existing = Profile { extra: mem::take(&mut existing.extra), ..profile }
+            }
+            None => self.data.profiles.push(Profile { extra: Default::default(), ..profile }),
         }
         self.persist_profiles()
     }
@@ -142,8 +148,12 @@ impl Store {
 
     pub fn upsert_sftp_profile(&mut self, profile: SftpProfile) -> AppResult<()> {
         match self.data.sftp_profiles.iter_mut().find(|p| p.id == profile.id) {
-            Some(existing) => *existing = profile,
-            None => self.data.sftp_profiles.push(profile),
+            Some(existing) => {
+                *existing = SftpProfile { extra: mem::take(&mut existing.extra), ..profile }
+            }
+            None => {
+                self.data.sftp_profiles.push(SftpProfile { extra: Default::default(), ..profile })
+            }
         }
         self.persist_profiles()
     }
@@ -163,8 +173,10 @@ impl Store {
 
     pub fn upsert_s3_profile(&mut self, profile: S3Profile) -> AppResult<()> {
         match self.data.s3_profiles.iter_mut().find(|p| p.id == profile.id) {
-            Some(existing) => *existing = profile,
-            None => self.data.s3_profiles.push(profile),
+            Some(existing) => {
+                *existing = S3Profile { extra: mem::take(&mut existing.extra), ..profile }
+            }
+            None => self.data.s3_profiles.push(S3Profile { extra: Default::default(), ..profile }),
         }
         self.persist_profiles()
     }
@@ -188,8 +200,10 @@ impl Store {
     pub fn upsert_vnc_profile(&mut self, profile: VncProfile) -> AppResult<()> {
         let mut data = self.data.clone();
         match data.vnc_profiles.iter_mut().find(|p| p.id == profile.id) {
-            Some(existing) => *existing = profile,
-            None => data.vnc_profiles.push(profile),
+            Some(existing) => {
+                *existing = VncProfile { extra: mem::take(&mut existing.extra), ..profile }
+            }
+            None => data.vnc_profiles.push(VncProfile { extra: Default::default(), ..profile }),
         }
         io::write_json_atomic(&self.dir.join("profiles.json"), &data)?;
         self.data = data;
@@ -201,6 +215,35 @@ impl Store {
         data.vnc_profiles.retain(|p| p.id != id);
         if data.vnc_profiles.len() == self.data.vnc_profiles.len() {
             return Err(AppError::NotFound(format!("vnc profile {id}")));
+        }
+        io::write_json_atomic(&self.dir.join("profiles.json"), &data)?;
+        self.data = data;
+        Ok(())
+    }
+
+    pub fn rdp_profiles(&self) -> Vec<RdpProfile> {
+        self.data.rdp_profiles.clone()
+    }
+
+    // Written before it is swapped in, like the VNC ones: a failed write leaves memory as it was.
+    pub fn upsert_rdp_profile(&mut self, profile: RdpProfile) -> AppResult<()> {
+        let mut data = self.data.clone();
+        match data.rdp_profiles.iter_mut().find(|p| p.id == profile.id) {
+            Some(existing) => {
+                *existing = RdpProfile { extra: mem::take(&mut existing.extra), ..profile }
+            }
+            None => data.rdp_profiles.push(RdpProfile { extra: Default::default(), ..profile }),
+        }
+        io::write_json_atomic(&self.dir.join("profiles.json"), &data)?;
+        self.data = data;
+        Ok(())
+    }
+
+    pub fn delete_rdp_profile(&mut self, id: &str) -> AppResult<()> {
+        let mut data = self.data.clone();
+        data.rdp_profiles.retain(|p| p.id != id);
+        if data.rdp_profiles.len() == self.data.rdp_profiles.len() {
+            return Err(AppError::NotFound(format!("rdp profile {id}")));
         }
         io::write_json_atomic(&self.dir.join("profiles.json"), &data)?;
         self.data = data;
@@ -230,11 +273,19 @@ mod tests {
             jump_host_id: None,
             tunnels: vec![],
             appearance: None,
+            extra: Default::default(),
         }
     }
 
     fn group(id: &str) -> Group {
-        Group { id: id.into(), name: id.into(), parent_id: None, icon: IconRef::default(), order: 0 }
+        Group {
+            id: id.into(),
+            name: id.into(),
+            parent_id: None,
+            icon: IconRef::default(),
+            order: 0,
+            extra: Default::default(),
+        }
     }
 
     #[test]
@@ -359,6 +410,7 @@ mod tests {
                 secret_id: None,
                 icon: IconRef::default(),
                 order: 0,
+                extra: Default::default(),
             })
             .unwrap();
         assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().sftp_profiles().len(), 1);
@@ -376,6 +428,7 @@ mod tests {
             secret_id: Some("vault-1".into()),
             icon: IconRef::default(),
             order: 0,
+            extra: Default::default(),
         }
     }
 
@@ -431,6 +484,87 @@ mod tests {
         assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().vnc_profiles(), [desk]);
     }
 
+    fn rdp(id: &str) -> RdpProfile {
+        RdpProfile {
+            id: id.into(),
+            name: id.into(),
+            host: "h".into(),
+            port: 3389,
+            username: "faye".into(),
+            domain: Some("corp".into()),
+            secret_id: Some("vault-1".into()),
+            keyboard_layout: Some(0x407),
+            icon: IconRef::default(),
+            order: 0,
+            extra: Default::default(),
+        }
+    }
+
+    #[test]
+    fn rdp_profiles_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        let mut office = rdp("r1");
+        store.upsert_rdp_profile(office.clone()).unwrap();
+        office.host = "changed".into();
+        store.upsert_rdp_profile(office.clone()).unwrap();
+        assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().rdp_profiles(), [office]);
+
+        store.delete_rdp_profile("r1").unwrap();
+        assert!(Store::load(dir.path().to_path_buf()).unwrap().rdp_profiles().is_empty());
+        assert!(matches!(store.delete_rdp_profile("r1"), Err(AppError::NotFound(_))));
+    }
+
+    fn store_with_blocked_rdp_writes(dir: &std::path::Path) -> (Store, RdpProfile, PathBuf) {
+        let mut store = Store::load(dir.to_path_buf()).unwrap();
+        let office = rdp("r1");
+        store.upsert_rdp_profile(office.clone()).unwrap();
+        let blocker = dir.join("profiles.json.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+        (store, office, blocker)
+    }
+
+    #[test]
+    fn rdp_upsert_that_cannot_be_written_leaves_the_profiles_as_they_were() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, office, blocker) = store_with_blocked_rdp_writes(dir.path());
+        let edited = RdpProfile { secret_id: Some("vault-2".into()), ..office.clone() };
+        assert!(matches!(store.upsert_rdp_profile(edited), Err(AppError::Io(_))));
+        assert!(matches!(store.upsert_rdp_profile(rdp("r2")), Err(AppError::Io(_))));
+        assert_eq!(store.rdp_profiles(), [office.clone()]);
+
+        std::fs::remove_dir(blocker).unwrap();
+        store.upsert_group(group("g1")).unwrap();
+        assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().rdp_profiles(), [office]);
+    }
+
+    #[test]
+    fn rdp_delete_that_cannot_be_written_keeps_the_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, office, blocker) = store_with_blocked_rdp_writes(dir.path());
+        assert!(matches!(store.delete_rdp_profile("r1"), Err(AppError::Io(_))));
+        assert_eq!(store.rdp_profiles(), [office.clone()]);
+
+        std::fs::remove_dir(blocker).unwrap();
+        store.upsert_group(group("g1")).unwrap();
+        assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().rdp_profiles(), [office]);
+    }
+
+    #[test]
+    fn profiles_file_from_before_rdp_profiles_loads_with_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("profiles.json"),
+            r#"{"version":1,"groups":[{"id":"g1","name":"g1","parentId":null,"order":0}],
+                "profiles":[],"sftpProfiles":[],"s3Profiles":[],"vncProfiles":[]}"#,
+        )
+        .unwrap();
+        let store = Store::load(dir.path().to_path_buf()).unwrap();
+        // A file that does not parse loads as an empty store, so the group shows it was read.
+        assert_eq!(store.groups(), [group("g1")]);
+        assert!(store.rdp_profiles().is_empty());
+    }
+
     #[test]
     fn profiles_file_from_before_vnc_profiles_loads_with_none() {
         let dir = tempfile::tempdir().unwrap();
@@ -451,13 +585,13 @@ mod tests {
     fn sections_this_build_does_not_know_survive_a_save() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("profiles.json");
-        let rdp = serde_json::json!([{
+        let kiosks = serde_json::json!([{
             "id": "r1", "name": "büro", "host": "10.0.0.9", "port": 3389, "gateway": null,
             "scale": 1.5, "icon": { "kind": "builtin", "name": "server" }, "order": 0
         }]);
         let file = serde_json::json!({
             "version": 1, "groups": [], "profiles": [], "vncProfiles": [vnc("v1")],
-            "rdpProfiles": rdp, "syncedAt": 1759622400
+            "kioskProfiles": kiosks, "syncedAt": 1759622400
         });
         std::fs::write(&path, file.to_string()).unwrap();
         let saved = || -> serde_json::Value {
@@ -467,18 +601,131 @@ mod tests {
         let mut store = Store::load(dir.path().to_path_buf()).unwrap();
         store.upsert_vnc_profile(VncProfile { name: "renamed".into(), ..vnc("v1") }).unwrap();
         assert_eq!(saved()["vncProfiles"][0]["name"], "renamed");
-        assert_eq!(saved()["rdpProfiles"].to_string(), rdp.to_string());
+        assert_eq!(saved()["kioskProfiles"].to_string(), kiosks.to_string());
         assert_eq!(saved()["syncedAt"], 1759622400);
 
         // Every other save writes the same data: the plain ones, an import, and a later start.
         store.upsert_group(group("g1")).unwrap();
-        assert_eq!(saved()["rdpProfiles"].to_string(), rdp.to_string());
+        assert_eq!(saved()["kioskProfiles"].to_string(), kiosks.to_string());
         store.commit(store.snapshot()).unwrap();
-        assert_eq!(saved()["rdpProfiles"].to_string(), rdp.to_string());
+        assert_eq!(saved()["kioskProfiles"].to_string(), kiosks.to_string());
         let mut store = Store::load(dir.path().to_path_buf()).unwrap();
         store.delete_vnc_profile("v1").unwrap();
-        assert_eq!(saved()["rdpProfiles"].to_string(), rdp.to_string());
+        assert_eq!(saved()["kioskProfiles"].to_string(), kiosks.to_string());
         assert_eq!(saved()["groups"][0]["id"], "g1");
+    }
+
+    // A field a later build adds to a profile, and one entry of each kind that carries it.
+    fn later_file() -> (serde_json::Value, serde_json::Value) {
+        let later = serde_json::json!({ "host": "gw.lan", "port": 443, "user": null });
+        let icon = serde_json::json!({ "kind": "builtin", "name": "server" });
+        let file = serde_json::json!({
+            "version": 1,
+            "groups": [{ "id": "g1", "name": "g1", "parentId": null, "icon": icon, "order": 0,
+                "later": later }],
+            "profiles": [{ "id": "p1", "name": "p1", "groupId": null, "host": "h", "port": 22,
+                "username": "u", "authMethod": "password", "keys": [], "secretId": null,
+                "icon": icon, "order": 0, "jumpHostId": null, "tunnels": [], "appearance": null,
+                "later": later }],
+            "sftpProfiles": [{ "id": "s1", "name": "s1", "host": "h", "port": 22,
+                "username": "u", "authMethod": "password", "keys": [], "secretId": null,
+                "icon": icon, "order": 0, "later": later }],
+            "s3Profiles": [{ "id": "b1", "name": "b1", "endpoint": "e", "port": null,
+                "region": "r", "useTls": true, "pathStyle": false, "accessKeyId": "k",
+                "secretId": null, "bucket": null, "icon": icon, "order": 0, "later": later }],
+            "vncProfiles": [{ "id": "v1", "name": "v1", "host": "h", "port": 5900,
+                "username": null, "secretId": null, "icon": icon, "order": 0, "later": later }],
+            "rdpProfiles": [{ "id": "r1", "name": "r1", "host": "h", "port": 3389,
+                "username": "u", "domain": null, "secretId": null, "keyboardLayout": null,
+                "icon": icon, "order": 0, "later": later }],
+        });
+        (file, later)
+    }
+
+    const KINDS: [&str; 6] =
+        ["groups", "profiles", "sftpProfiles", "s3Profiles", "vncProfiles", "rdpProfiles"];
+
+    #[test]
+    fn fields_a_later_version_added_to_a_profile_survive_an_unrelated_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let (file, later) = later_file();
+        std::fs::write(&path, file.to_string()).unwrap();
+        let saved = || -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
+        };
+
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        store.upsert_group(group("g2")).unwrap();
+        for kind in KINDS {
+            assert_eq!(saved()[kind][0]["later"].to_string(), later.to_string(), "{kind}");
+        }
+        store.commit(store.snapshot()).unwrap();
+        for kind in KINDS {
+            assert_eq!(saved()[kind][0]["later"].to_string(), later.to_string(), "{kind}");
+        }
+    }
+
+    // The dialogs send a profile as the bindings describe it, without the fields they do not know.
+    #[test]
+    fn an_edit_from_the_dialogs_keeps_the_fields_a_later_version_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let (file, later) = later_file();
+        std::fs::write(&path, file.to_string()).unwrap();
+        let saved = || -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
+        };
+        let edited = |kind: &str| {
+            let mut entry = file[kind][0].clone();
+            let entry_map = entry.as_object_mut().unwrap();
+            entry_map.remove("later");
+            entry_map.insert("name".into(), "renamed".into());
+            entry
+        };
+
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        store.upsert_group(serde_json::from_value(edited("groups")).unwrap()).unwrap();
+        store.upsert_profile(serde_json::from_value(edited("profiles")).unwrap()).unwrap();
+        store.upsert_sftp_profile(serde_json::from_value(edited("sftpProfiles")).unwrap()).unwrap();
+        store.upsert_s3_profile(serde_json::from_value(edited("s3Profiles")).unwrap()).unwrap();
+        store.upsert_vnc_profile(serde_json::from_value(edited("vncProfiles")).unwrap()).unwrap();
+        store.upsert_rdp_profile(serde_json::from_value(edited("rdpProfiles")).unwrap()).unwrap();
+        for kind in KINDS {
+            assert_eq!(saved()[kind].as_array().unwrap().len(), 1, "{kind}");
+            assert_eq!(saved()[kind][0]["name"], "renamed", "{kind}");
+            assert_eq!(saved()[kind][0]["later"].to_string(), later.to_string(), "{kind}");
+        }
+    }
+
+    // A duplicate is sent as a copy of what the store gave, with a new id.
+    #[test]
+    fn a_new_entry_starts_without_the_fields_a_later_version_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let (file, later) = later_file();
+        std::fs::write(&path, file.to_string()).unwrap();
+        let saved = || -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
+        };
+        let copied = |kind: &str| {
+            let mut entry = file[kind][0].clone();
+            entry["id"] = "copy".into();
+            entry
+        };
+
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        store.upsert_group(serde_json::from_value(copied("groups")).unwrap()).unwrap();
+        store.upsert_profile(serde_json::from_value(copied("profiles")).unwrap()).unwrap();
+        store.upsert_sftp_profile(serde_json::from_value(copied("sftpProfiles")).unwrap()).unwrap();
+        store.upsert_s3_profile(serde_json::from_value(copied("s3Profiles")).unwrap()).unwrap();
+        store.upsert_vnc_profile(serde_json::from_value(copied("vncProfiles")).unwrap()).unwrap();
+        store.upsert_rdp_profile(serde_json::from_value(copied("rdpProfiles")).unwrap()).unwrap();
+        for kind in KINDS {
+            assert_eq!(saved()[kind][1]["id"], "copy", "{kind}");
+            assert!(saved()[kind][1].get("later").is_none(), "{kind}");
+            assert_eq!(saved()[kind][0]["later"].to_string(), later.to_string(), "{kind}");
+        }
     }
 
     #[test]

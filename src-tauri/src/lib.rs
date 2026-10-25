@@ -2,6 +2,7 @@ mod commands;
 mod error;
 mod ftp;
 mod net;
+mod rdp;
 mod remote;
 mod s3;
 mod sftp;
@@ -32,12 +33,21 @@ pub mod live_ssh {
     pub use crate::tunnel::{run_dynamic, run_local, run_remote, TunnelStatus, GRACE};
 }
 
+// Public for the live tests in tests/live_rdp.rs.
+pub mod live_rdp {
+    pub use crate::commands::rdp_cmds::RdpSessions;
+    pub use crate::rdp::connect::Target;
+    pub use crate::rdp::input::Input;
+    pub use crate::rdp::session::Session;
+}
+
 use std::sync::{Arc, Mutex};
 
 use commands::ftp_cmds;
 use commands::icon_cmds;
 use commands::import_cmds;
 use commands::local_cmds;
+use commands::rdp_cmds;
 use commands::s3_cmds;
 use commands::sftp_cmds;
 use commands::ssh_cmds;
@@ -48,6 +58,7 @@ use commands::vault_cmds;
 use commands::vnc_cmds;
 use error::AppResult;
 use vault::Vault;
+#[cfg(debug_assertions)]
 use specta_typescript::Typescript;
 use tauri::Manager;
 use tauri_specta::{collect_commands, collect_events, Builder};
@@ -81,6 +92,9 @@ fn specta_builder() -> Builder<tauri::Wry> {
             store_cmds::list_vnc_profiles,
             store_cmds::upsert_vnc_profile,
             store_cmds::delete_vnc_profile,
+            store_cmds::list_rdp_profiles,
+            store_cmds::upsert_rdp_profile,
+            store_cmds::delete_rdp_profile,
             transfer_cmds::transfer_export,
             transfer_cmds::transfer_read,
             transfer_cmds::transfer_validate,
@@ -148,6 +162,11 @@ fn specta_builder() -> Builder<tauri::Wry> {
             vnc_cmds::vnc_input,
             vnc_cmds::vnc_ack,
             vnc_cmds::vnc_close,
+            rdp_cmds::rdp_open,
+            rdp_cmds::rdp_input,
+            rdp_cmds::rdp_resize,
+            rdp_cmds::rdp_ack,
+            rdp_cmds::rdp_close,
         ])
         .events(collect_events![ssh_cmds::SshStatus, tunnel::TunnelStatus])
 }
@@ -250,11 +269,19 @@ pub fn run() {
             app.manage(s3_cmds::S3Sessions::default());
             app.manage(s3_cmds::S3Transfers::default());
             app.manage(vnc_cmds::VncSessions::default());
+            app.manage(rdp_cmds::RdpSessions::default());
             app.manage(tunnel_cmds::Tunnels::default());
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app, event| {
+            // Dropped at the exit, an RDP connection can leave the user's Windows session blocked.
+            if let tauri::RunEvent::Exit = event {
+                let rdps = app.state::<rdp_cmds::RdpSessions>();
+                tauri::async_runtime::block_on(rdps.close_all());
+            }
+        });
 }
 
 #[cfg(test)]

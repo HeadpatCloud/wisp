@@ -6,6 +6,7 @@ import { Label } from '@/components/ui/label'
 import { PageShell } from '@/components/ui/page-shell'
 import { exportBundle, pickExportPath } from '@/lib/transfer'
 import { useProfileStore } from '@/stores/profileStore'
+import { useRdpProfileStore } from '@/stores/rdpProfileStore'
 import { useS3ProfileStore } from '@/stores/s3ProfileStore'
 import { useSessionStore } from '@/stores/sessionStore'
 import { useSftpProfileStore } from '@/stores/sftpProfileStore'
@@ -35,6 +36,7 @@ export function ExportPage({ tabId }: { tabId: string }) {
   const sftp = useSftpProfileStore((s) => s.profiles)
   const s3 = useS3ProfileStore((s) => s.profiles)
   const vnc = useVncProfileStore((s) => s.profiles)
+  const rdp = useRdpProfileStore((s) => s.profiles)
   const removeTab = useSessionStore((s) => s.removeTab)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [includeSecrets, setIncludeSecrets] = useState(false)
@@ -76,6 +78,7 @@ export function ExportPage({ tabId }: { tabId: string }) {
             sftpIds: ids('sftp:'),
             s3Ids: ids('s3:'),
             vncIds: ids('vnc:'),
+            rdpIds: ids('rdp:'),
           },
           { includeSecrets, includeKeys },
           needsPassword ? password : null,
@@ -147,6 +150,7 @@ export function ExportPage({ tabId }: { tabId: string }) {
     ...sftp.map((p) => `sftp:${p.id}`),
     ...s3.map((p) => `s3:${p.id}`),
     ...vnc.map((p) => `vnc:${p.id}`),
+    ...rdp.map((p) => `rdp:${p.id}`),
   ]
 
   if (summary) {
@@ -222,6 +226,12 @@ export function ExportPage({ tabId }: { tabId: string }) {
           <section>
             <h3 className="mb-1 font-semibold">VNC</h3>
             <ul className="space-y-1">{flat('vnc:', vnc)}</ul>
+          </section>
+        )}
+        {rdp.length > 0 && (
+          <section>
+            <h3 className="mb-1 font-semibold">RDP</h3>
+            <ul className="space-y-1">{flat('rdp:', rdp)}</ul>
           </section>
         )}
         <section className="space-y-2 border-border border-t pt-4">

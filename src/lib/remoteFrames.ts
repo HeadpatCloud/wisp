@@ -8,6 +8,7 @@ export type FrameMessage =
   | { kind: 'clipboard'; text: string }
   | { kind: 'closed'; reason: string }
   | { kind: 'sync' }
+  | { kind: 'cursorDefault' }
 
 function invalid(): Error {
   return new Error('invalid frame message')
@@ -58,6 +59,9 @@ export function decodeFrame(buf: ArrayBuffer | number[]): FrameMessage {
     case 7:
       if (view.byteLength !== 1) throw invalid()
       return { kind: 'sync' }
+    case 8:
+      if (view.byteLength !== 1) throw invalid()
+      return { kind: 'cursorDefault' }
     default:
       throw invalid()
   }

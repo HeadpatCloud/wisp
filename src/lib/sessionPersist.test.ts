@@ -226,6 +226,131 @@ test('a VNC tab keeps its username and profile across a restart', () => {
   expect(loadSnapshot()?.tabs).toEqual([tab])
 })
 
+test('an RDP tab is restored as it was', () => {
+  const tabs: Tab[] = [
+    {
+      id: 't1',
+      kind: 'rdp',
+      title: 'pc:3389',
+      host: 'pc',
+      port: 3389,
+      username: 'alice',
+      domain: 'CORP',
+      secretId: 'vault-1',
+      profileId: null,
+      keyboardLayout: null,
+    },
+    {
+      id: 't2',
+      kind: 'rdp',
+      title: 'Office PC',
+      host: 'pc',
+      port: 3390,
+      username: 'bob',
+      domain: null,
+      secretId: null,
+      profileId: 'rdp-1',
+      keyboardLayout: 0x407,
+    },
+  ]
+  saveSnapshot({ tabs, sessions: {}, activeTabId: 't2' })
+  expect(loadSnapshot()).toEqual({ tabs, sessions: {}, activeTabId: 't2' })
+})
+
+test('closing a quick-connect RDP tab drops its password, a saved profile keeps its own', () => {
+  const rdp = (id: string, profileId: string | null): Tab => ({
+    id,
+    kind: 'rdp',
+    title: 'pc:3389',
+    host: 'pc',
+    port: 3389,
+    username: 'alice',
+    domain: null,
+    secretId: 'vault-1',
+    profileId,
+    keyboardLayout: null,
+  })
+  useSessionStore.setState({
+    tabs: [rdp('a', 'rdp-1'), rdp('b', null)],
+    sessions: {},
+    activeTabId: 'a',
+  })
+
+  useSessionStore.getState().removeTab('a')
+  expect(deleteSecret).not.toHaveBeenCalled()
+
+  useSessionStore.getState().removeTab('b')
+  expect(deleteSecret).toHaveBeenCalledWith('vault-1')
+})
+
+test('an RDP tab saved with fields missing loads with the defaults', () => {
+  localStorage.setItem(
+    'wisp.session',
+    JSON.stringify({
+      tabs: [{ id: 't1', kind: 'rdp', title: 'pc:3389', host: 'pc', port: 3389 }],
+      sessions: {},
+      activeTabId: 't1',
+    }),
+  )
+  expect(loadSnapshot()?.tabs).toEqual([
+    {
+      id: 't1',
+      kind: 'rdp',
+      title: 'pc:3389',
+      host: 'pc',
+      port: 3389,
+      username: '',
+      domain: null,
+      secretId: null,
+      profileId: null,
+      keyboardLayout: null,
+    },
+  ])
+})
+
+test('an RDP tab without a profile id still owns its secret when it is closed', () => {
+  localStorage.setItem(
+    'wisp.session',
+    JSON.stringify({
+      tabs: [
+        {
+          id: 't1',
+          kind: 'rdp',
+          title: 'pc:3389',
+          host: 'pc',
+          port: 3389,
+          username: 'alice',
+          secretId: 'vault-1',
+        },
+      ],
+      sessions: {},
+      activeTabId: 't1',
+    }),
+  )
+  const snap = loadSnapshot()
+  if (!snap) throw new Error('nothing persisted')
+  useSessionStore.getState().restoreTabs(snap)
+  useSessionStore.getState().removeTab('t1')
+  expect(deleteSecret).toHaveBeenCalledWith('vault-1')
+})
+
+test('an RDP tab keeps the fields it was saved with', () => {
+  const tab: Tab = {
+    id: 't1',
+    kind: 'rdp',
+    title: 'Office PC',
+    host: 'pc',
+    port: 3390,
+    username: 'alice',
+    domain: 'CORP',
+    secretId: 'vault-1',
+    profileId: 'rdp-1',
+    keyboardLayout: 0,
+  }
+  saveSnapshot({ tabs: [tab], sessions: {}, activeTabId: 't1' })
+  expect(loadSnapshot()?.tabs).toEqual([tab])
+})
+
 // A tab opened from a saved SFTP profile only references it by id, so closing the tab must
 // never touch the profile's vault entries.
 test('closing a saved-profile tab leaves the profile secrets alone', () => {

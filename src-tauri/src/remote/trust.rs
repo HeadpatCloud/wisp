@@ -9,6 +9,7 @@ use crate::ssh::known_hosts::HostKeyVerdict;
 #[derive(Clone, Copy)]
 pub enum Scheme {
     Vnc,
+    Rdp,
 }
 
 pub const UNENCRYPTED: &str = "no certificate (unencrypted login)";
@@ -26,6 +27,7 @@ fn lookup(
 ) -> AppResult<(String, HostKeyVerdict)> {
     let prefix = match scheme {
         Scheme::Vnc => "vnc/",
+        Scheme::Rdp => "rdp/",
     };
     // One key for every spelling of a host: a pin must not depend on how the host was typed.
     let host = crate::net::normalize_host(host);
@@ -293,6 +295,59 @@ mod tests {
             Err(AppError::HostKeyUnknown { host, .. }) if host == "vnc/127.0.0.1"
         ));
         assert!(has_certificate_pin(&known, Scheme::Vnc, "LOCALHOST", 5900).unwrap());
+    }
+
+    #[test]
+    fn rdp_certificate_is_stored_under_its_own_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let known = known(&dir);
+        match check(&known, Scheme::Rdp, "h", 3389, b"cert") {
+            Err(AppError::HostKeyUnknown { host, port, fingerprint }) => {
+                assert_eq!(host, "rdp/h");
+                assert_eq!(port, 3389);
+                known.0.lock().unwrap().record(&host, port, &fingerprint).unwrap();
+            }
+            other => panic!("expected HostKeyUnknown, got {other:?}"),
+        }
+        assert!(check(&known, Scheme::Rdp, "h", 3389, b"cert").is_ok());
+    }
+
+    #[test]
+    fn vnc_pin_is_not_an_rdp_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let known = known(&dir);
+        known.0.lock().unwrap().record("vnc/h", 5900, &fingerprint(b"cert")).unwrap();
+        assert!(matches!(
+            check(&known, Scheme::Rdp, "h", 5900, b"cert"),
+            Err(AppError::HostKeyUnknown { host, .. }) if host == "rdp/h"
+        ));
+    }
+
+    #[test]
+    fn rdp_pin_is_not_a_vnc_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let known = known(&dir);
+        known.0.lock().unwrap().record("rdp/h", 3389, &fingerprint(b"cert")).unwrap();
+        assert!(matches!(
+            check(&known, Scheme::Vnc, "h", 3389, b"cert"),
+            Err(AppError::HostKeyUnknown { host, .. }) if host == "vnc/h"
+        ));
+    }
+
+    #[test]
+    fn an_rdp_pin_holds_for_every_spelling_of_a_host_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let known = known(&dir);
+        match check(&known, Scheme::Rdp, "Desk.lan", 3389, b"cert") {
+            Err(AppError::HostKeyUnknown { host, port, fingerprint }) => {
+                assert_eq!(host, "rdp/desk.lan");
+                known.0.lock().unwrap().record(&host, port, &fingerprint).unwrap();
+            }
+            other => panic!("expected HostKeyUnknown, got {other:?}"),
+        }
+        for spelling in ["Desk.lan", "desk.lan.", "DESK.LAN"] {
+            assert!(check(&known, Scheme::Rdp, spelling, 3389, b"cert").is_ok(), "{spelling}");
+        }
     }
 
     #[test]

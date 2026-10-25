@@ -67,6 +67,7 @@ impl<'a> Stager<'a> {
             ItemKind::Sftp => self.data.sftp_profiles.iter().any(|p| p.id == id),
             ItemKind::S3 => self.data.s3_profiles.iter().any(|p| p.id == id),
             ItemKind::Vnc => self.data.vnc_profiles.iter().any(|p| p.id == id),
+            ItemKind::Rdp => self.data.rdp_profiles.iter().any(|p| p.id == id),
         };
         match self.plan.matches.get(&key) {
             Some(local) if !(accept && as_new) => Some(local.clone()),
@@ -298,6 +299,7 @@ pub fn stage(
                     parent_id,
                     icon,
                     order,
+                    extra: Default::default(),
                 });
                 s.summary.added += 1;
                 s.touched.push((key, id));
@@ -579,6 +581,65 @@ pub fn stage(
         }
     }
 
+    for inc in &payload.rdp_profiles {
+        let key = ItemKind::Rdp.key(&inc.id);
+        let (accept, as_new, fields) = s.decision(&key);
+        if !accept {
+            continue;
+        }
+        match plan.matches.get(&key).filter(|_| !as_new).cloned() {
+            Some(local_id) => {
+                if fields.is_empty() {
+                    continue;
+                }
+                let mut next = s
+                    .data
+                    .rdp_profiles
+                    .iter()
+                    .find(|x| x.id == local_id)
+                    .cloned()
+                    .expect("matched rdp profile exists");
+                for f in &fields {
+                    match *f {
+                        field::NAME => next.name = inc.name.clone(),
+                        field::HOST => next.host = inc.host.clone(),
+                        field::PORT => next.port = inc.port,
+                        field::USERNAME => next.username = inc.username.clone(),
+                        field::DOMAIN => next.domain = inc.domain.clone(),
+                        field::KEYBOARD_LAYOUT => next.keyboard_layout = inc.keyboard_layout,
+                        field::ICON => next.icon = inc.icon.clone(),
+                        field::PASSWORD => {
+                            s.replaced.extend(next.secret_id.take());
+                            next.secret_id = s.secret(inc.secret_id.as_deref());
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(slot) = s.data.rdp_profiles.iter_mut().find(|x| x.id == local_id) {
+                    *slot = next;
+                }
+                s.summary.updated += 1;
+                s.touched.push((key, local_id));
+            }
+            None => {
+                let id =
+                    s.final_id(ItemKind::Rdp, &inc.id).expect("accepted rdp profile has an id");
+                let secret_id = s.secret(inc.secret_id.as_deref());
+                let order = s.data.rdp_profiles.iter().map(|x| x.order + 1).max().unwrap_or(0);
+                let icon = s.icon(&inc.icon);
+                s.data.rdp_profiles.push(crate::store::model::RdpProfile {
+                    id: id.clone(),
+                    secret_id,
+                    icon,
+                    order,
+                    ..inc.clone()
+                });
+                s.summary.added += 1;
+                s.touched.push((key, id));
+            }
+        }
+    }
+
     let touched = std::mem::take(&mut s.touched);
     let mut found: Vec<(String, String)> = Vec::new();
     for (key, id) in &touched {
@@ -733,6 +794,9 @@ fn substitute(data: &mut ProfileStore, secrets: &[String], keys: &[String]) {
     for p in data.vnc_profiles.iter_mut() {
         fix(&mut p.secret_id);
     }
+    for p in data.rdp_profiles.iter_mut() {
+        fix(&mut p.secret_id);
+    }
 }
 
 pub fn execute(
@@ -836,7 +900,8 @@ pub fn remove_unreferenced_keys(keys_dir: &Path, previous: &[ProfileKey], data: 
 mod tests {
     use super::*;
     use crate::store::model::{
-        AuthMethod, Group, IconRef, Profile, ProfileKey, S3Profile, SftpProfile, VncProfile,
+        AuthMethod, Group, IconRef, Profile, ProfileKey, RdpProfile, S3Profile, SftpProfile,
+        VncProfile,
     };
     use crate::transfer::bundle::KeyFile;
     use crate::transfer::plan::plan;
@@ -860,6 +925,7 @@ mod tests {
             jump_host_id: None,
             tunnels: vec![],
             appearance: None,
+            extra: Default::default(),
         }
     }
 
@@ -875,6 +941,7 @@ mod tests {
             secret_id: None,
             icon: IconRef::default(),
             order: 0,
+            extra: Default::default(),
         }
     }
 
@@ -892,6 +959,7 @@ mod tests {
             bucket: None,
             icon: IconRef::default(),
             order: 0,
+            extra: Default::default(),
         }
     }
 
@@ -905,6 +973,23 @@ mod tests {
             secret_id: None,
             icon: IconRef::default(),
             order: 0,
+            extra: Default::default(),
+        }
+    }
+
+    fn rdp(id: &str, name: &str, host: &str) -> RdpProfile {
+        RdpProfile {
+            id: id.into(),
+            name: name.into(),
+            host: host.into(),
+            port: 3389,
+            username: "faye".into(),
+            domain: None,
+            secret_id: None,
+            keyboard_layout: None,
+            icon: IconRef::default(),
+            order: 0,
+            extra: Default::default(),
         }
     }
 
@@ -916,6 +1001,7 @@ mod tests {
             sftp_profiles: vec![],
             s3_profiles: vec![],
             vnc_profiles: vec![],
+            rdp_profiles: vec![],
             unknown: Default::default(),
         }
     }
@@ -927,6 +1013,7 @@ mod tests {
             parent_id: parent.map(Into::into),
             icon: IconRef::default(),
             order: 0,
+            extra: Default::default(),
         }
     }
 
@@ -1140,6 +1227,7 @@ mod tests {
                 parent_id: None,
                 icon: IconRef::default(),
                 order: 0,
+                extra: Default::default(),
             }],
             profiles: vec![inc],
             ..Default::default()
@@ -1416,6 +1504,38 @@ mod tests {
         assert_eq!(S3Profile { secret_id: inc.secret_id.clone(), ..p.clone() }, inc);
     }
 
+    // This bundle carries no RDP profiles, so the import has to leave them as they are.
+    #[test]
+    fn import_leaves_rdp_profiles_as_they_were() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        let mut v = vault(dir.path());
+        let office = RdpProfile {
+            id: "r1".into(),
+            name: "office".into(),
+            host: "10.0.0.9".into(),
+            port: 3390,
+            username: "CORP\\faye".into(),
+            domain: None,
+            secret_id: Some(v.set_secret(b"pw").unwrap()),
+            keyboard_layout: Some(0x407),
+            icon: IconRef::Custom { path: "icons/6f1c2a9e-8d0b-4c57-9a3e-2b7d5e41f0c8.png".into() },
+            order: 3,
+            extra: Default::default(),
+        };
+        store.upsert_rdp_profile(office.clone()).unwrap();
+
+        let payload = Payload { profiles: vec![profile("n", "new", "h9")], ..Default::default() };
+        let staged = run(&store.snapshot(), &payload, &[accept("ssh:n", &[])]).unwrap();
+        let summary = execute(&mut store, &mut v, &dir.path().join("keys"), staged).unwrap();
+        assert_eq!(summary, ApplySummary { added: 1, updated: 0 });
+        assert_eq!(store.profiles().len(), 1);
+        assert_eq!(store.rdp_profiles(), [office.clone()]);
+        let reloaded = Store::load(dir.path().to_path_buf()).unwrap();
+        assert_eq!(reloaded.rdp_profiles(), [office.clone()]);
+        assert_eq!(v.get_secret(office.secret_id.as_deref().unwrap()).unwrap().as_slice(), b"pw");
+    }
+
     // This bundle carries no VNC profiles, so the import has to leave them as they are.
     #[test]
     fn import_leaves_vnc_profiles_as_they_were() {
@@ -1431,6 +1551,7 @@ mod tests {
             secret_id: Some(v.set_secret(b"pw").unwrap()),
             icon: IconRef::Custom { path: "icons/6f1c2a9e-8d0b-4c57-9a3e-2b7d5e41f0c8.png".into() },
             order: 3,
+            extra: Default::default(),
         };
         store.upsert_vnc_profile(desk.clone()).unwrap();
 
@@ -1600,6 +1721,183 @@ mod tests {
     fn failed_vnc_import_leaves_the_store_and_the_vault_as_they_were() {
         let dir = tempfile::tempdir().unwrap();
         let (mut store, mut v, old, staged) = vnc_import(dir.path());
+        assert_eq!(staged.secrets.len(), 2);
+        assert_eq!(staged.replaced_secrets, [old.clone()]);
+        let on_disk = |name: &str| std::fs::read(dir.path().join(name)).unwrap();
+        let before = (store.snapshot(), on_disk("profiles.json"), on_disk("vault.enc"));
+        // A directory where the temp file should be makes the store write fail.
+        std::fs::create_dir(dir.path().join("profiles.json.tmp")).unwrap();
+        assert!(execute(&mut store, &mut v, &dir.path().join("keys"), staged).is_err());
+        assert_eq!((store.snapshot(), on_disk("profiles.json"), on_disk("vault.enc")), before);
+        assert_eq!(v.get_secret(&old).unwrap().as_slice(), b"old");
+    }
+
+    #[test]
+    fn new_rdp_profile_is_written_with_its_secret() {
+        let inc = RdpProfile {
+            domain: Some("CORP".into()),
+            keyboard_layout: Some(0x407),
+            secret_id: Some("mac-pw".into()),
+            ..rdp("r", "office", "h9")
+        };
+        let mut payload = Payload { rdp_profiles: vec![inc.clone()], ..Default::default() };
+        payload.secrets.insert("mac-pw".into(), Zeroizing::new("pw".into()));
+        let local = ProfileStore {
+            rdp_profiles: vec![RdpProfile { order: 3, ..rdp("x", "other", "h1") }],
+            ..store_of(vec![])
+        };
+        let staged = run(&local, &payload, &[accept("rdp:r", &[])]).unwrap();
+        assert_eq!(staged.summary, ApplySummary { added: 1, updated: 0 });
+        assert_eq!(staged.data.rdp_profiles[1].secret_id, Some(format!("{SECRET_PREFIX}0")));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        let mut v = vault(dir.path());
+        execute(&mut store, &mut v, &dir.path().join("keys"), staged).unwrap();
+        assert_eq!(store.rdp_profiles()[0], local.rdp_profiles[0]);
+        let p = &store.rdp_profiles()[1];
+        assert_eq!(v.get_secret(p.secret_id.as_deref().unwrap()).unwrap().as_slice(), b"pw");
+        assert_eq!(p.order, 4);
+        assert_eq!(RdpProfile { secret_id: inc.secret_id.clone(), order: 0, ..p.clone() }, inc);
+        let reloaded = Store::load(dir.path().to_path_buf()).unwrap();
+        assert_eq!(reloaded.rdp_profiles(), store.rdp_profiles());
+    }
+
+    #[test]
+    fn new_rdp_profile_drops_a_password_and_icon_the_bundle_does_not_bring() {
+        let inc = RdpProfile {
+            secret_id: Some("mac-pw".into()),
+            icon: IconRef::Custom { path: "icons/6f1c2a9e-8d0b-4c57-9a3e-2b7d5e41f0c8.png".into() },
+            ..rdp("r", "office", "h9")
+        };
+        let payload = Payload { rdp_profiles: vec![inc], ..Default::default() };
+        let staged = run(&store_of(vec![]), &payload, &[accept("rdp:r", &[])]).unwrap();
+        let p = &staged.data.rdp_profiles[0];
+        assert_eq!((p.id.as_str(), &p.secret_id, &p.icon), ("r", &None, &IconRef::default()));
+        assert!(staged.secrets.is_empty());
+    }
+
+    #[test]
+    fn matched_rdp_profile_takes_only_the_accepted_fields() {
+        let pc = RdpProfile { secret_id: Some("old".into()), ..rdp("pc", "office", "h1") };
+        let mac = RdpProfile {
+            name: "office (mac)".into(),
+            host: "h2".into(),
+            port: 3390,
+            username: "CORP\\faye".into(),
+            domain: Some("CORP".into()),
+            keyboard_layout: Some(0x407),
+            secret_id: Some("mac-pw".into()),
+            icon: IconRef::Builtin { name: "monitor".into() },
+            ..pc.clone()
+        };
+        let mut payload = Payload { rdp_profiles: vec![mac.clone()], ..Default::default() };
+        payload.secrets.insert("mac-pw".into(), Zeroizing::new("new".into()));
+        let local = ProfileStore { rdp_profiles: vec![pc.clone()], ..store_of(vec![]) };
+
+        let some = ["port", "domain", "keyboardLayout"];
+        let staged = run(&local, &payload, &[accept("rdp:pc", &some)]).unwrap();
+        let expected = RdpProfile {
+            port: 3390,
+            domain: Some("CORP".into()),
+            keyboard_layout: Some(0x407),
+            ..pc
+        };
+        assert_eq!(staged.data.rdp_profiles, [expected]);
+        assert!(staged.secrets.is_empty() && staged.replaced_secrets.is_empty());
+        assert_eq!(staged.summary, ApplySummary { added: 0, updated: 1 });
+
+        let every =
+            ["name", "host", "port", "username", "domain", "keyboardLayout", "icon", "password"];
+        let staged = run(&local, &payload, &[accept("rdp:pc", &every)]).unwrap();
+        let all = RdpProfile { secret_id: Some(format!("{SECRET_PREFIX}0")), ..mac };
+        assert_eq!(staged.data.rdp_profiles, [all]);
+        assert_eq!(staged.secrets[0].as_str(), "new");
+        assert_eq!(staged.replaced_secrets, ["old"]);
+        assert_eq!(staged.summary, ApplySummary { added: 0, updated: 1 });
+    }
+
+    #[test]
+    fn declined_rdp_profiles_leave_everything_untouched() {
+        let pc = RdpProfile { secret_id: Some("old".into()), ..rdp("pc", "office", "h1") };
+        let mac = RdpProfile { port: 3390, secret_id: Some("mac-pw".into()), ..pc.clone() };
+        let mut payload =
+            Payload { rdp_profiles: vec![mac, rdp("n", "new", "h9")], ..Default::default() };
+        payload.secrets.insert("mac-pw".into(), Zeroizing::new("new".into()));
+        let local = ProfileStore { rdp_profiles: vec![pc], ..store_of(vec![]) };
+        let decline = |key: &str| ItemDecision {
+            key: key.into(),
+            accept: false,
+            as_new: false,
+            fields: vec!["port".into(), "password".into()],
+        };
+        for decisions in [
+            vec![],
+            vec![decline("rdp:pc"), decline("rdp:n")],
+            vec![accept("rdp:pc", &[])],
+        ] {
+            let staged = run(&local, &payload, &decisions).unwrap();
+            assert_eq!(staged.data, local);
+            assert!(staged.secrets.is_empty() && staged.replaced_secrets.is_empty());
+            assert_eq!(staged.summary, ApplySummary { added: 0, updated: 0 });
+        }
+    }
+
+    #[test]
+    fn rdp_profile_added_as_new_gets_its_own_id() {
+        let pc = rdp("pc", "office", "h1");
+        let local = ProfileStore { rdp_profiles: vec![pc.clone()], ..store_of(vec![]) };
+        let inc = RdpProfile { port: 3390, ..pc.clone() };
+        let payload = Payload { rdp_profiles: vec![inc], ..Default::default() };
+        let d = ItemDecision { key: "rdp:pc".into(), accept: true, as_new: true, fields: vec![] };
+        let staged = run(&local, &payload, &[d]).unwrap();
+        assert_eq!(staged.data.rdp_profiles.len(), 2);
+        assert_eq!(staged.data.rdp_profiles[0], pc);
+        let added = &staged.data.rdp_profiles[1];
+        assert_ne!(added.id, "pc");
+        assert_eq!((added.port, added.order), (3390, 1));
+        assert_eq!(staged.summary, ApplySummary { added: 1, updated: 0 });
+    }
+
+    // A stored RDP profile whose password is in the vault, and an import that replaces that
+    // password and adds a second profile with a password of its own.
+    fn rdp_import(dir: &std::path::Path) -> (Store, Vault, String, Staged) {
+        let mut store = Store::load(dir.to_path_buf()).unwrap();
+        let mut v = vault(dir);
+        let old = v.set_secret(b"old").unwrap();
+        let pc = RdpProfile { secret_id: Some(old.clone()), ..rdp("pc", "office", "h1") };
+        store.upsert_rdp_profile(pc).unwrap();
+        let mac = RdpProfile { secret_id: Some("mac-pw".into()), ..rdp("mac", "office", "h1") };
+        let lab = RdpProfile { secret_id: Some("lab-pw".into()), ..rdp("lab", "lab", "h2") };
+        let mut payload = Payload { rdp_profiles: vec![mac, lab], ..Default::default() };
+        payload.secrets.insert("mac-pw".into(), Zeroizing::new("new".into()));
+        payload.secrets.insert("lab-pw".into(), Zeroizing::new("lab".into()));
+        let decisions = [accept("rdp:mac", &["password"]), accept("rdp:lab", &[])];
+        let staged = run(&store.snapshot(), &payload, &decisions).unwrap();
+        (store, v, old, staged)
+    }
+
+    #[test]
+    fn rdp_import_stores_the_new_passwords_and_deletes_the_replaced_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, mut v, old, staged) = rdp_import(dir.path());
+        let summary = execute(&mut store, &mut v, &dir.path().join("keys"), staged).unwrap();
+        assert_eq!(summary, ApplySummary { added: 1, updated: 1 });
+        let profiles = store.rdp_profiles();
+        let ids: Vec<_> = profiles.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["pc", "lab"]);
+        let secret =
+            |p: &RdpProfile| v.get_secret(p.secret_id.as_deref().unwrap()).unwrap().to_vec();
+        assert_eq!(secret(&profiles[0]), b"new");
+        assert_eq!(secret(&profiles[1]), b"lab");
+        assert!(!v.has_secret(&old));
+        assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().rdp_profiles(), profiles);
+    }
+
+    #[test]
+    fn failed_rdp_import_leaves_the_store_and_the_vault_as_they_were() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, mut v, old, staged) = rdp_import(dir.path());
         assert_eq!(staged.secrets.len(), 2);
         assert_eq!(staged.replaced_secrets, [old.clone()]);
         let on_disk = |name: &str| std::fs::read(dir.path().join(name)).unwrap();

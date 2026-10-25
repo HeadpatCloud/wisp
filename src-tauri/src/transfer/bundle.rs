@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::error::{AppError, AppResult};
-use crate::store::model::{Group, Profile, S3Profile, SftpProfile, VncProfile};
+use crate::store::model::{Group, Profile, RdpProfile, S3Profile, SftpProfile, VncProfile};
 use crate::vault::crypto;
 use crate::vault::model::KdfParams;
 
@@ -33,6 +33,8 @@ pub struct Payload {
     pub s3_profiles: Vec<S3Profile>,
     #[serde(default)]
     pub vnc_profiles: Vec<VncProfile>,
+    #[serde(default)]
+    pub rdp_profiles: Vec<RdpProfile>,
     // Keyed by the exporting machine's secret id and key path, which the profiles still reference.
     #[serde(default)]
     pub secrets: BTreeMap<String, Zeroizing<String>>,
@@ -115,11 +117,16 @@ fn checked(payload: Payload) -> AppResult<Opened> {
         && unique(payload.sftp_profiles.iter().map(|p| &p.id).collect())
         && unique(payload.s3_profiles.iter().map(|p| &p.id).collect())
         && unique(payload.vnc_profiles.iter().map(|p| &p.id).collect())
+        && unique(payload.rdp_profiles.iter().map(|p| &p.id).collect())
     {
         Ok(Opened::Payload(payload))
     } else {
         Err(corrupt())
     }
+}
+
+fn newer() -> AppError {
+    AppError::Import("this file was made by a newer version of Wisp".into())
 }
 
 // A key this build does not write holds a kind of profile it would leave out without a word.
@@ -128,7 +135,23 @@ fn known_keys<'a>(keys: impl IntoIterator<Item = &'a String>) -> AppResult<()> {
     if keys.into_iter().all(|key| known.get(key).is_some()) {
         return Ok(());
     }
-    Err(AppError::Import("this file was made by a newer version of Wisp".into()))
+    Err(newer())
+}
+
+// A profile field this build does not know, such as a gateway, would be left out on import and the
+// profile would then connect without it.
+fn known_fields(payload: &Payload) -> AppResult<()> {
+    let known = payload.groups.iter().all(|g| g.extra.is_empty())
+        && payload.profiles.iter().all(|p| p.extra.is_empty())
+        && payload.sftp_profiles.iter().all(|p| p.extra.is_empty())
+        && payload.s3_profiles.iter().all(|p| p.extra.is_empty())
+        && payload.vnc_profiles.iter().all(|p| p.extra.is_empty())
+        && payload.rdp_profiles.iter().all(|p| p.extra.is_empty());
+    if known {
+        Ok(())
+    } else {
+        Err(newer())
+    }
 }
 
 pub fn load(path: &str) -> AppResult<Zeroizing<Vec<u8>>> {
@@ -143,7 +166,9 @@ pub fn read(bytes: &[u8], password: Option<&str>) -> AppResult<Opened> {
     let value: serde_json::Value = serde_json::from_slice(bytes)?;
     match value.get("version").and_then(|v| v.as_u64()) {
         Some(1) if value.get("groups").is_some() && value.get("profiles").is_some() => {
-            checked(serde_json::from_value(value)?)
+            let payload = serde_json::from_value(value)?;
+            known_fields(&payload)?;
+            checked(payload)
         }
         Some(2) => {
             if let Some(serde_json::Value::Object(payload)) = value.get("payload") {
@@ -151,7 +176,9 @@ pub fn read(bytes: &[u8], password: Option<&str>) -> AppResult<Opened> {
             }
             let envelope: Envelope = serde_json::from_value(value)?;
             if !envelope.encrypted {
-                return checked(envelope.payload.ok_or_else(corrupt)?);
+                let payload = envelope.payload.ok_or_else(corrupt)?;
+                known_fields(&payload)?;
+                return checked(payload);
             }
             let Some(password) = password else { return Ok(Opened::NeedsPassword) };
             let salt: [u8; 16] = decode(envelope.salt)?.try_into().map_err(|_| corrupt())?;
@@ -171,7 +198,9 @@ pub fn read(bytes: &[u8], password: Option<&str>) -> AppResult<Opened> {
             // Only the keys are read here, so that no secret is copied out of `plain`.
             let keys: BTreeMap<String, IgnoredAny> = serde_json::from_slice(&plain)?;
             known_keys(keys.keys())?;
-            checked(serde_json::from_slice(&plain)?)
+            let payload = serde_json::from_slice(&plain)?;
+            known_fields(&payload)?;
+            checked(payload)
         }
         Some(1) | None => Err(AppError::Import("this isn't a wisp export file".into())),
         Some(v) => Err(AppError::Import(format!("unsupported export version {v}"))),
@@ -200,6 +229,7 @@ mod tests {
             jump_host_id: None,
             tunnels: vec![],
             appearance: None,
+            extra: Default::default(),
         }
     }
 
@@ -213,6 +243,23 @@ mod tests {
             secret_id: Some("vnc-1".into()),
             icon: IconRef::default(),
             order: 0,
+            extra: Default::default(),
+        }
+    }
+
+    fn rdp(id: &str) -> RdpProfile {
+        RdpProfile {
+            id: id.into(),
+            name: "office".into(),
+            host: "10.0.0.9".into(),
+            port: 3390,
+            username: "faye".into(),
+            domain: Some("CORP".into()),
+            secret_id: Some("rdp-1".into()),
+            keyboard_layout: Some(0x407),
+            icon: IconRef::default(),
+            order: 0,
+            extra: Default::default(),
         }
     }
 
@@ -332,6 +379,7 @@ mod tests {
             bucket: None,
             icon: IconRef::default(),
             order: 0,
+            extra: Default::default(),
         };
         let v1 = serde_json::json!({
             "version": 1, "groups": [], "profiles": [profile("p1")], "s3Profiles": [s3]
@@ -340,6 +388,17 @@ mod tests {
         assert_eq!(p.profiles.len(), 1);
         assert_eq!(p.s3_profiles.len(), 1);
         assert!(p.secrets.is_empty());
+    }
+
+    #[test]
+    fn version_one_files_with_a_field_this_build_does_not_know_are_refused() {
+        let mut newer = serde_json::to_value(profile("p1")).unwrap();
+        newer["gateway"] = serde_json::json!({ "host": "gw.lan" });
+        let v1 = serde_json::json!({ "version": 1, "groups": [], "profiles": [newer] });
+        assert!(matches!(
+            read(v1.to_string().as_bytes(), None),
+            Err(AppError::Import(told)) if told == "this file was made by a newer version of Wisp"
+        ));
     }
 
     #[test]
@@ -362,6 +421,49 @@ mod tests {
     }
 
     #[test]
+    fn rdp_profiles_round_trip_in_a_version_two_file() {
+        let plain = Payload { rdp_profiles: vec![rdp("r1")], ..Default::default() };
+        let mut sealed = plain.clone();
+        sealed.secrets.insert("rdp-1".into(), Zeroizing::new("hunter2".into()));
+        for (payload, password) in [(&plain, None), (&sealed, Some("pw"))] {
+            let bytes = write(payload, password).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["version"], 2);
+            assert!(matches!(
+                read(&bytes, password).unwrap(),
+                Opened::Payload(back) if &back == payload
+            ));
+        }
+        let value: serde_json::Value =
+            serde_json::from_slice(&write(&plain, None).unwrap()).unwrap();
+        assert_eq!(value["payload"]["rdpProfiles"][0]["id"], "r1");
+    }
+
+    #[test]
+    fn version_two_files_from_before_rdp_profiles_still_read() {
+        let old = serde_json::json!({
+            "groups": [], "profiles": [profile("p1")], "sftpProfiles": [], "s3Profiles": [],
+            "vncProfiles": [vnc("v1")], "secrets": {}, "keyFiles": {}
+        });
+        let kdf = KdfParams { m_cost: 8, t_cost: 1, p_cost: 1 };
+        let salt = crypto::random_bytes::<16>().unwrap();
+        let key = crypto::derive_key(b"pw", &salt, Some(kdf.tuple())).unwrap();
+        let (nonce, ciphertext) = crypto::seal(&key, old.to_string().as_bytes()).unwrap();
+        let sealed = serde_json::json!({
+            "version": 2, "encrypted": true, "kdf": kdf, "salt": STANDARD.encode(salt),
+            "nonce": STANDARD.encode(nonce), "ciphertext": STANDARD.encode(ciphertext)
+        });
+        let plain = serde_json::json!({ "version": 2, "encrypted": false, "payload": old });
+        for (file, password) in [(plain, None), (sealed, Some("pw"))] {
+            let Opened::Payload(p) = read(file.to_string().as_bytes(), password).unwrap() else {
+                panic!()
+            };
+            assert_eq!(p.vnc_profiles.len(), 1);
+            assert!(p.rdp_profiles.is_empty());
+        }
+    }
+
+    #[test]
     fn version_two_files_from_before_vnc_profiles_still_read() {
         let old = serde_json::json!({
             "groups": [], "profiles": [profile("p1")], "sftpProfiles": [], "s3Profiles": [],
@@ -381,7 +483,7 @@ mod tests {
                 panic!()
             };
             assert_eq!(p.profiles.len(), 1);
-            assert!(p.vnc_profiles.is_empty());
+            assert!(p.vnc_profiles.is_empty() && p.rdp_profiles.is_empty());
         }
     }
 
@@ -389,7 +491,7 @@ mod tests {
     fn version_two_files_with_a_kind_this_build_does_not_know_are_refused() {
         let newer = serde_json::json!({
             "groups": [], "profiles": [profile("p1")], "sftpProfiles": [], "s3Profiles": [],
-            "vncProfiles": [vnc("v1")], "rdpProfiles": [{ "id": "r1" }], "secrets": {},
+            "vncProfiles": [vnc("v1")], "kioskProfiles": [{ "id": "k1" }], "secrets": {},
             "keyFiles": {}
         });
         let kdf = KdfParams { m_cost: 8, t_cost: 1, p_cost: 1 };
@@ -411,6 +513,64 @@ mod tests {
                 Err(AppError::Import(told))
                     if told == "this file was made by a newer version of Wisp"
             ));
+        }
+    }
+
+    // A plain and a sealed version two file of `payload`, each with the password it needs.
+    fn version_two_files(payload: &serde_json::Value) -> [(serde_json::Value, Option<&str>); 2] {
+        let kdf = KdfParams { m_cost: 8, t_cost: 1, p_cost: 1 };
+        let salt = crypto::random_bytes::<16>().unwrap();
+        let key = crypto::derive_key(b"pw", &salt, Some(kdf.tuple())).unwrap();
+        let (nonce, ciphertext) = crypto::seal(&key, payload.to_string().as_bytes()).unwrap();
+        let sealed = serde_json::json!({
+            "version": 2, "encrypted": true, "kdf": kdf, "salt": STANDARD.encode(salt),
+            "nonce": STANDARD.encode(nonce), "ciphertext": STANDARD.encode(ciphertext)
+        });
+        let plain = serde_json::json!({ "version": 2, "encrypted": false, "payload": payload });
+        [(plain, None), (sealed, Some("pw"))]
+    }
+
+    #[test]
+    fn profiles_with_fields_this_build_does_not_know_are_refused() {
+        let group = Group {
+            id: "g1".into(),
+            name: "g1".into(),
+            parent_id: None,
+            icon: IconRef::default(),
+            order: 0,
+            extra: Default::default(),
+        };
+        let sftp = serde_json::json!({ "id": "s1", "name": "s1", "host": "h", "port": 22,
+            "username": "u", "authMethod": "password", "secretId": null, "order": 0 });
+        let s3 = serde_json::json!({ "id": "b1", "name": "b1", "endpoint": "e", "port": null,
+            "region": "r", "useTls": true, "pathStyle": false, "accessKeyId": "k",
+            "secretId": null, "bucket": null, "order": 0 });
+        let known = serde_json::json!({
+            "groups": [group], "profiles": [profile("p1")], "sftpProfiles": [sftp],
+            "s3Profiles": [s3], "vncProfiles": [vnc("v1")], "rdpProfiles": [rdp("r1")],
+            "secrets": {}, "keyFiles": {}
+        });
+        for (file, password) in version_two_files(&known) {
+            let Opened::Payload(p) = read(file.to_string().as_bytes(), password).unwrap() else {
+                panic!()
+            };
+            assert_eq!(p.rdp_profiles, [rdp("r1")]);
+        }
+
+        let kinds = ["groups", "profiles", "sftpProfiles", "s3Profiles", "vncProfiles"];
+        for kind in ["rdpProfiles"].into_iter().chain(kinds) {
+            let mut newer = known.clone();
+            newer[kind][0]["gateway"] = serde_json::json!({ "host": "gw.lan", "port": 443 });
+            for (file, password) in version_two_files(&newer) {
+                assert!(
+                    matches!(
+                        read(file.to_string().as_bytes(), password),
+                        Err(AppError::Import(told))
+                            if told == "this file was made by a newer version of Wisp"
+                    ),
+                    "{kind} {password:?}"
+                );
+            }
         }
     }
 
@@ -443,15 +603,22 @@ mod tests {
             parent_id: None,
             icon: IconRef::default(),
             order: 0,
+            extra: Default::default(),
         };
         let groups = Payload { groups: vec![group.clone(), group], ..Default::default() };
         let profiles =
             Payload { profiles: vec![profile("p1"), profile("p1")], ..Default::default() };
         let vnc_profiles =
             Payload { vnc_profiles: vec![vnc("v1"), vnc("v1")], ..Default::default() };
-        for (payload, password) in
-            [(&groups, None), (&profiles, None), (&profiles, Some("pw")), (&vnc_profiles, None)]
-        {
+        let rdp_profiles =
+            Payload { rdp_profiles: vec![rdp("r1"), rdp("r1")], ..Default::default() };
+        for (payload, password) in [
+            (&groups, None),
+            (&profiles, None),
+            (&profiles, Some("pw")),
+            (&vnc_profiles, None),
+            (&rdp_profiles, None),
+        ] {
             let bytes = write(payload, password).unwrap();
             assert!(matches!(read(&bytes, password), Err(AppError::Import(_))));
         }

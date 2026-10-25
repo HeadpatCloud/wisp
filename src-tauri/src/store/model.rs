@@ -75,6 +75,9 @@ pub struct SftpProfile {
     #[serde(default)]
     pub icon: IconRef,
     pub order: u32,
+    #[serde(flatten)]
+    #[specta(skip)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 // A saved S3 / S3-compatible connection. The secret access key never lives here - only a
@@ -95,6 +98,9 @@ pub struct S3Profile {
     #[serde(default)]
     pub icon: IconRef,
     pub order: u32,
+    #[serde(flatten)]
+    #[specta(skip)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 // A saved VNC connection. The password is a secret_id into the vault, like the others.
@@ -110,6 +116,29 @@ pub struct VncProfile {
     #[serde(default)]
     pub icon: IconRef,
     pub order: u32,
+    #[serde(flatten)]
+    #[specta(skip)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+// A saved RDP connection. The password is a secret_id into the vault, like the others.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RdpProfile {
+    pub id: String,
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub domain: Option<String>,
+    pub secret_id: Option<String>,
+    pub keyboard_layout: Option<u32>,
+    #[serde(default)]
+    pub icon: IconRef,
+    pub order: u32,
+    #[serde(flatten)]
+    #[specta(skip)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -121,6 +150,9 @@ pub struct Group {
     #[serde(default)]
     pub icon: IconRef,
     pub order: u32,
+    #[serde(flatten)]
+    #[specta(skip)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -147,6 +179,9 @@ pub struct Profile {
     pub tunnels: Vec<Tunnel>,
     #[serde(default)]
     pub appearance: Option<ProfileAppearance>,
+    #[serde(flatten)]
+    #[specta(skip)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
@@ -249,6 +284,8 @@ pub struct ProfileStore {
     pub s3_profiles: Vec<S3Profile>,
     #[serde(default)]
     pub vnc_profiles: Vec<VncProfile>,
+    #[serde(default)]
+    pub rdp_profiles: Vec<RdpProfile>,
     // What a later version keeps in the file. It is written back as it was read: left out, the
     // first save by this version would delete it.
     #[serde(flatten)]
@@ -284,6 +321,7 @@ mod tests {
             jump_host_id: None,
             tunnels: vec![],
             appearance: None,
+            extra: Default::default(),
         }
     }
 
@@ -326,6 +364,7 @@ mod tests {
                 secret_id: Some("vault-1".into()),
                 icon: IconRef::default(),
                 order: 0,
+                extra: Default::default(),
             }],
             ..Default::default()
         };
@@ -342,5 +381,39 @@ mod tests {
         let p: VncProfile = serde_json::from_str(minimal).unwrap();
         assert_eq!(p.icon, IconRef::default());
         assert_eq!(p.username.as_deref(), Some("u"));
+    }
+
+    #[test]
+    fn rdp_profiles_are_stored_camel_case() {
+        let store = ProfileStore {
+            rdp_profiles: vec![RdpProfile {
+                id: "r1".into(),
+                name: "office".into(),
+                host: "10.0.0.9".into(),
+                port: 3389,
+                username: "CORP\\faye".into(),
+                domain: None,
+                secret_id: Some("vault-1".into()),
+                keyboard_layout: Some(0x407),
+                icon: IconRef::default(),
+                order: 0,
+                extra: Default::default(),
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&store).unwrap();
+        assert_eq!(json["rdpProfiles"][0]["secretId"], "vault-1");
+        assert_eq!(json["rdpProfiles"][0]["keyboardLayout"], 0x407);
+        assert_eq!(json["rdpProfiles"][0]["domain"], serde_json::Value::Null);
+        assert_eq!(serde_json::from_value::<ProfileStore>(json).unwrap(), store);
+    }
+
+    #[test]
+    fn rdp_profile_tolerates_a_missing_icon() {
+        let minimal = r#"{"id":"r1","name":"n","host":"h","port":3389,"username":"u",
+            "domain":"corp","secretId":null,"keyboardLayout":null,"order":0}"#;
+        let p: RdpProfile = serde_json::from_str(minimal).unwrap();
+        assert_eq!(p.icon, IconRef::default());
+        assert_eq!(p.domain.as_deref(), Some("corp"));
     }
 }

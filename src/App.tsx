@@ -4,6 +4,7 @@ import { Settings } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   events,
+  type RdpProfile,
   type S3Profile,
   type SftpProfile,
   type ShellInfo,
@@ -19,6 +20,8 @@ import { FtpConnectDialog } from '@/features/ftp/FtpConnectDialog'
 import { FtpConnectionView } from '@/features/ftp/FtpConnectionView'
 import { CommandPalette } from '@/features/palette/CommandPalette'
 import { ProfileTree } from '@/features/profiles/ProfileTree'
+import { RdpConnectDialog } from '@/features/remote/RdpConnectDialog'
+import { RdpProfileDialog } from '@/features/remote/RdpProfileDialog'
 import { RemoteDesktopView } from '@/features/remote/RemoteDesktopView'
 import { VncProfileDialog } from '@/features/remote/VncProfileDialog'
 import { S3ConnectionView } from '@/features/s3/S3ConnectionView'
@@ -37,6 +40,7 @@ import { VaultGate } from '@/features/vault/VaultGate'
 import { WelcomePage } from '@/features/welcome/WelcomePage'
 import { useHotkeys } from '@/lib/hotkeys'
 import { clearEditTemp, listShells } from '@/lib/local'
+import { rdpDriver } from '@/lib/rdp'
 import { clearSnapshot, loadSnapshot, saveSnapshot } from '@/lib/sessionPersist'
 import { watchSystemTheme } from '@/lib/theme'
 import { pickImportPath } from '@/lib/transfer'
@@ -44,10 +48,12 @@ import { cn } from '@/lib/utils'
 import { setSecret } from '@/lib/vault'
 import { vncDriver } from '@/lib/vnc'
 import { useProfileStore } from '@/stores/profileStore'
+import { useRdpProfileStore } from '@/stores/rdpProfileStore'
 import { useS3ProfileStore } from '@/stores/s3ProfileStore'
 import {
   type FtpTab,
   type LocalTab,
+  type RdpTab,
   type S3Tab,
   type SessionTab,
   type SftpTab,
@@ -96,6 +102,16 @@ function VncTabView({ tab, active }: { tab: VncTab; active: boolean }) {
   return <RemoteDesktopView tabId={tab.id} driver={driver} active={active} />
 }
 
+function RdpTabView({ tab, active }: { tab: RdpTab; active: boolean }) {
+  const { host, port, username, domain, secretId, profileId, keyboardLayout } = tab
+  // The view reconnects whenever it is given another driver object.
+  const driver = useMemo(
+    () => rdpDriver({ host, port, username, domain, secretId, profileId, keyboardLayout }),
+    [host, port, username, domain, secretId, profileId, keyboardLayout],
+  )
+  return <RemoteDesktopView tabId={tab.id} driver={driver} active={active} />
+}
+
 export default function App() {
   const load = useProfileStore((s) => s.load)
   const tabs = useSessionStore((s) => s.tabs)
@@ -104,6 +120,7 @@ export default function App() {
   const openView = useSessionStore((s) => s.openView)
   const openLocalShell = useSessionStore((s) => s.openLocalShell)
   const openVnc = useSessionStore((s) => s.openVnc)
+  const openRdp = useSessionStore((s) => s.openRdp)
   const openSftp = useSessionStore((s) => s.openSftp)
   const openSftpAdhoc = useSessionStore((s) => s.openSftpAdhoc)
   const openSftpProfile = useSessionStore((s) => s.openSftpProfile)
@@ -113,9 +130,11 @@ export default function App() {
   const loadS3 = useS3ProfileStore((s) => s.load)
   const loadSftpProfiles = useSftpProfileStore((s) => s.load)
   const loadVncProfiles = useVncProfileStore((s) => s.load)
+  const loadRdpProfiles = useRdpProfileStore((s) => s.load)
   const themeValue = useSettingsStore((s) => s.settings.theme)
   const settingsHotkeys = useSettingsStore((s) => s.settings.hotkeys ?? {})
   const [vncDialogOpen, setVncDialogOpen] = useState(false)
+  const [rdpDialogOpen, setRdpDialogOpen] = useState(false)
   const [ftpDialogOpen, setFtpDialogOpen] = useState(false)
   const [sftpDialogOpen, setSftpDialogOpen] = useState(false)
   const [s3DialogOpen, setS3DialogOpen] = useState(false)
@@ -124,6 +143,8 @@ export default function App() {
   const [sftpEditing, setSftpEditing] = useState<SftpProfile | null>(null)
   const [vncProfileDialogOpen, setVncProfileDialogOpen] = useState(false)
   const [vncEditing, setVncEditing] = useState<VncProfile | null>(null)
+  const [rdpProfileDialogOpen, setRdpProfileDialogOpen] = useState(false)
+  const [rdpEditing, setRdpEditing] = useState<RdpProfile | null>(null)
   const [shells, setShells] = useState<ShellInfo[]>([])
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [vaultReady, setVaultReady] = useState(false)
@@ -214,6 +235,9 @@ export default function App() {
     loadVncProfiles().catch(console.error)
   }, [loadVncProfiles])
   useEffect(() => {
+    loadRdpProfiles().catch(console.error)
+  }, [loadRdpProfiles])
+  useEffect(() => {
     return watchSystemTheme(() =>
       themeValue === 'light' || themeValue === 'dark' ? themeValue : 'system',
     )
@@ -240,6 +264,7 @@ export default function App() {
   const sessionTabs = tabs.filter((t): t is SessionTab => t.kind === 'session')
   const localTabs = tabs.filter((t): t is LocalTab => t.kind === 'local')
   const vncTabs = tabs.filter((t): t is VncTab => t.kind === 'vnc')
+  const rdpTabs = tabs.filter((t): t is RdpTab => t.kind === 'rdp')
   const sftpTabs = tabs.filter((t): t is SftpTab => t.kind === 'sftp')
   const ftpTabs = tabs.filter((t): t is FtpTab => t.kind === 'ftp')
   const s3Tabs = tabs.filter((t): t is S3Tab => t.kind === 's3')
@@ -270,6 +295,30 @@ export default function App() {
             }
           }
           openVnc({ host, port, username: username.trim() || null, secretId, profileId: null })
+        }}
+      />
+      <RdpConnectDialog
+        open={rdpDialogOpen}
+        onOpenChange={setRdpDialogOpen}
+        onConnect={async (host, port, username, domain, password) => {
+          let secretId: string | null = null
+          if (password) {
+            try {
+              secretId = await setSecret(password)
+            } catch (e) {
+              await message(String(e), { title: 'Could not store the password', kind: 'error' })
+              return
+            }
+          }
+          openRdp({
+            host,
+            port,
+            username,
+            domain,
+            secretId,
+            profileId: null,
+            keyboardLayout: null,
+          })
         }}
       />
       <FtpConnectDialog
@@ -304,6 +353,11 @@ export default function App() {
         open={vncProfileDialogOpen}
         onOpenChange={setVncProfileDialogOpen}
         editing={vncEditing}
+      />
+      <RdpProfileDialog
+        open={rdpProfileDialogOpen}
+        onOpenChange={setRdpProfileDialogOpen}
+        editing={rdpEditing}
       />
       <AppShell
         sidebar={
@@ -370,6 +424,7 @@ export default function App() {
                   openView({ kind: 'profile-editor', profileId: null }, 'New profile')
                 }
                 onNewVnc={() => setVncDialogOpen(true)}
+                onNewRdp={() => setRdpDialogOpen(true)}
                 onNewVncProfile={() => {
                   setVncEditing(null)
                   setVncProfileDialogOpen(true)
@@ -387,6 +442,26 @@ export default function App() {
                 onEditVnc={(p) => {
                   setVncEditing(p)
                   setVncProfileDialogOpen(true)
+                }}
+                onNewRdpProfile={() => {
+                  setRdpEditing(null)
+                  setRdpProfileDialogOpen(true)
+                }}
+                onActivateRdp={(p) =>
+                  openRdp({
+                    host: p.host,
+                    port: p.port,
+                    username: p.username,
+                    domain: p.domain,
+                    secretId: null,
+                    profileId: p.id,
+                    keyboardLayout: p.keyboardLayout,
+                    title: p.name,
+                  })
+                }
+                onEditRdp={(p) => {
+                  setRdpEditing(p)
+                  setRdpProfileDialogOpen(true)
                 }}
                 onNewFtp={() => setFtpDialogOpen(true)}
                 onNewS3={() => {
@@ -454,6 +529,15 @@ export default function App() {
                   className={cn('absolute inset-0', t.id !== activeTabId && 'hidden')}
                 >
                   <VncTabView tab={t} active={t.id === activeTabId} />
+                </div>
+              ))}
+              {rdpTabs.map((t) => (
+                <div
+                  key={t.id}
+                  data-testid={`tabpane-${t.id}`}
+                  className={cn('absolute inset-0', t.id !== activeTabId && 'hidden')}
+                >
+                  <RdpTabView tab={t} active={t.id === activeTabId} />
                 </div>
               ))}
               {sftpTabs.map((t) => (

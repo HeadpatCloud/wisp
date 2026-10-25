@@ -26,11 +26,13 @@ vi.mock('@tauri-apps/api/core', () => ({
   },
 }))
 
+import { RemoteKeyboard } from './remoteInput'
 import { vncDriver } from './vnc'
 
 const RECT = [1, 0, 1, 0, 2, 0, 1, 0, 1, 9, 8, 7, 255]
 const UNREADABLE = { kind: 'closed', reason: 'The server sent data this app could not read.' }
 const OK = { status: 'ok', data: null }
+const viewport = { width: 0, height: 0, scale: 100 }
 const opened = { id: 'v1', width: 4, height: 2, name: 'desk' }
 const target = { host: 'h', port: 5901, username: 'faye', secretId: 's1', profileId: null }
 const press = (keysym: number): VncInput => ({ kind: 'key', down: true, keysym })
@@ -80,14 +82,14 @@ function held(): Call[] {
 async function open() {
   const frames: FrameMessage[] = []
   const driver = vncDriver(target)
-  const session = await driver.open((f) => frames.push(f))
+  const session = await driver.open((f) => frames.push(f), viewport)
   return { driver, session, frames, send: m.channels[0].onmessage }
 }
 
 async function rejection(error: unknown): Promise<unknown> {
   m.vncOpen.mockResolvedValue({ status: 'error', error })
   return vncDriver(target)
-    .open(() => {})
+    .open(() => {}, viewport)
     .catch((e: unknown) => e)
 }
 
@@ -114,6 +116,12 @@ test('open connects to the target and forwards a decoded rect', async () => {
   expect(Array.from(frame.rgba)).toEqual([9, 8, 7, 255])
 })
 
+test('open with a viewport calls vncOpen with the same arguments as without', async () => {
+  const driver = vncDriver(target)
+  await driver.open(() => {}, { width: 1920, height: 1080, scale: 125 })
+  expect(m.vncOpen).toHaveBeenCalledWith('h', 5901, 'faye', 's1', null, m.channels[0])
+})
+
 test('every open of a profile tab sends the profile id and no secret id', async () => {
   const driver = vncDriver({
     host: 'h',
@@ -122,9 +130,9 @@ test('every open of a profile tab sends the profile id and no secret id', async 
     secretId: null,
     profileId: 'vnc-1',
   })
-  await driver.open(() => {})
+  await driver.open(() => {}, viewport)
   await driver.close('v1')
-  await driver.open(() => {})
+  await driver.open(() => {}, viewport)
   expect(m.vncOpen.mock.calls).toEqual([
     ['h', 5901, 'faye', null, 'vnc-1', m.channels[0]],
     ['h', 5901, 'faye', null, 'vnc-1', m.channels[1]],
@@ -156,7 +164,7 @@ test('messages that arrive before open resolves are forwarded at once', async ()
     seen = [...frames]
     return { status: 'ok', data: opened }
   })
-  await vncDriver(target).open((f) => frames.push(f))
+  await vncDriver(target).open((f) => frames.push(f), viewport)
   expect(seen).toEqual([{ kind: 'resize', w: 8, h: 6 }])
   expect(frames).toHaveLength(1)
 })
@@ -192,7 +200,7 @@ test('an undecodable message closes the session, then is reported, once', async 
     return OK
   })
   const driver = vncDriver(target)
-  await driver.open((f) => order.push(f.kind === 'closed' ? f.reason : f.kind))
+  await driver.open((f) => order.push(f.kind === 'closed' ? f.reason : f.kind), viewport)
   const send = m.channels[0].onmessage
   send(buf(9))
   expect(order).toEqual(['close', UNREADABLE.reason])
@@ -221,7 +229,7 @@ test('an undecodable message before open resolves closes the session once it has
     return { status: 'ok', data: opened }
   })
   m.vncClose.mockRejectedValue(new Error('ipc'))
-  const session = await vncDriver(target).open((f) => frames.push(f))
+  const session = await vncDriver(target).open((f) => frames.push(f), viewport)
   expect(session).toEqual(opened)
   expect(frames).toEqual([UNREADABLE])
   expect(m.vncClose).toHaveBeenCalledTimes(1)
@@ -239,7 +247,7 @@ test('a failed open after an undecodable message closes nothing', async () => {
     return { status: 'error', error }
   })
   const rejected = await vncDriver(target)
-    .open(() => {})
+    .open(() => {}, viewport)
     .catch((e: unknown) => e)
   expect(rejected).toBe(error)
   expect(m.vncClose).not.toHaveBeenCalled()
@@ -248,7 +256,7 @@ test('a failed open after an undecodable message closes nothing', async () => {
 test('input goes out as events of one command', async () => {
   const driver = vncDriver(target)
   await driver.pointer('v1', 5, 10, 20)
-  await driver.key('v1', true, 0xffe1)
+  await driver.key('v1', true, 0xffe1, 'ShiftLeft')
   await driver.clipboard('v1', 'héllo')
   expect(m.vncInput.mock.calls).toEqual([
     ['v1', [pointer(5, 10, 20)]],
@@ -257,14 +265,65 @@ test('input goes out as events of one command', async () => {
   ])
 })
 
+test('a key code is not sent to the server', async () => {
+  const driver = vncDriver(target)
+  await driver.key('v1', true, 0xffe1, 'ShiftLeft')
+  await driver.key('v1', false, 0xffe1, 'ShiftLeft')
+  expect(m.vncInput.mock.calls).toEqual([
+    ['v1', [press(0xffe1)]],
+    ['v1', [release(0xffe1)]],
+  ])
+})
+
+test('a dead key is not sent and the character it composes goes out as its keysym', async () => {
+  const driver = vncDriver(target)
+  const keyboard = new RemoteKeyboard(
+    (down, keysym, code) => driver.key('v1', down, keysym, code),
+    'windows',
+    driver.scancodes === true,
+  )
+  expect(keyboard.keydown({ code: 'Equal', key: 'Dead' })).toBe(false)
+  expect(keyboard.keyup({ code: 'Equal', key: 'Dead' })).toBe(false)
+  keyboard.keydown({ code: 'KeyE', key: 'é' })
+  keyboard.keyup({ code: 'KeyE', key: 'e' })
+  await tick()
+  await tick()
+  expect(m.vncInput.mock.calls.flatMap(([, events]) => events)).toEqual([
+    press(0xe9),
+    release(0xe9),
+  ])
+})
+
+test('the back and forward buttons never reach the server', async () => {
+  const driver = vncDriver(target)
+  await driver.pointer('v1', 0x180, 3, 4)
+  await driver.pointer('v1', 0x180 | 1, 5, 6)
+  await driver.pointer('v1', 0, 7, 8)
+  expect(m.vncInput.mock.calls).toEqual([
+    ['v1', [pointer(0, 3, 4)]],
+    ['v1', [pointer(1, 5, 6)]],
+    ['v1', [pointer(0, 7, 8)]],
+  ])
+})
+
+test('every VNC button bit goes through unchanged', async () => {
+  const driver = vncDriver(target)
+  await driver.pointer('v1', 0x7f, 1, 2)
+  await driver.pointer('v1', 0x40, 3, 4)
+  expect(m.vncInput.mock.calls).toEqual([
+    ['v1', [pointer(0x7f, 1, 2)]],
+    ['v1', [pointer(0x40, 3, 4)]],
+  ])
+})
+
 test('inputs made while a call is in flight go out as one further call, in order', async () => {
   const calls = held()
   const driver = vncDriver(target)
-  const first = driver.key('v1', true, 0x61)
+  const first = driver.key('v1', true, 0x61, 'KeyA')
   expect(calls).toHaveLength(1)
   expect(calls[0]).toMatchObject({ id: 'v1', events: [press(0x61)] })
   const rest = Promise.all([
-    driver.key('v1', false, 0x61),
+    driver.key('v1', false, 0x61, 'KeyA'),
     driver.pointer('v1', 1, 10, 20),
     driver.clipboard('v1', 'hi'),
   ])
@@ -289,7 +348,7 @@ test('inputs made while a call is in flight go out as one further call, in order
 test('pointer moves queued behind a call collapse to the last one', async () => {
   const calls = held()
   const driver = vncDriver(target)
-  driver.key('v1', true, 0x61)
+  driver.key('v1', true, 0x61, 'KeyA')
   const moves = Promise.all(Array.from({ length: 10 }, (_, x) => driver.pointer('v1', 0, x, 5)))
   calls[0].resolve(OK)
   await tick()
@@ -302,7 +361,7 @@ test('pointer moves queued behind a call collapse to the last one', async () => 
 test('a button change between moves keeps both sides and where it happened', async () => {
   const calls = held()
   const driver = vncDriver(target)
-  driver.key('v1', true, 0x61)
+  driver.key('v1', true, 0x61, 'KeyA')
   for (const x of [0, 1, 2]) driver.pointer('v1', 0, x, 1)
   for (const x of [3, 4, 5]) driver.pointer('v1', 1, x, 1)
   for (const x of [6, 7, 8]) driver.pointer('v1', 0, x, 1)
@@ -320,9 +379,9 @@ test('a button change between moves keeps both sides and where it happened', asy
 test('moves on either side of another event are not merged', async () => {
   const calls = held()
   const driver = vncDriver(target)
-  driver.key('v1', true, 0x61)
+  driver.key('v1', true, 0x61, 'KeyA')
   driver.pointer('v1', 0, 1, 1)
-  driver.key('v1', false, 0x61)
+  driver.key('v1', false, 0x61, 'KeyA')
   driver.pointer('v1', 0, 2, 2)
   calls[0].resolve(OK)
   await tick()
@@ -348,8 +407,11 @@ test('close waits for the call in flight and sends what is queued before it clos
     return OK
   })
   const driver = vncDriver(target)
-  driver.key('v1', true, 0xffe1)
-  const releases = Promise.all([driver.key('v1', false, 0xffe1), driver.key('v1', false, 0xffe3)])
+  driver.key('v1', true, 0xffe1, 'ShiftLeft')
+  const releases = Promise.all([
+    driver.key('v1', false, 0xffe1, 'ShiftLeft'),
+    driver.key('v1', false, 0xffe3, 'ControlLeft'),
+  ])
   const closing = driver.close('v1')
   await tick()
   expect(calls).toHaveLength(1)
@@ -373,8 +435,8 @@ test('close stops waiting after a second for an input call that never returns', 
   vi.useFakeTimers()
   const calls = held()
   const driver = vncDriver(target)
-  driver.key('v1', true, 0x61)
-  driver.key('v1', false, 0x61)
+  driver.key('v1', true, 0x61, 'KeyA')
+  driver.key('v1', false, 0x61, 'KeyA')
   const closing = driver.close('v1')
   await vi.advanceTimersByTimeAsync(999)
   expect(m.vncClose).not.toHaveBeenCalled()
@@ -388,7 +450,7 @@ test('close stops waiting after a second for an input call that never returns', 
 test('a close that did not have to wait leaves no timer behind', async () => {
   vi.useFakeTimers()
   const driver = vncDriver(target)
-  await driver.key('v1', true, 0x61)
+  await driver.key('v1', true, 0x61, 'KeyA')
   await driver.close('v1')
   expect(m.vncClose.mock.calls).toEqual([['v1']])
   expect(vi.getTimerCount()).toBe(0)
@@ -403,14 +465,14 @@ test('close without input goes straight to the command', async () => {
 test('a failed input call is followed by the next batch and leaves no promise pending', async () => {
   const calls = held()
   const driver = vncDriver(target)
-  const first = driver.key('v1', true, 0x61)
-  const second = driver.key('v1', false, 0x61)
+  const first = driver.key('v1', true, 0x61, 'KeyA')
+  const second = driver.key('v1', false, 0x61, 'KeyA')
   calls[0].reject(new Error('ipc'))
   await first
   expect(calls).toHaveLength(2)
   expect(calls[1].events).toEqual([release(0x61)])
 
-  const third = driver.key('v1', true, 0x62)
+  const third = driver.key('v1', true, 0x62, 'KeyB')
   calls[1].resolve({ status: 'error', error: { kind: 'io', message: 'broken pipe' } })
   await second
   expect(calls).toHaveLength(3)
@@ -422,8 +484,8 @@ test('a failed input call is followed by the next batch and leaves no promise pe
 test('two sessions do not wait for each other', async () => {
   const calls = held()
   const driver = vncDriver(target)
-  const first = driver.key('v1', true, 0x61)
-  const other = driver.key('v2', true, 0x62)
+  const first = driver.key('v1', true, 0x61, 'KeyA')
+  const other = driver.key('v2', true, 0x62, 'KeyB')
   expect(calls.map((call) => call.id)).toEqual(['v1', 'v2'])
   calls[1].resolve(OK)
   await other
@@ -435,7 +497,7 @@ test('two sessions do not wait for each other', async () => {
 test('ack goes out at once while an input call is in flight', async () => {
   const calls = held()
   const driver = vncDriver(target)
-  driver.key('v1', true, 0x61)
+  driver.key('v1', true, 0x61, 'KeyA')
   await driver.ack('v1')
   expect(m.vncAck).toHaveBeenCalledWith('v1')
   expect(calls).toHaveLength(1)

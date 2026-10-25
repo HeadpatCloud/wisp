@@ -15,6 +15,7 @@ vi.mock('@/lib/transfer', () => ({
 
 import { exportBundle, pickExportPath } from '@/lib/transfer'
 import { useProfileStore } from '@/stores/profileStore'
+import { useRdpProfileStore } from '@/stores/rdpProfileStore'
 import { useS3ProfileStore } from '@/stores/s3ProfileStore'
 import { useSessionStore } from '@/stores/sessionStore'
 import { useSftpProfileStore } from '@/stores/sftpProfileStore'
@@ -46,6 +47,19 @@ const desk = {
   order: 0,
 }
 
+const office = {
+  id: 'r',
+  name: 'office',
+  host: 'h',
+  port: 3389,
+  username: 'u',
+  domain: null,
+  secretId: null,
+  keyboardLayout: null,
+  icon: { kind: 'builtin', name: 'server' },
+  order: 0,
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
   useProfileStore.setState({
@@ -66,6 +80,7 @@ beforeEach(() => {
   useSftpProfileStore.setState({ profiles: [] } as never)
   useS3ProfileStore.setState({ profiles: [] } as never)
   useVncProfileStore.setState({ profiles: [] } as never)
+  useRdpProfileStore.setState({ profiles: [] } as never)
   useSessionStore.setState({ removeTab: vi.fn() } as never)
 })
 
@@ -75,7 +90,7 @@ test('group checkbox selects its profiles and exports without a password', async
   await user.click(screen.getByLabelText('Prod'))
   await user.click(screen.getByRole('button', { name: 'Export' }))
   expect(exportBundle).toHaveBeenCalledWith(
-    { groupIds: ['g'], profileIds: ['a'], sftpIds: [], s3Ids: [], vncIds: [] },
+    { groupIds: ['g'], profileIds: ['a'], sftpIds: [], s3Ids: [], vncIds: [], rdpIds: [] },
     { includeSecrets: false, includeKeys: false },
     null,
     'C:/out.json',
@@ -98,7 +113,7 @@ test('including secrets requires a matching password', async () => {
   await user.type(screen.getByLabelText('Confirm password'), 'pw')
   await user.click(exportButton)
   expect(exportBundle).toHaveBeenCalledWith(
-    { groupIds: [], profileIds: ['b'], sftpIds: [], s3Ids: [], vncIds: [] },
+    { groupIds: [], profileIds: ['b'], sftpIds: [], s3Ids: [], vncIds: [], rdpIds: [] },
     { includeSecrets: true, includeKeys: false },
     'pw',
     'C:/out.json',
@@ -123,7 +138,7 @@ test('ticking every member of a group checks the group', async () => {
   expect(group.indeterminate).toBe(false)
   await user.click(screen.getByRole('button', { name: 'Export' }))
   expect(exportBundle).toHaveBeenCalledWith(
-    { groupIds: ['g'], profileIds: ['a', 'c'], sftpIds: [], s3Ids: [], vncIds: [] },
+    { groupIds: ['g'], profileIds: ['a', 'c'], sftpIds: [], s3Ids: [], vncIds: [], rdpIds: [] },
     { includeSecrets: false, includeKeys: false },
     null,
     'C:/out.json',
@@ -162,7 +177,7 @@ test('ticking a group includes its empty subgroups', async () => {
   expect(parent).toBeChecked()
   await user.click(screen.getByRole('button', { name: 'Export' }))
   expect(exportBundle).toHaveBeenCalledWith(
-    { groupIds: ['g', 'e'], profileIds: ['a'], sftpIds: [], s3Ids: [], vncIds: [] },
+    { groupIds: ['g', 'e'], profileIds: ['a'], sftpIds: [], s3Ids: [], vncIds: [], rdpIds: [] },
     { includeSecrets: false, includeKeys: false },
     null,
     'C:/out.json',
@@ -205,7 +220,7 @@ test('a VNC profile exports on its own', async () => {
   expect(exportButton).toBeEnabled()
   await user.click(exportButton)
   expect(exportBundle).toHaveBeenCalledWith(
-    { groupIds: [], profileIds: [], sftpIds: [], s3Ids: [], vncIds: ['v'] },
+    { groupIds: [], profileIds: [], sftpIds: [], s3Ids: [], vncIds: ['v'], rdpIds: [] },
     { includeSecrets: false, includeKeys: false },
     null,
     'C:/out.json',
@@ -223,7 +238,58 @@ test('select all and select none cover the VNC profiles', async () => {
   await user.click(screen.getByRole('button', { name: 'Select all' }))
   await user.click(screen.getByRole('button', { name: 'Export' }))
   expect(exportBundle).toHaveBeenCalledWith(
-    { groupIds: ['g'], profileIds: ['a', 'b'], sftpIds: [], s3Ids: [], vncIds: ['v'] },
+    { groupIds: ['g'], profileIds: ['a', 'b'], sftpIds: [], s3Ids: [], vncIds: ['v'], rdpIds: [] },
+    { includeSecrets: false, includeKeys: false },
+    null,
+    'C:/out.json',
+  )
+})
+
+test('the RDP section is listed only when there are RDP profiles', () => {
+  render(<ExportPage tabId="t" />)
+  expect(screen.queryByRole('heading', { name: 'RDP' })).not.toBeInTheDocument()
+  act(() => useRdpProfileStore.setState({ profiles: [office] } as never))
+  expect(screen.getByRole('heading', { name: 'RDP' })).toBeInTheDocument()
+  expect(screen.getByLabelText('office')).not.toBeChecked()
+})
+
+test('an RDP profile exports on its own', async () => {
+  useRdpProfileStore.setState({ profiles: [office] } as never)
+  const user = userEvent.setup()
+  render(<ExportPage tabId="t" />)
+  const exportButton = screen.getByRole('button', { name: 'Export' })
+  expect(exportButton).toBeDisabled()
+  await user.click(screen.getByLabelText('office'))
+  expect(exportButton).toBeEnabled()
+  await user.click(exportButton)
+  expect(exportBundle).toHaveBeenCalledWith(
+    { groupIds: [], profileIds: [], sftpIds: [], s3Ids: [], vncIds: [], rdpIds: ['r'] },
+    { includeSecrets: false, includeKeys: false },
+    null,
+    'C:/out.json',
+  )
+})
+
+test('select all and select none cover the RDP profiles', async () => {
+  useRdpProfileStore.setState({ profiles: [office] } as never)
+  useVncProfileStore.setState({ profiles: [desk] } as never)
+  const user = userEvent.setup()
+  render(<ExportPage tabId="t" />)
+  await user.click(screen.getByRole('button', { name: 'Select all' }))
+  expect(screen.getByLabelText('office')).toBeChecked()
+  await user.click(screen.getByRole('button', { name: 'Select none' }))
+  expect(screen.getByLabelText('office')).not.toBeChecked()
+  await user.click(screen.getByRole('button', { name: 'Select all' }))
+  await user.click(screen.getByRole('button', { name: 'Export' }))
+  expect(exportBundle).toHaveBeenCalledWith(
+    {
+      groupIds: ['g'],
+      profileIds: ['a', 'b'],
+      sftpIds: [],
+      s3Ids: [],
+      vncIds: ['v'],
+      rdpIds: ['r'],
+    },
     { includeSecrets: false, includeKeys: false },
     null,
     'C:/out.json',
@@ -239,7 +305,7 @@ test('unticking the opt-in again exports without a password', async () => {
   await user.click(screen.getByLabelText('Include passwords and passphrases'))
   await user.click(screen.getByRole('button', { name: 'Export' }))
   expect(exportBundle).toHaveBeenCalledWith(
-    { groupIds: [], profileIds: ['b'], sftpIds: [], s3Ids: [], vncIds: [] },
+    { groupIds: [], profileIds: ['b'], sftpIds: [], s3Ids: [], vncIds: [], rdpIds: [] },
     { includeSecrets: false, includeKeys: false },
     null,
     'C:/out.json',

@@ -12,7 +12,15 @@ import {
 } from 'lucide-react'
 import type { ReactNode, PointerEvent as ReactPointerEvent } from 'react'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { Group, Profile, S3Profile, SftpProfile, ShellInfo, VncProfile } from '@/bindings'
+import type {
+  Group,
+  Profile,
+  RdpProfile,
+  S3Profile,
+  SftpProfile,
+  ShellInfo,
+  VncProfile,
+} from '@/bindings'
 import {
   ContextMenu,
   ContextMenuContent,
@@ -31,6 +39,7 @@ import {
 import { Input } from '@/components/ui/input'
 import { duplicateProfile, reorderGroups, reorderProfiles } from '@/lib/profiles'
 import { useProfileStore } from '@/stores/profileStore'
+import { useRdpProfileStore } from '@/stores/rdpProfileStore'
 import { useS3ProfileStore } from '@/stores/s3ProfileStore'
 import { useSftpProfileStore } from '@/stores/sftpProfileStore'
 import { useVncProfileStore } from '@/stores/vncProfileStore'
@@ -81,6 +90,10 @@ interface ProfileTreeProps {
   onNewProfile: () => void
   onNewVnc: () => void
   onNewVncProfile: () => void
+  onNewRdp: () => void
+  onNewRdpProfile: () => void
+  onActivateRdp: (profile: RdpProfile) => void
+  onEditRdp: (profile: RdpProfile) => void
   onActivateVnc: (profile: VncProfile) => void
   onEditVnc: (profile: VncProfile) => void
   onNewFtp: () => void
@@ -104,6 +117,10 @@ export function ProfileTree({
   onNewProfile,
   onNewVnc,
   onNewVncProfile,
+  onNewRdp,
+  onNewRdpProfile,
+  onActivateRdp,
+  onEditRdp,
   onActivateVnc,
   onEditVnc,
   onNewFtp,
@@ -129,6 +146,8 @@ export function ProfileTree({
   const removeSftpProfile = useSftpProfileStore((s) => s.remove)
   const vncProfiles = useVncProfileStore((s) => s.profiles)
   const removeVnc = useVncProfileStore((s) => s.remove)
+  const rdpProfiles = useRdpProfileStore((s) => s.profiles)
+  const removeRdp = useRdpProfileStore((s) => s.remove)
   const removeProfile = useProfileStore((s) => s.removeProfile)
   const removeGroup = useProfileStore((s) => s.removeGroup)
   const saveProfile = useProfileStore((s) => s.saveProfile)
@@ -275,6 +294,12 @@ export function ProfileTree({
             <DropdownMenuItem onSelect={onNewVnc}>
               <Monitor /> VNC connection
             </DropdownMenuItem>
+            <DropdownMenuItem onSelect={onNewRdpProfile}>
+              <Monitor /> RDP profile
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={onNewRdp}>
+              <Monitor /> RDP connection
+            </DropdownMenuItem>
             <DropdownMenuItem onSelect={onNewS3}>
               <Cloud /> S3 connection
             </DropdownMenuItem>
@@ -318,7 +343,8 @@ export function ProfileTree({
           profiles.length === 0 &&
           s3Profiles.length === 0 &&
           sftpProfiles.length === 0 &&
-          vncProfiles.length === 0 && (
+          vncProfiles.length === 0 &&
+          rdpProfiles.length === 0 && (
             <div className="px-2 py-6 text-center text-muted-foreground text-xs">
               No hosts yet. Use + to add a profile, or Import from ~/.ssh/config.
             </div>
@@ -454,6 +480,29 @@ export function ProfileTree({
                   <button
                     type="button"
                     onDoubleClick={() => onActivateVnc(p)}
+                    className="flex w-full select-none items-center gap-1.5 rounded border-2 border-transparent px-1.5 py-1 text-sm hover:bg-muted"
+                  >
+                    <Monitor className="size-4 text-muted-foreground" />
+                    <span className="truncate">{p.name}</span>
+                    <span className="ml-auto truncate text-muted-foreground text-xs">{p.host}</span>
+                  </button>
+                </Row>
+              ))}
+          </div>
+        )}
+        {rdpProfiles.length > 0 && (
+          <div className="mt-2">
+            <div className="px-2 py-1 font-medium text-muted-foreground text-xs">RDP</div>
+            {rdpProfiles
+              .filter((p) => {
+                const q = query.trim().toLowerCase()
+                return !q || p.name.toLowerCase().includes(q) || p.host.toLowerCase().includes(q)
+              })
+              .map((p) => (
+                <Row key={p.id} onEdit={() => onEditRdp(p)} onDelete={() => removeRdp(p.id)}>
+                  <button
+                    type="button"
+                    onDoubleClick={() => onActivateRdp(p)}
                     className="flex w-full select-none items-center gap-1.5 rounded border-2 border-transparent px-1.5 py-1 text-sm hover:bg-muted"
                   >
                     <Monitor className="size-4 text-muted-foreground" />

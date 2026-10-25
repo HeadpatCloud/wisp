@@ -386,6 +386,7 @@ impl View {
             FrameOp::Clipboard(text) => self.clipboard.push(text),
             FrameOp::Closed(reason) => self.closed = Some(reason),
             FrameOp::Sync => self.session.ack(),
+            FrameOp::CursorDefault => panic!("{}: a default cursor", self.service),
         }
     }
 

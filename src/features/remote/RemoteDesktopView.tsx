@@ -8,7 +8,7 @@ import {
 } from 'react'
 import type { AppError } from '@/bindings'
 import { HostKeyDialog, type HostKeyPrompt } from '@/features/sessions/HostKeyDialog'
-import type { RemoteDriver } from '@/lib/remoteDriver'
+import type { LockKeys, RemoteDriver, Viewport } from '@/lib/remoteDriver'
 import type { FrameMessage } from '@/lib/remoteFrames'
 import { detectPlatform, pointerButtons, RemoteKeyboard, WheelSteps } from '@/lib/remoteInput'
 import { trustHostKey } from '@/lib/ssh'
@@ -34,7 +34,13 @@ interface Live {
   synced: string
   pending: string | null
   received: number
+  sent: Viewport
+  locks: boolean
+  lockState: LockKeys | null
 }
+
+const LOCK_CODES = new Set(['CapsLock', 'NumLock', 'ScrollLock'])
+const RESIZE_DELAY = 300
 
 const PICTURE_ERROR = 'The picture could not be updated.'
 
@@ -52,6 +58,18 @@ function pointOn(canvas: HTMLCanvasElement, e: { clientX: number; clientY: numbe
   return {
     x: Math.min(Math.max(x, 0), canvas.width - 1),
     y: Math.min(Math.max(y, 0), canvas.height - 1),
+  }
+}
+
+function measure(area: HTMLElement): Viewport {
+  const ratio = window.devicePixelRatio
+  const scale = Math.round(ratio * 100)
+  const { clientWidth, clientHeight } = area
+  if (clientWidth === 0 || clientHeight === 0) return { width: 0, height: 0, scale }
+  return {
+    width: Math.round(clientWidth * ratio),
+    height: Math.round(clientHeight * ratio),
+    scale,
   }
 }
 
@@ -91,19 +109,22 @@ export function RemoteDesktopView({
   const [state, setState] = useState<State>({ status: 'connecting' })
   const [fullscreen, setFullscreen] = useState(false)
   const containerRef = useRef<HTMLDivElement>(null)
+  const areaRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const reconnectRef = useRef<HTMLButtonElement>(null)
   const liveRef = useRef<Live | null>(null)
   const stopRef = useRef(() => {})
   const attemptRef = useRef(0)
   const activeRef = useRef(active)
+  const sendSizeRef = useRef(() => {})
   const removeTab = useSessionStore((s) => s.removeTab)
 
   const connect = useCallback(() => {
     stopRef.current()
     attemptRef.current += 1
     const canvas = canvasRef.current
-    if (!canvas) return
+    const area = areaRef.current
+    if (!canvas || !area) return
     const ctx = canvas.getContext('2d')
     if (!ctx) {
       setState({ status: 'failed', error: PICTURE_ERROR })
@@ -111,9 +132,11 @@ export function RemoteDesktopView({
     }
     setState({ status: 'connecting' })
     let ended = false
+    const pending = new AbortController()
     let sessionId: string | null = null
     let live: Live | null = null
     const queue: FrameMessage[] = []
+    const viewport = measure(area)
 
     const release = () => {
       if (!live) return
@@ -127,6 +150,7 @@ export function RemoteDesktopView({
 
     const stop = () => {
       ended = true
+      pending.abort()
       release()
       // A close that failed leaves nothing to show.
       if (sessionId) driver.close(sessionId).catch(() => {})
@@ -191,6 +215,9 @@ export function RemoteDesktopView({
               canvas.style.cursor = `url(${image.toDataURL()}) ${m.hotX} ${m.hotY}, default`
             }
             break
+          case 'cursorDefault':
+            canvas.style.cursor = 'default'
+            break
         }
       } catch {
         stop()
@@ -199,10 +226,14 @@ export function RemoteDesktopView({
     }
 
     driver
-      .open((m) => {
-        if (live) apply(live, m)
-        else if (!ended) queue.push(m)
-      })
+      .open(
+        (m) => {
+          if (live) apply(live, m)
+          else if (!ended) queue.push(m)
+        },
+        viewport,
+        pending.signal,
+      )
       .then(
         (opened) => {
           if (ended) {
@@ -215,8 +246,19 @@ export function RemoteDesktopView({
           const session: Live = {
             id: opened.id,
             keyboard: new RemoteKeyboard(
-              (down, keysym) => driver.key(opened.id, down, keysym),
+              (down, keysym, code) => {
+                // Sent with the first key that goes out, so a key the keyboard drops keeps them
+                // for the next one.
+                const lockState = session.lockState
+                if (down && session.locks && lockState) {
+                  session.locks = false
+                  session.lockState = null
+                  driver.locks?.(opened.id, lockState)
+                }
+                return driver.key(opened.id, down, keysym, code)
+              },
               detectPlatform(navigator.userAgent),
+              driver.scancodes === true,
             ),
             wheel: new WheelSteps(),
             buttons: 0,
@@ -226,11 +268,17 @@ export function RemoteDesktopView({
             synced: '',
             pending: null,
             received: 0,
+            sent: viewport,
+            locks: true,
+            lockState: null,
           }
           live = session
           liveRef.current = session
           setState({ status: 'connected' })
           for (const m of queue.splice(0)) apply(session, m)
+          // The area keeps its size as the session connects, so nothing else would send a size
+          // that settled while connecting.
+          sendSizeRef.current()
         },
         (e: unknown) => {
           if (ended) return
@@ -306,6 +354,54 @@ export function RemoteDesktopView({
   }, [active, syncClipboard, driver])
 
   useEffect(() => {
+    const area = areaRef.current
+    if (!area || !driver.resize) return
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const send = () => {
+      const live = liveRef.current
+      const viewport = measure(area)
+      if (!live || viewport.width === 0 || viewport.height === 0) return
+      const { sent } = live
+      if (
+        viewport.width === sent.width &&
+        viewport.height === sent.height &&
+        viewport.scale === sent.scale
+      ) {
+        return
+      }
+      live.sent = viewport
+      // The session may already be gone.
+      driver.resize?.(live.id, viewport).catch(() => {})
+    }
+    sendSizeRef.current = send
+    const check = () => {
+      clearTimeout(timer)
+      timer = setTimeout(send, RESIZE_DELAY)
+    }
+    const observer = new ResizeObserver(check)
+    observer.observe(area)
+    // The size in CSS pixels stays the same when the window moves to a display with another
+    // scaling; a query for the current ratio changes once it no longer matches.
+    let ratio: MediaQueryList
+    const onRatio = () => {
+      ratio.removeEventListener('change', onRatio)
+      check()
+      watchRatio()
+    }
+    const watchRatio = () => {
+      ratio = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`)
+      ratio.addEventListener('change', onRatio)
+    }
+    watchRatio()
+    return () => {
+      sendSizeRef.current = () => {}
+      observer.disconnect()
+      ratio.removeEventListener('change', onRatio)
+      clearTimeout(timer)
+    }
+  }, [driver])
+
+  useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas) return
     const onWheel = (e: WheelEvent) => {
@@ -377,8 +473,18 @@ export function RemoteDesktopView({
   }
 
   const onKey = (e: KeyboardEvent<HTMLCanvasElement>) => {
-    const keyboard = liveRef.current?.keyboard
-    if (!keyboard || e.nativeEvent.isComposing) return
+    const live = liveRef.current
+    const keyboard = live?.keyboard
+    if (!live || !keyboard) return
+    // The keyup of a key pressed before composition began still has to release it.
+    if (e.nativeEvent.isComposing && !(e.type === 'keyup' && keyboard.holds(e.code))) return
+    if (live.locks && driver.locks && e.type === 'keydown' && !LOCK_CODES.has(e.code)) {
+      live.lockState = {
+        caps: e.getModifierState('CapsLock'),
+        num: e.getModifierState('NumLock'),
+        scroll: e.getModifierState('ScrollLock'),
+      }
+    }
     const used =
       e.type === 'keydown' ? keyboard.keydown(e.nativeEvent) : keyboard.keyup(e.nativeEvent)
     if (!used) return
@@ -389,8 +495,13 @@ export function RemoteDesktopView({
   const ctrlAltDel = () => {
     const live = liveRef.current
     if (!live) return
-    for (const keysym of [0xffe3, 0xffe9, 0xffff]) driver.key(live.id, true, keysym)
-    for (const keysym of [0xffff, 0xffe9, 0xffe3]) driver.key(live.id, false, keysym)
+    const keys: [number, string][] = [
+      [0xffe3, 'ControlLeft'],
+      [0xffe9, 'AltLeft'],
+      [0xffff, 'Delete'],
+    ]
+    for (const [keysym, code] of keys) driver.key(live.id, true, keysym, code)
+    for (const [keysym, code] of [...keys].reverse()) driver.key(live.id, false, keysym, code)
     canvasRef.current?.focus()
   }
 
@@ -403,54 +514,61 @@ export function RemoteDesktopView({
     state.status === 'closed' ? state.reason : state.status === 'failed' ? state.error : null
 
   return (
-    <div ref={containerRef} className="flex h-full w-full flex-col bg-background">
-      {state.status === 'connected' && (
-        <div className="flex shrink-0 items-center gap-1 border-border border-b p-1">
-          <button
-            type="button"
-            onClick={ctrlAltDel}
-            className="rounded px-2 py-1 text-xs hover:bg-muted"
-          >
-            Ctrl+Alt+Del
-          </button>
-          <button
-            type="button"
-            onClick={connect}
-            className="rounded px-2 py-1 text-xs hover:bg-muted"
-          >
-            Reconnect
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              stopRef.current()
-              setState({ status: 'closed', reason: 'Disconnected.' })
-            }}
-            className="rounded px-2 py-1 text-xs hover:bg-muted"
-          >
-            Disconnect
-          </button>
-          <button
-            type="button"
-            aria-pressed={fullscreen}
-            onClick={() => {
-              const change = fullscreen
-                ? document.exitFullscreen()
-                : containerRef.current?.requestFullscreen()
-              // The browser refused; there is nothing to show.
-              change?.catch(() => {})
-              canvasRef.current?.focus()
-            }}
-            className="rounded px-2 py-1 text-xs hover:bg-muted"
-          >
-            {fullscreen ? 'Exit fullscreen' : 'Fullscreen'}
-          </button>
-        </div>
-      )}
+    <div ref={containerRef} className="relative flex h-full w-full flex-col bg-background">
       <div
+        data-remote-toolbar
+        aria-hidden={state.status !== 'connected'}
+        inert={state.status !== 'connected'}
+        className={cn(
+          'flex shrink-0 items-center gap-1 border-border border-b p-1',
+          state.status !== 'connected' && 'invisible',
+        )}
+      >
+        <button
+          type="button"
+          onClick={ctrlAltDel}
+          className="rounded px-2 py-1 text-xs hover:bg-muted"
+        >
+          Ctrl+Alt+Del
+        </button>
+        <button
+          type="button"
+          onClick={connect}
+          className="rounded px-2 py-1 text-xs hover:bg-muted"
+        >
+          Reconnect
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            stopRef.current()
+            setState({ status: 'closed', reason: 'Disconnected.' })
+          }}
+          className="rounded px-2 py-1 text-xs hover:bg-muted"
+        >
+          Disconnect
+        </button>
+        <button
+          type="button"
+          aria-pressed={fullscreen}
+          onClick={() => {
+            const change = fullscreen
+              ? document.exitFullscreen()
+              : containerRef.current?.requestFullscreen()
+            // The browser refused; there is nothing to show.
+            change?.catch(() => {})
+            canvasRef.current?.focus()
+          }}
+          className="rounded px-2 py-1 text-xs hover:bg-muted"
+        >
+          {fullscreen ? 'Exit fullscreen' : 'Fullscreen'}
+        </button>
+      </div>
+      <div
+        ref={areaRef}
         className={cn(
           'flex min-h-0 flex-1 items-center justify-center overflow-hidden border border-transparent bg-black focus-within:border-ring',
-          state.status !== 'connected' && 'hidden',
+          state.status !== 'connected' && 'invisible',
         )}
       >
         <canvas
@@ -466,7 +584,13 @@ export function RemoteDesktopView({
           onContextMenu={(e) => e.preventDefault()}
           onKeyDown={onKey}
           onKeyUp={onKey}
-          onFocus={syncClipboard}
+          onFocus={() => {
+            if (liveRef.current) {
+              liveRef.current.locks = true
+              liveRef.current.lockState = null
+            }
+            syncClipboard()
+          }}
           onBlur={() => {
             const live = liveRef.current
             if (!live) return
@@ -477,7 +601,7 @@ export function RemoteDesktopView({
         />
       </div>
       {state.status !== 'connected' && (
-        <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 text-sm">
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-sm">
           {message !== null ? (
             <>
               <p

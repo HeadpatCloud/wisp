@@ -3,16 +3,7 @@ import { commands, type FrameBytes, type VncInput } from '@/bindings'
 import { unwrap } from '@/lib/ipc'
 import type { RemoteDriver } from '@/lib/remoteDriver'
 import { decodeFrame, type FrameMessage } from '@/lib/remoteFrames'
-
-// Input for one session that is not sent yet. `buttons` is the mask of the last pointer event
-// made, and `move` says the last queued event is a pointer event that changed no button.
-interface Queue {
-  events: VncInput[]
-  sent: (() => void)[]
-  flight: Promise<void> | null
-  buttons: number
-  move: boolean
-}
+import { remoteQueue } from '@/lib/remoteQueue'
 
 export function vncDriver(target: {
   host: string
@@ -21,61 +12,11 @@ export function vncDriver(target: {
   secretId: string | null
   profileId: string | null
 }): RemoteDriver {
-  // The backend runs every call as a task of its own, so input keeps its order only when one
-  // call per session is under way at a time.
-  const queues = new Map<string, Queue>()
-
-  const flush = (id: string, queue: Queue) => {
-    const { events, sent } = queue
-    queue.events = []
-    queue.sent = []
-    queue.move = false
-    const done = () => {
-      for (const resolve of sent) resolve()
-      queue.flight = null
-      if (queue.events.length > 0) flush(id, queue)
-    }
-    // A failed call counts as sent: the session is gone or the IPC failed, and the view can do
-    // nothing about either.
-    queue.flight = commands.vncInput(id, events).then(done, done)
-  }
-
-  const push = (id: string, event: VncInput) => {
-    let queue = queues.get(id)
-    if (!queue) {
-      queue = { events: [], sent: [], flight: null, buttons: 0, move: false }
-      queues.set(id, queue)
-    }
-    const move = event.kind === 'pointer' && event.buttons === queue.buttons
-    if (event.kind === 'pointer') queue.buttons = event.buttons
-    // Only a move takes the place of the move before it; where a button changed is kept.
-    if (move && queue.move) queue.events[queue.events.length - 1] = event
-    else queue.events.push(event)
-    queue.move = move
-    const { sent } = queue
-    const done = new Promise<void>((resolve) => {
-      sent.push(resolve)
-    })
-    if (!queue.flight) flush(id, queue)
-    return done
-  }
+  const queue = remoteQueue<VncInput>((id, events) => commands.vncInput(id, events))
 
   const close = async (id: string) => {
-    const queue = queues.get(id)
-    if (queue) {
-      // What is queued goes out as a call of its own once the one in flight has returned.
-      const sent = (async () => {
-        while (queue.flight) await queue.flight
-      })()
-      // A server that stopped reading never lets the call in flight return; closing ends it.
-      let timer: ReturnType<typeof setTimeout> | undefined
-      const stuck = new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, 1000)
-      })
-      await Promise.race([sent, stuck])
-      clearTimeout(timer)
-      queues.delete(id)
-    }
+    const draining = queue.drain(id)
+    if (draining) await draining
     unwrap(await commands.vncClose(id))
   }
 
@@ -131,9 +72,10 @@ export function vncDriver(target: {
       if (unreadable) abandon(id)
       return res.data
     },
-    pointer: (id, buttons, x, y) => push(id, { kind: 'pointer', buttons, x, y }),
-    key: (id, down, keysym) => push(id, { kind: 'key', down, keysym }),
-    clipboard: (id, text) => push(id, { kind: 'clipboard', text }),
+    pointer: (id, buttons, x, y) =>
+      queue.push(id, { kind: 'pointer', buttons: buttons & 0x7f, x, y }),
+    key: (id, down, keysym) => queue.push(id, { kind: 'key', down, keysym }),
+    clipboard: (id, text) => queue.push(id, { kind: 'clipboard', text }),
     async ack(id) {
       unwrap(await commands.vncAck(id))
     },

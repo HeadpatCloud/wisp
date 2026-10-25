@@ -60,6 +60,20 @@ export interface VncTab {
   profileId: string | null
 }
 
+export interface RdpTab {
+  id: string
+  kind: 'rdp'
+  title: string
+  host: string
+  port: number
+  username: string
+  domain: string | null
+  secretId: string | null
+  profileId: string | null
+  // Null picks the local layout.
+  keyboardLayout: number | null
+}
+
 export interface SftpTab {
   id: string
   kind: 'sftp'
@@ -92,13 +106,15 @@ export interface S3Tab {
   bucket: string | null
 }
 
-export type Tab = SessionTab | ViewTab | LocalTab | VncTab | SftpTab | FtpTab | S3Tab
+export type Tab = SessionTab | ViewTab | LocalTab | VncTab | RdpTab | SftpTab | FtpTab | S3Tab
 
 // Vault entries a tab owns outright, so closing it can clean them up. Secrets belonging to
 // a saved profile are excluded - the profile owns those and outlives the tab.
 export function tabSecretIds(t: Tab): string[] {
   if (t.kind === 'ftp') return t.secretId ? [t.secretId] : []
-  if (t.kind === 'vnc') return t.secretId && t.profileId === null ? [t.secretId] : []
+  if (t.kind === 'vnc' || t.kind === 'rdp') {
+    return t.secretId && t.profileId === null ? [t.secretId] : []
+  }
   if (t.kind === 'sftp' && t.adhoc) {
     return [t.adhoc.secretId, ...t.adhoc.keys.map((k) => k.secretId)].filter(
       (id): id is string => !!id,
@@ -131,6 +147,16 @@ interface SessionState {
     username: string | null
     secretId: string | null
     profileId: string | null
+    title?: string
+  }) => void
+  openRdp: (target: {
+    host: string
+    port: number
+    username: string
+    domain: string | null
+    secretId: string | null
+    profileId: string | null
+    keyboardLayout: number | null
     title?: string
   }) => void
   openSftp: (profileId: string, title: string) => void
@@ -211,6 +237,22 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       username,
       secretId,
       profileId,
+    }
+    set({ tabs: [...get().tabs, tab], activeTabId: tab.id })
+  },
+
+  openRdp: ({ host, port, username, domain, secretId, profileId, keyboardLayout, title }) => {
+    const tab: RdpTab = {
+      id: crypto.randomUUID(),
+      kind: 'rdp',
+      title: title ?? `${host}:${port}`,
+      host,
+      port,
+      username,
+      domain,
+      secretId,
+      profileId,
+      keyboardLayout,
     }
     set({ tabs: [...get().tabs, tab], activeTabId: tab.id })
   },

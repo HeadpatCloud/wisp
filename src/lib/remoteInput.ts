@@ -1,4 +1,5 @@
 import { LEGACY_KEYSYMS } from '@/lib/keysymTable'
+import { scancodeFor } from '@/lib/scancodes'
 
 const KEYSYMS = new Map([
   ['ShiftLeft', 0xffe1],
@@ -67,6 +68,9 @@ const MODIFIERS = new Set([
   'MetaRight',
 ])
 
+// The browser reports no keyup for the IME toggle keys.
+const NO_KEYUP = new Set(['Lang1', 'Lang2'])
+
 // Virtual keyboards and input injectors report keys without a usable code.
 function hasNoCode(code: string): boolean {
   return code === '' || code === 'Unidentified'
@@ -87,12 +91,15 @@ export function keysymFor(e: { code: string; key: string }): number | null {
   return LEGACY_KEYSYMS.get(cp) ?? 0x01000000 + cp
 }
 
-// DOM buttons (1 left, 2 right, 4 middle) to the VNC mask (bit 0 left, bit 1 middle, bit 2 right).
+// DOM buttons (1 left, 2 right, 4 middle, 8 back, 16 forward) to the VNC mask (bit 0 left, bit 1
+// middle, bit 2 right) with back and forward as bits 7 and 8.
 export function pointerButtons(domButtons: number): number {
   let mask = 0
   if (domButtons & 1) mask |= 1
   if (domButtons & 4) mask |= 2
   if (domButtons & 2) mask |= 4
+  if (domButtons & 8) mask |= 0x80
+  if (domButtons & 16) mask |= 0x100
   return mask
 }
 
@@ -154,10 +161,10 @@ export class HeldKeys {
     return keysym
   }
 
-  releaseAll(): number[] {
-    const keysyms = [...this.held.values()]
+  releaseAll(): [string, number][] {
+    const keys = [...this.held]
     this.held.clear()
-    return keysyms
+    return keys
   }
 }
 
@@ -178,8 +185,9 @@ export class RemoteKeyboard {
   } | null = null
 
   constructor(
-    private send: (down: boolean, keysym: number) => void,
+    private send: (down: boolean, keysym: number, code: string) => void,
     private platform: Platform,
+    private scancodes = false,
   ) {}
 
   keydown(e: { code: string; key: string; timeStamp?: number; metaKey?: boolean }): boolean {
@@ -196,16 +204,21 @@ export class RemoteKeyboard {
       if (altGr) this.cancelControl()
       else this.flush()
     }
-    const keysym = keysymFor(e)
-    if (keysym === null) return false
+    let keysym = keysymFor(e)
+    if (keysym === null) {
+      // A driver that sends the key's position lets the remote layout compose dead keys and IME
+      // input, so these go out by their code alone.
+      if (!this.scancodes || scancodeFor(e.code) === null) return false
+      keysym = 0
+    }
     // macOS reports no keyup for a non-modifier key pressed while Cmd is down.
     const underCmd =
       this.platform === 'mac' &&
       !MODIFIERS.has(e.code) &&
       !this.held.has(e.code) &&
       (e.metaKey === true || this.held.has('MetaLeft') || this.held.has('MetaRight'))
-    if (hasNoCode(e.code) || this.macCapsLock(e.code) || underCmd) {
-      this.click(keysym)
+    if (hasNoCode(e.code) || NO_KEYUP.has(e.code) || this.macCapsLock(e.code) || underCmd) {
+      this.click(keysym, e.code)
     } else if (
       this.platform === 'windows' &&
       e.code === 'ControlLeft' &&
@@ -214,7 +227,7 @@ export class RemoteKeyboard {
       const timer = setTimeout(() => this.flush(), 100)
       this.pendingControl = { keysym, timeStamp: e.timeStamp, timer }
     } else {
-      this.send(true, this.held.press(e.code, keysym))
+      this.send(true, this.held.press(e.code, keysym), e.code)
     }
     return true
   }
@@ -223,7 +236,7 @@ export class RemoteKeyboard {
     this.flush()
     const mapped = keysymFor(e)
     if (mapped !== null && this.macCapsLock(e.code)) {
-      this.click(mapped)
+      this.click(mapped, e.code)
       return true
     }
     // macOS never reports the keyup of a non-modifier key let go while Cmd was down, so those
@@ -245,27 +258,31 @@ export class RemoteKeyboard {
     return wasHeld || mapped !== null
   }
 
+  holds(code: string): boolean {
+    return this.held.has(code)
+  }
+
   flush(): void {
     const pending = this.pendingControl
     if (!pending) return
     this.cancelControl()
-    this.send(true, this.held.press('ControlLeft', pending.keysym))
+    this.send(true, this.held.press('ControlLeft', pending.keysym), 'ControlLeft')
   }
 
   releaseAll(): void {
     this.cancelControl()
-    for (const keysym of this.held.releaseAll()) this.send(false, keysym)
+    for (const [code, keysym] of this.held.releaseAll()) this.send(false, keysym, code)
   }
 
-  private click(keysym: number): void {
-    this.send(true, keysym)
-    this.send(false, keysym)
+  private click(keysym: number, code: string): void {
+    this.send(true, keysym, code)
+    this.send(false, keysym, code)
   }
 
   private up(code: string): boolean {
     const keysym = this.held.release(code)
     if (keysym === null) return false
-    this.send(false, keysym)
+    this.send(false, keysym, code)
     return true
   }
 

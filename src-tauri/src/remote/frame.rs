@@ -10,6 +10,7 @@ pub enum FrameOp {
     Clipboard(String),
     Closed(String),
     Sync,
+    CursorDefault,
 }
 
 impl FrameOp {
@@ -24,6 +25,7 @@ impl FrameOp {
             Self::Clipboard(text) => (5, Vec::new(), text.into_bytes()),
             Self::Closed(reason) => (6, Vec::new(), reason.into_bytes()),
             Self::Sync => (7, Vec::new(), Vec::new()),
+            Self::CursorDefault => (8, Vec::new(), Vec::new()),
         };
         let mut out = Vec::with_capacity(1 + fields.len() * 2 + tail.len());
         out.push(kind);
@@ -88,5 +90,10 @@ mod tests {
     #[test]
     fn encodes_sync() {
         assert_eq!(FrameOp::Sync.encode().0, [7]);
+    }
+
+    #[test]
+    fn encodes_cursor_default() {
+        assert_eq!(FrameOp::CursorDefault.encode().0, [8]);
     }
 }

@@ -1,8 +1,9 @@
 import { act, fireEvent, render, renderHook, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { StrictMode } from 'react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import { suspendHotkeys, useHotkeys } from '@/lib/hotkeys'
-import type { RemoteDriver, RemoteSession } from '@/lib/remoteDriver'
+import type { LockKeys, RemoteDriver, RemoteSession, Viewport } from '@/lib/remoteDriver'
 import type { FrameMessage } from '@/lib/remoteFrames'
 import { trustHostKey } from '@/lib/ssh'
 import { useSessionStore } from '@/stores/sessionStore'
@@ -35,6 +36,9 @@ let fullscreenElement: Element | null = null
 let localText = 'local'
 let heldWrites: (() => void)[] | null = null
 let frames: FrameRequestCallback[] = []
+let area = { width: 0, height: 0 }
+let ratioQueries: { media: string; listeners: Set<() => void> }[] = []
+let observers: { run: () => void; observed: Element[]; disconnected: boolean }[] = []
 
 function setClipboardSync(on: boolean) {
   useSettingsStore.setState({
@@ -46,8 +50,46 @@ beforeEach(() => {
   vi.clearAllMocks()
   ctx.putImageData.mockReset()
   frames = []
+  area = { width: 0, height: 0 }
+  observers = []
+  ratioQueries = []
   fullscreenElement = null
   vi.stubGlobal('ImageData', FakeImageData)
+  vi.stubGlobal(
+    'ResizeObserver',
+    class {
+      private entry = { run: () => {}, observed: [] as Element[], disconnected: false }
+      constructor(run: () => void) {
+        this.entry.run = run
+        observers.push(this.entry)
+      }
+      observe(element: Element) {
+        this.entry.observed.push(element)
+      }
+      unobserve() {}
+      disconnect() {
+        this.entry.disconnected = true
+      }
+    },
+  )
+  vi.stubGlobal('matchMedia', (media: string) => {
+    const query = { media, matches: false, listeners: new Set<() => void>() }
+    ratioQueries.push(query)
+    return {
+      media,
+      matches: false,
+      addEventListener: (_type: string, run: () => void) => query.listeners.add(run),
+      removeEventListener: (_type: string, run: () => void) => query.listeners.delete(run),
+    }
+  })
+  const sizeOf = (side: 'width' | 'height') =>
+    function (this: Element) {
+      // A browser gives an element with display: none, or inside one, no size.
+      if (this.closest('.hidden')) return 0
+      return this.firstElementChild instanceof HTMLCanvasElement ? area[side] : 0
+    }
+  vi.spyOn(Element.prototype, 'clientWidth', 'get').mockImplementation(sizeOf('width'))
+  vi.spyOn(Element.prototype, 'clientHeight', 'get').mockImplementation(sizeOf('height'))
   vi.stubGlobal('requestAnimationFrame', (run: FrameRequestCallback) => frames.push(run))
   vi.stubGlobal('cancelAnimationFrame', (handle: number) => {
     if (handle > 0) frames[handle - 1] = () => {}
@@ -91,17 +133,20 @@ afterEach(() => {
   suspendHotkeys(false)
 })
 
-function fakeDriver() {
+function fakeDriver(rdp = false) {
+  const resize = vi.fn(async (_id: string, _viewport: Viewport) => {})
+  const locks = vi.fn(async (_id: string, _locks: LockKeys) => {})
   const opens: {
     onFrame: (m: FrameMessage) => void
+    signal: AbortSignal | undefined
     resolve: (session: RemoteSession) => void
     reject: (error: unknown) => void
   }[] = []
   const driver = {
     open: vi.fn(
-      (onFrame: (m: FrameMessage) => void) =>
+      (onFrame: (m: FrameMessage) => void, _viewport: Viewport, signal?: AbortSignal) =>
         new Promise<RemoteSession>((resolve, reject) => {
-          opens.push({ onFrame, resolve, reject })
+          opens.push({ onFrame, signal, resolve, reject })
         }),
     ),
     pointer: vi.fn(async () => {}),
@@ -109,16 +154,17 @@ function fakeDriver() {
     clipboard: vi.fn(async () => {}),
     ack: vi.fn(async () => {}),
     close: vi.fn(async () => {}),
+    ...(rdp ? { resize, locks, scancodes: true } : {}),
   } satisfies RemoteDriver
-  return { driver, opens }
+  return { driver, opens, resize, locks }
 }
 
 function session(id = 's1'): RemoteSession {
   return { id, width: 200, height: 100, name: 'desk' }
 }
 
-function start(active = true) {
-  const fake = fakeDriver()
+function start(active = true, rdp = false) {
+  const fake = fakeDriver(rdp)
   const view = render(<RemoteDesktopView tabId="t1" driver={fake.driver} active={active} />)
   const canvas = view.container.querySelector('canvas') as HTMLCanvasElement
   const open = (opened = session()) =>
@@ -140,8 +186,8 @@ function start(active = true) {
   return { ...fake, ...view, canvas, open, fail, emit, setActive }
 }
 
-async function connect(active = true) {
-  const view = start(active)
+async function connect(active = true, rdp = false) {
+  const view = start(active, rdp)
   await view.open()
   return view
 }
@@ -215,6 +261,34 @@ function keepClosingDialogs() {
   })
 }
 
+function resizeTo(width: number, height: number) {
+  area = { width, height }
+  act(() => {
+    for (const observer of observers) if (!observer.disconnected) observer.run()
+  })
+}
+
+function changeRatio(ratio: number) {
+  vi.stubGlobal('devicePixelRatio', ratio)
+  act(() => {
+    for (const query of [...ratioQueries]) for (const run of [...query.listeners]) run()
+  })
+}
+
+function ratioListeners() {
+  return ratioQueries.reduce((count, query) => count + query.listeners.size, 0)
+}
+
+async function wait(ms: number) {
+  await act(async () => {
+    vi.advanceTimersByTime(ms)
+  })
+}
+
+function useFakeTimers() {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+}
+
 function runFrames() {
   for (const run of frames.splice(0)) run(0)
 }
@@ -254,13 +328,13 @@ function points(driver: { pointer: { mock: { calls: unknown[][] } } }) {
 test('shows Connecting…, then the canvas with the opened size', async () => {
   const view = start()
   expect(screen.getByText('Connecting…')).toBeInTheDocument()
-  expect(view.canvas.parentElement).toHaveClass('hidden')
+  expect(view.canvas.parentElement).toHaveClass('invisible')
   expect(screen.queryByRole('button', { name: 'Disconnect' })).toBeNull()
 
   await view.open()
 
   expect(screen.queryByText('Connecting…')).toBeNull()
-  expect(view.canvas.parentElement).not.toHaveClass('hidden')
+  expect(view.canvas.parentElement).not.toHaveClass('invisible')
   expect([view.canvas.width, view.canvas.height]).toEqual([200, 100])
   expect(screen.queryByText('desk')).toBeNull()
 })
@@ -382,7 +456,7 @@ test('closed shows the reason with Reconnect and Close tab', async () => {
   await view.emit({ kind: 'closed', reason: 'network connection lost' })
 
   expect(screen.getByText('network connection lost')).toBeInTheDocument()
-  expect(view.canvas.parentElement).toHaveClass('hidden')
+  expect(view.canvas.parentElement).toHaveClass('invisible')
   expect(screen.queryByRole('button', { name: 'Disconnect' })).toBeNull()
   expect(view.driver.close).not.toHaveBeenCalled()
 
@@ -393,7 +467,7 @@ test('closed shows the reason with Reconnect and Close tab', async () => {
 
   await view.open(session('s2'))
   expect(screen.queryByText('network connection lost')).toBeNull()
-  expect(view.canvas.parentElement).not.toHaveClass('hidden')
+  expect(view.canvas.parentElement).not.toHaveClass('invisible')
 
   await view.emit({ kind: 'closed', reason: 'bye' })
   fireEvent.click(screen.getByRole('button', { name: 'Close tab' }))
@@ -443,7 +517,7 @@ test('an unknown certificate can be trusted, which connects again', async () => 
   expect(screen.queryByRole('heading', { name: 'Unknown certificate' })).toBeNull()
 
   await view.open()
-  expect(view.canvas.parentElement).not.toHaveClass('hidden')
+  expect(view.canvas.parentElement).not.toHaveClass('invisible')
 })
 
 test('rejecting an unknown certificate shows Certificate rejected.', async () => {
@@ -482,7 +556,7 @@ test('Reject on the closing certificate dialog does not end the attempt that Tru
   expect(screen.queryByText('Certificate rejected.')).toBeNull()
   expect(screen.getByText('Connecting…')).toBeInTheDocument()
   await view.open()
-  expect(view.canvas.parentElement).not.toHaveClass('hidden')
+  expect(view.canvas.parentElement).not.toHaveClass('invisible')
 })
 
 test('a changed certificate is trusted with the offered fingerprint', async () => {
@@ -611,10 +685,10 @@ test('Shift+A releases the keysym that was pressed', async () => {
   expect(fireEvent.keyUp(view.canvas, { code: 'KeyA', key: 'a' })).toBe(false)
 
   expect(view.driver.key.mock.calls).toEqual([
-    ['s1', true, 0xffe1],
-    ['s1', true, 0x41],
-    ['s1', false, 0xffe1],
-    ['s1', false, 0x41],
+    ['s1', true, 0xffe1, 'ShiftLeft'],
+    ['s1', true, 0x41, 'KeyA'],
+    ['s1', false, 0xffe1, 'ShiftLeft'],
+    ['s1', false, 0x41, 'KeyA'],
   ])
 })
 
@@ -760,7 +834,7 @@ test('a session that ends takes focus off the hidden canvas', async () => {
   act(() => view.canvas.focus())
   fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }))
 
-  expect(view.canvas.parentElement).toHaveClass('hidden')
+  expect(view.canvas.parentElement).toHaveClass('invisible')
   expect(document.activeElement).not.toBe(view.canvas)
 })
 
@@ -770,8 +844,8 @@ test('reconnecting releases held keys on the old session before closing it', asy
   fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }))
 
   expect(view.driver.key.mock.calls).toEqual([
-    ['s1', true, 0x61],
-    ['s1', false, 0x61],
+    ['s1', true, 0x61, 'KeyA'],
+    ['s1', false, 0x61, 'KeyA'],
   ])
   expect(view.driver.close.mock.calls).toEqual([['s1']])
   expect(view.driver.key.mock.invocationCallOrder[1]).toBeLessThan(
@@ -781,7 +855,7 @@ test('reconnecting releases held keys on the old session before closing it', asy
 
   await view.open(session('s2'))
   fireEvent.keyDown(view.canvas, { code: 'KeyB', key: 'b' })
-  expect(view.driver.key.mock.calls[2]).toEqual(['s2', true, 0x62])
+  expect(view.driver.key.mock.calls[2]).toEqual(['s2', true, 0x62, 'KeyB'])
 })
 
 test('a closing session releases held keys and takes no more input', async () => {
@@ -1103,7 +1177,7 @@ test('a click right after Control arrives with Control on Windows', async () => 
 
   fireEvent.pointerDown(view.canvas, { clientX: 5, clientY: 5, buttons: 1, pointerId: 1 })
 
-  expect(view.driver.key.mock.calls).toEqual([['s1', true, 0xffe3]])
+  expect(view.driver.key.mock.calls).toEqual([['s1', true, 0xffe3, 'ControlLeft']])
   expect(view.driver.key.mock.invocationCallOrder[0]).toBeLessThan(
     view.driver.pointer.mock.invocationCallOrder[0],
   )
@@ -1176,7 +1250,7 @@ test('a wheel step right after Control arrives with Control on Windows', async (
   fireEvent.keyDown(view.canvas, { code: 'ControlLeft', key: 'Control' })
   fireEvent.wheel(view.canvas, { deltaY: -50, clientX: 5, clientY: 5 })
 
-  expect(view.driver.key.mock.calls).toEqual([['s1', true, 0xffe3]])
+  expect(view.driver.key.mock.calls).toEqual([['s1', true, 0xffe3, 'ControlLeft']])
   expect(view.driver.key.mock.invocationCallOrder[0]).toBeLessThan(
     view.driver.pointer.mock.invocationCallOrder[0],
   )
@@ -1567,6 +1641,29 @@ test.each([
   expect(view.canvas.style.cursor).toBe(cursor)
 })
 
+test('a default cursor message drops the remote cursor image', async () => {
+  const view = await connect()
+  await view.emit({ kind: 'cursor', hotX: 3, hotY: 5, w: 16, h: 24, rgba: pixels(16, 24) })
+  expect(view.canvas.style.cursor).not.toBe('default')
+  await view.emit({ kind: 'cursorDefault' })
+
+  expect(view.canvas.style.cursor).toBe('default')
+})
+
+test('the view opens the session with an unmeasured viewport', async () => {
+  const view = await connect()
+
+  expect(view.driver.open).toHaveBeenCalledWith(
+    expect.any(Function),
+    {
+      width: 0,
+      height: 0,
+      scale: 100,
+    },
+    expect.any(AbortSignal),
+  )
+})
+
 test('a new session starts with the default cursor', async () => {
   const view = await connect()
   await view.emit({ kind: 'cursor', hotX: 0, hotY: 0, w: 0, h: 0, rgba: pixels(0, 0) })
@@ -1581,12 +1678,12 @@ test('Ctrl+Alt+Del sends the three keys down and up in reverse', async () => {
   fireEvent.click(screen.getByRole('button', { name: 'Ctrl+Alt+Del' }))
 
   expect(view.driver.key.mock.calls).toEqual([
-    ['s1', true, 0xffe3],
-    ['s1', true, 0xffe9],
-    ['s1', true, 0xffff],
-    ['s1', false, 0xffff],
-    ['s1', false, 0xffe9],
-    ['s1', false, 0xffe3],
+    ['s1', true, 0xffe3, 'ControlLeft'],
+    ['s1', true, 0xffe9, 'AltLeft'],
+    ['s1', true, 0xffff, 'Delete'],
+    ['s1', false, 0xffff, 'Delete'],
+    ['s1', false, 0xffe9, 'AltLeft'],
+    ['s1', false, 0xffe3, 'ControlLeft'],
   ])
 })
 
@@ -1640,7 +1737,7 @@ test('Disconnect closes the session and shows Disconnected.', async () => {
   fireEvent.click(screen.getByRole('button', { name: 'Disconnect' }))
 
   expect(screen.getByText('Disconnected.')).toBeInTheDocument()
-  expect(view.canvas.parentElement).toHaveClass('hidden')
+  expect(view.canvas.parentElement).toHaveClass('invisible')
   expect(view.driver.close.mock.calls).toEqual([['s1']])
   expect(keys(view.driver)).toEqual([
     [true, 0x61],
@@ -2048,7 +2145,7 @@ test('a queued clipboard message that throws does not stop the rest of the queue
   expect(errors.mock.calls).toEqual([[broke], [broke]])
   expect(ctx.putImageData).toHaveBeenCalledTimes(1)
   expect(view.driver.ack.mock.calls).toEqual([['s1'], ['s1']])
-  expect(view.canvas.parentElement).not.toHaveClass('hidden')
+  expect(view.canvas.parentElement).not.toHaveClass('invisible')
   expect(screen.queryByText(PICTURE_ERROR)).toBeNull()
 })
 
@@ -2061,7 +2158,7 @@ test('a message that cannot be painted closes the session with a reason', async 
   await view.emit(rect(0, 0, 1, 1), { kind: 'sync' }, rect(1, 1, 1, 1))
 
   expect(screen.getByText(PICTURE_ERROR)).toBeInTheDocument()
-  expect(view.canvas.parentElement).toHaveClass('hidden')
+  expect(view.canvas.parentElement).toHaveClass('invisible')
   expect(view.driver.close.mock.calls).toEqual([['s1']])
   expect(view.driver.ack).not.toHaveBeenCalled()
   expect(ctx.putImageData).toHaveBeenCalledTimes(1)
@@ -2150,7 +2247,7 @@ test('an open that resolves after the driver changed is closed at once', async (
   expect(view.driver.close.mock.calls).toEqual([['late']])
   expect(next.driver.open).toHaveBeenCalledTimes(1)
   expect(next.driver.close).not.toHaveBeenCalled()
-  expect(view.canvas.parentElement).toHaveClass('hidden')
+  expect(view.canvas.parentElement).toHaveClass('invisible')
   expect(screen.getByText('Connecting…')).toBeInTheDocument()
 })
 
@@ -2174,6 +2271,57 @@ test('an open that fails after unmount is ignored', async () => {
   expect(view.driver.close).not.toHaveBeenCalled()
 })
 
+test('unmount while connecting cancels the pending open at once', async () => {
+  const view = start(true, true)
+  expect(view.opens[0].signal?.aborted).toBe(false)
+  view.unmount()
+
+  expect(view.opens[0].signal?.aborted).toBe(true)
+  await view.fail({ kind: 'cancelled' })
+  expect(view.driver.close).not.toHaveBeenCalled()
+})
+
+test('a driver change while connecting cancels the pending open of the old driver', async () => {
+  const view = start(true, true)
+  const next = fakeDriver(true)
+  await act(async () => {
+    view.rerender(<RemoteDesktopView tabId="t1" driver={next.driver} active />)
+  })
+
+  expect(view.opens[0].signal?.aborted).toBe(true)
+  expect(next.opens[0].signal?.aborted).toBe(false)
+})
+
+test('Reconnect while connected closes the session and opens a new one as before', async () => {
+  const view = await connect(true, true)
+  fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }))
+
+  expect(view.driver.close.mock.calls).toEqual([['s1']])
+  expect(view.driver.open).toHaveBeenCalledTimes(2)
+  expect(view.opens[1].signal?.aborted).toBe(false)
+  await view.open(session('s2'))
+  expect(view.driver.close.mock.calls).toEqual([['s1']])
+})
+
+test('under StrictMode one session is opened and the first open is cancelled', async () => {
+  const fake = fakeDriver(true)
+  render(
+    <StrictMode>
+      <RemoteDesktopView tabId="t1" driver={fake.driver} active />
+    </StrictMode>,
+  )
+
+  expect(fake.opens.map((open) => open.signal?.aborted)).toEqual([true, false])
+  await act(async () => fake.opens[0].reject({ kind: 'cancelled' }))
+  await act(async () => fake.opens[1].resolve(session('s2')))
+
+  expect(screen.queryByText('Connecting…')).toBeNull()
+  expect(screen.queryByText('cancelled')).toBeNull()
+  expect(fake.driver.close).not.toHaveBeenCalled()
+  fireEvent.keyDown(screen.getByLabelText('Remote desktop'), { code: 'KeyA', key: 'a' })
+  expect(fake.driver.key.mock.calls).toEqual([['s2', true, 0x61, 'KeyA']])
+})
+
 test('a new driver closes the old session and connects with the new one', async () => {
   const view = await connect()
   const next = fakeDriver()
@@ -2193,4 +2341,713 @@ test('a re-render with the same driver does not reconnect', async () => {
 
   expect(view.driver.open).toHaveBeenCalledTimes(1)
   expect(view.driver.close).not.toHaveBeenCalled()
+})
+
+test('the viewport passed to open is the size of the canvas area in device pixels', async () => {
+  area = { width: 1200, height: 800 }
+  vi.stubGlobal('devicePixelRatio', 1.5)
+  const view = await connect(true, true)
+
+  expect(view.driver.open).toHaveBeenCalledWith(
+    expect.any(Function),
+    {
+      width: 1800,
+      height: 1200,
+      scale: 150,
+    },
+    expect.any(AbortSignal),
+  )
+})
+
+test('the viewport is rounded to whole device pixels and the scale to whole percent', async () => {
+  area = { width: 801, height: 601 }
+  vi.stubGlobal('devicePixelRatio', 1.25)
+  const view = await connect(true, true)
+
+  expect(view.driver.open).toHaveBeenCalledWith(
+    expect.any(Function),
+    {
+      width: 1001,
+      height: 751,
+      scale: 125,
+    },
+    expect.any(AbortSignal),
+  )
+  vi.stubGlobal('devicePixelRatio', 1.1)
+  area = { width: 1001, height: 1001 }
+  fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }))
+  expect(view.driver.open).toHaveBeenLastCalledWith(
+    expect.any(Function),
+    {
+      width: 1101,
+      height: 1101,
+      scale: 110,
+    },
+    expect.any(AbortSignal),
+  )
+})
+
+test.each([
+  [0, 0],
+  [0, 600],
+  [800, 0],
+])('an area of %i by %i (a hidden view) is passed as zeros', async (width, height) => {
+  area = { width, height }
+  vi.stubGlobal('devicePixelRatio', 2)
+  const view = await connect(true, true)
+
+  expect(view.driver.open).toHaveBeenCalledWith(
+    expect.any(Function),
+    {
+      width: 0,
+      height: 0,
+      scale: 200,
+    },
+    expect.any(AbortSignal),
+  )
+})
+
+test('the size is watched on the element that holds the canvas', async () => {
+  const view = await connect(true, true)
+
+  expect(observers).toHaveLength(1)
+  expect(observers[0].observed).toEqual([view.canvas.parentElement])
+})
+
+test('a reconnect measures the area again', async () => {
+  area = { width: 1000, height: 700 }
+  const view = await connect(true, true)
+  area = { width: 640, height: 480 }
+  fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }))
+
+  expect(view.driver.open).toHaveBeenLastCalledWith(
+    expect.any(Function),
+    {
+      width: 640,
+      height: 480,
+      scale: 100,
+    },
+    expect.any(AbortSignal),
+  )
+})
+
+test('ten size changes within 300 ms give one resize with the last size', async () => {
+  area = { width: 1000, height: 700 }
+  useFakeTimers()
+  const view = await connect(true, true)
+  for (let i = 1; i <= 10; i++) {
+    resizeTo(1000 + i * 10, 700 + i * 5)
+    await wait(29)
+  }
+  expect(view.resize).not.toHaveBeenCalled()
+
+  await wait(270)
+  expect(view.resize).not.toHaveBeenCalled()
+  await wait(1)
+  expect(view.resize.mock.calls).toEqual([['s1', { width: 1100, height: 750, scale: 100 }]])
+
+  await wait(1000)
+  expect(view.resize).toHaveBeenCalledTimes(1)
+})
+
+test('a resize uses the device pixel ratio', async () => {
+  area = { width: 1000, height: 700 }
+  vi.stubGlobal('devicePixelRatio', 1.5)
+  useFakeTimers()
+  const view = await connect(true, true)
+  resizeTo(1200, 800)
+  await wait(300)
+
+  expect(view.resize.mock.calls).toEqual([['s1', { width: 1800, height: 1200, scale: 150 }]])
+})
+
+test('a size equal to the one the session opened with is not sent', async () => {
+  area = { width: 1000, height: 700 }
+  useFakeTimers()
+  const view = await connect(true, true)
+  resizeTo(1000, 700)
+  await wait(300)
+
+  expect(view.resize).not.toHaveBeenCalled()
+})
+
+test('a size equal to the last one sent is not sent again, one that differs is', async () => {
+  area = { width: 1000, height: 700 }
+  useFakeTimers()
+  const view = await connect(true, true)
+  resizeTo(900, 600)
+  await wait(300)
+  resizeTo(1000, 700)
+  resizeTo(900, 600)
+  await wait(300)
+  expect(view.resize).toHaveBeenCalledTimes(1)
+
+  resizeTo(1000, 700)
+  await wait(300)
+  expect(view.resize.mock.calls).toEqual([
+    ['s1', { width: 900, height: 600, scale: 100 }],
+    ['s1', { width: 1000, height: 700, scale: 100 }],
+  ])
+})
+
+test('a view that opened unmeasured sends its size once it is shown', async () => {
+  useFakeTimers()
+  const view = await connect(true, true)
+  resizeTo(1000, 700)
+  await wait(300)
+
+  expect(view.resize.mock.calls).toEqual([['s1', { width: 1000, height: 700, scale: 100 }]])
+})
+
+test.each([
+  [0, 0],
+  [0, 600],
+  [800, 0],
+])('a size of %i by %i is never sent', async (width, height) => {
+  area = { width: 1000, height: 700 }
+  useFakeTimers()
+  const view = await connect(true, true)
+  resizeTo(width, height)
+  await wait(300)
+
+  expect(view.resize).not.toHaveBeenCalled()
+})
+
+test('a size change that settles before the session is open is sent once it opens', async () => {
+  useFakeTimers()
+  const view = start(true, true)
+  resizeTo(1000, 700)
+  await wait(500)
+  expect(view.resize).not.toHaveBeenCalled()
+
+  await view.open()
+  expect(view.resize.mock.calls).toEqual([['s1', { width: 1000, height: 700, scale: 100 }]])
+  await wait(500)
+  expect(view.resize).toHaveBeenCalledTimes(1)
+})
+
+test('a session that opens at the size of the area is not sent it again', async () => {
+  area = { width: 1000, height: 700 }
+  useFakeTimers()
+  const view = start(true, true)
+  await view.open()
+  await wait(500)
+
+  expect(view.resize).not.toHaveBeenCalled()
+})
+
+test('a size change that is still waiting when the session opens is sent', async () => {
+  useFakeTimers()
+  const view = start(true, true)
+  resizeTo(1000, 700)
+  await wait(200)
+  await view.open()
+  await wait(100)
+
+  expect(view.resize.mock.calls).toEqual([['s1', { width: 1000, height: 700, scale: 100 }]])
+})
+
+test('a session that has ended gets no resize', async () => {
+  area = { width: 1000, height: 700 }
+  useFakeTimers()
+  const view = await connect(true, true)
+  await view.emit({ kind: 'closed', reason: 'gone' })
+  resizeTo(900, 600)
+  await wait(300)
+
+  expect(view.resize).not.toHaveBeenCalled()
+})
+
+test('a size change that is waiting when the session ends is not sent', async () => {
+  area = { width: 1000, height: 700 }
+  useFakeTimers()
+  const view = await connect(true, true)
+  resizeTo(900, 600)
+  await wait(200)
+  await view.emit({ kind: 'closed', reason: 'gone' })
+  await wait(200)
+
+  expect(view.resize).not.toHaveBeenCalled()
+})
+
+test('a size change that is waiting at unmount is not sent and the observer stops', async () => {
+  area = { width: 1000, height: 700 }
+  useFakeTimers()
+  const view = await connect(true, true)
+  resizeTo(900, 600)
+  await wait(200)
+  view.unmount()
+  await wait(500)
+
+  expect(view.resize).not.toHaveBeenCalled()
+  expect(observers.every((observer) => observer.disconnected)).toBe(true)
+})
+
+test('after a reconnect the size is compared with what the new session opened with', async () => {
+  area = { width: 1000, height: 700 }
+  useFakeTimers()
+  const view = await connect(true, true)
+  resizeTo(900, 600)
+  await wait(300)
+  expect(view.resize).toHaveBeenCalledTimes(1)
+
+  fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }))
+  await view.open(session('s2'))
+  resizeTo(900, 600)
+  await wait(300)
+  expect(view.resize).toHaveBeenCalledTimes(1)
+
+  resizeTo(1000, 700)
+  await wait(300)
+  expect(view.resize.mock.calls.at(-1)).toEqual(['s2', { width: 1000, height: 700, scale: 100 }])
+})
+
+test('a resize that fails is not left unhandled', async () => {
+  area = { width: 1000, height: 700 }
+  useFakeTimers()
+  const view = await connect(true, true)
+  let calls = 0
+  // A plain function: a mock handles the promises it returns, which would hide a missing catch.
+  Object.assign(view.driver, {
+    resize: () => {
+      calls += 1
+      return Promise.reject(new Error('gone'))
+    },
+  })
+
+  expect(
+    await unhandledRejections(async () => {
+      resizeTo(900, 600)
+      await wait(300)
+      vi.useRealTimers()
+    }),
+  ).toBe(0)
+  expect(calls).toBe(1)
+})
+
+test('a driver without resize is never asked to resize and watches nothing', async () => {
+  area = { width: 1000, height: 700 }
+  useFakeTimers()
+  const view = await connect()
+  resizeTo(900, 600)
+  await wait(1000)
+
+  expect(observers).toEqual([])
+  expect(view.resize).not.toHaveBeenCalled()
+  expect(view.driver.open).toHaveBeenCalledWith(
+    expect.any(Function),
+    {
+      width: 1000,
+      height: 700,
+      scale: 100,
+    },
+    expect.any(AbortSignal),
+  )
+})
+
+const LOCKS = { modifierCapsLock: true, modifierNumLock: true, modifierScrollLock: false }
+
+test('the first key sends the lock keys first, the second key does not repeat them', async () => {
+  const view = await connect(true, true)
+  fireEvent.keyDown(view.canvas, { code: 'KeyA', key: 'a', ...LOCKS })
+  fireEvent.keyUp(view.canvas, { code: 'KeyA', key: 'a', ...LOCKS })
+  fireEvent.keyDown(view.canvas, { code: 'KeyB', key: 'b', ...LOCKS })
+
+  expect(view.locks.mock.calls).toEqual([['s1', { caps: true, num: true, scroll: false }]])
+  expect(keys(view.driver)).toEqual([
+    [true, 0x61],
+    [false, 0x61],
+    [true, 0x62],
+  ])
+  expect(view.locks.mock.invocationCallOrder[0]).toBeLessThan(
+    view.driver.key.mock.invocationCallOrder[0],
+  )
+})
+
+test('each lock key is read from the key event', async () => {
+  const view = await connect(true, true)
+  fireEvent.keyDown(view.canvas, { code: 'KeyA', key: 'a', modifierScrollLock: true })
+
+  expect(view.locks.mock.calls).toEqual([['s1', { caps: false, num: false, scroll: true }]])
+})
+
+test.each([
+  ['CapsLock', 'CapsLock'],
+  ['NumLock', 'NumLock'],
+  ['ScrollLock', 'ScrollLock'],
+])('pressing %s first sends no lock keys for that press', async (code, key) => {
+  const view = await connect(true, true)
+  fireEvent.keyDown(view.canvas, { code, key, ...LOCKS })
+  fireEvent.keyUp(view.canvas, { code, key, ...LOCKS })
+
+  expect(view.locks).not.toHaveBeenCalled()
+})
+
+test('the key after a lock key is still preceded by the lock keys, once', async () => {
+  const view = await connect(true, true)
+  fireEvent.keyDown(view.canvas, { code: 'CapsLock', key: 'CapsLock', modifierCapsLock: true })
+  fireEvent.keyUp(view.canvas, { code: 'CapsLock', key: 'CapsLock', modifierCapsLock: true })
+  fireEvent.keyDown(view.canvas, { code: 'KeyA', key: 'A', modifierCapsLock: true })
+  fireEvent.keyDown(view.canvas, { code: 'KeyB', key: 'B', modifierCapsLock: true })
+
+  expect(view.locks.mock.calls).toEqual([['s1', { caps: true, num: false, scroll: false }]])
+})
+
+test('the lock keys are sent again for the first key after the canvas regains focus', async () => {
+  const view = await connect(true, true)
+  fireEvent.keyDown(view.canvas, { code: 'KeyA', key: 'a' })
+  fireEvent.keyUp(view.canvas, { code: 'KeyA', key: 'a' })
+  expect(view.locks).toHaveBeenCalledTimes(1)
+
+  await focusAgain(view.canvas)
+  fireEvent.keyDown(view.canvas, { code: 'KeyA', key: 'a', modifierNumLock: true })
+  fireEvent.keyDown(view.canvas, { code: 'KeyB', key: 'b', modifierNumLock: true })
+
+  expect(view.locks.mock.calls).toEqual([
+    ['s1', { caps: false, num: false, scroll: false }],
+    ['s1', { caps: false, num: true, scroll: false }],
+  ])
+})
+
+test('the first key of a new session sends the lock keys to that session', async () => {
+  const view = await connect(true, true)
+  fireEvent.keyDown(view.canvas, { code: 'KeyA', key: 'a' })
+  fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }))
+  await view.open(session('s2'))
+  fireEvent.keyDown(view.canvas, { code: 'KeyA', key: 'a' })
+
+  expect(view.locks.mock.calls.map(([id]) => id)).toEqual(['s1', 's2'])
+})
+
+test('a key pressed during composition does not use up the lock keys', async () => {
+  const view = await connect(true, true)
+  fireEvent.keyDown(view.canvas, { code: 'KeyA', key: 'a', isComposing: true })
+  expect(view.locks).not.toHaveBeenCalled()
+
+  fireEvent.keyDown(view.canvas, { code: 'KeyA', key: 'a' })
+  expect(view.locks).toHaveBeenCalledTimes(1)
+})
+
+test('a key the keyboard does not send does not use up the lock keys', async () => {
+  const view = await connect(true, true)
+  fireEvent.keyDown(view.canvas, { code: '', key: 'Dead' })
+  expect(view.driver.key).not.toHaveBeenCalled()
+  expect(view.locks).not.toHaveBeenCalled()
+
+  fireEvent.keyDown(view.canvas, { code: 'KeyA', key: 'a', ...LOCKS })
+  expect(view.locks.mock.calls).toEqual([['s1', { caps: true, num: true, scroll: false }]])
+  expect(view.locks.mock.invocationCallOrder[0]).toBeLessThan(
+    view.driver.key.mock.invocationCallOrder[0],
+  )
+})
+
+test('the lock keys read from a dropped key before the canvas lost focus are not sent', async () => {
+  const view = await connect(true, true)
+  fireEvent.keyDown(view.canvas, { code: '', key: 'Dead', ...LOCKS })
+  await focusAgain(view.canvas)
+  fireEvent.keyDown(view.canvas, { code: 'CapsLock', key: 'CapsLock' })
+
+  expect(view.locks).not.toHaveBeenCalled()
+  expect(keys(view.driver)).toEqual([[true, 0xffe5]])
+})
+
+test('a dead key reaches a driver that sends scancodes by its code and is consumed', async () => {
+  const view = await connect(true, true)
+  expect(fireEvent.keyDown(view.canvas, { code: 'Equal', key: 'Dead' })).toBe(false)
+  expect(fireEvent.keyUp(view.canvas, { code: 'Equal', key: 'Dead' })).toBe(false)
+  fireEvent.keyDown(view.canvas, { code: 'KeyE', key: 'é' })
+
+  expect(view.driver.key.mock.calls).toEqual([
+    ['s1', true, 0, 'Equal'],
+    ['s1', false, 0, 'Equal'],
+    ['s1', true, 0xe9, 'KeyE'],
+  ])
+})
+
+test('the keyup of a held key is sent even while the browser composes', async () => {
+  const view = await connect(true, true)
+  fireEvent.keyDown(view.canvas, { code: 'KeyA', key: 'Process' })
+  fireEvent.keyUp(view.canvas, { code: 'KeyA', key: 'Process', isComposing: true })
+  fireEvent.keyUp(view.canvas, { code: 'KeyB', key: 'Process', isComposing: true })
+
+  expect(view.driver.key.mock.calls).toEqual([
+    ['s1', true, 0, 'KeyA'],
+    ['s1', false, 0, 'KeyA'],
+  ])
+})
+
+test('a dead key is left to the browser for a driver that sends keysyms', async () => {
+  const view = await connect()
+  expect(fireEvent.keyDown(view.canvas, { code: 'Equal', key: 'Dead' })).toBe(true)
+  fireEvent.keyDown(view.canvas, { code: 'KeyE', key: 'é' })
+
+  expect(keys(view.driver)).toEqual([[true, 0xe9]])
+})
+
+test('a driver without locks sends keys as before', async () => {
+  const view = await connect()
+  fireEvent.keyDown(view.canvas, { code: 'KeyA', key: 'a', ...LOCKS })
+
+  expect(keys(view.driver)).toEqual([[true, 0x61]])
+  expect(view.locks).not.toHaveBeenCalled()
+})
+
+test('the area keeps its box while connecting and when the session has ended', async () => {
+  const view = start()
+  expect(view.canvas.parentElement).toHaveClass('invisible')
+  expect(view.canvas.parentElement).not.toHaveClass('hidden')
+  await view.open()
+  expect(view.canvas.parentElement).not.toHaveClass('invisible')
+  await view.emit({ kind: 'closed', reason: 'gone' })
+  expect(view.canvas.parentElement).toHaveClass('invisible')
+  expect(view.canvas.parentElement).not.toHaveClass('hidden')
+})
+
+test('the first connect opens at the size of the area', async () => {
+  area = { width: 1000, height: 700 }
+  const view = start(true, true)
+
+  expect(view.driver.open).toHaveBeenCalledWith(
+    expect.any(Function),
+    {
+      width: 1000,
+      height: 700,
+      scale: 100,
+    },
+    expect.any(AbortSignal),
+  )
+})
+
+test('a reconnect from an ended session opens at the size of the area', async () => {
+  area = { width: 1000, height: 700 }
+  const view = await connect(true, true)
+  await view.emit({ kind: 'closed', reason: 'gone' })
+  area = { width: 640, height: 480 }
+  fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }))
+
+  expect(view.driver.open).toHaveBeenLastCalledWith(
+    expect.any(Function),
+    {
+      width: 640,
+      height: 480,
+      scale: 100,
+    },
+    expect.any(AbortSignal),
+  )
+})
+
+test('a reconnect after a failed connect opens at the size of the area', async () => {
+  area = { width: 1000, height: 700 }
+  const view = start(true, true)
+  await view.fail(new Error('refused'))
+  fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }))
+
+  expect(view.driver.open).toHaveBeenLastCalledWith(
+    expect.any(Function),
+    {
+      width: 1000,
+      height: 700,
+      scale: 100,
+    },
+    expect.any(AbortSignal),
+  )
+})
+
+test('connecting again after trusting a certificate opens at the size of the area', async () => {
+  area = { width: 1000, height: 700 }
+  const view = start(true, true)
+  await view.fail({
+    kind: 'hostKeyUnknown',
+    message: { host: 'rdp/h', port: 3389, fingerprint: 'SHA256:aa' },
+  })
+  await act(async () => {
+    fireEvent.click(screen.getByRole('button', { name: 'Trust' }))
+  })
+
+  expect(view.driver.open).toHaveBeenCalledTimes(2)
+  expect(view.driver.open).toHaveBeenLastCalledWith(
+    expect.any(Function),
+    {
+      width: 1000,
+      height: 700,
+      scale: 100,
+    },
+    expect.any(AbortSignal),
+  )
+})
+
+test('a view inside a hidden tab opens unmeasured', async () => {
+  area = { width: 1000, height: 700 }
+  const fake = fakeDriver(true)
+  render(
+    <div className="hidden">
+      <RemoteDesktopView tabId="t1" driver={fake.driver} active={false} />
+    </div>,
+  )
+
+  expect(fake.driver.open).toHaveBeenCalledWith(
+    expect.any(Function),
+    {
+      width: 0,
+      height: 0,
+      scale: 100,
+    },
+    expect.any(AbortSignal),
+  )
+})
+
+test('the toolbar keeps its place but is out of reach until the session is connected', async () => {
+  const view = start()
+  const toolbar = view.container.querySelector('[data-remote-toolbar]')
+  expect(toolbar).toHaveClass('invisible')
+  expect(toolbar).toHaveAttribute('aria-hidden', 'true')
+  expect(toolbar).toHaveAttribute('inert')
+  expect(screen.queryByRole('button', { name: 'Disconnect' })).toBeNull()
+
+  await view.open()
+  expect(toolbar).not.toHaveClass('invisible')
+  expect(toolbar).not.toHaveAttribute('aria-hidden', 'true')
+  expect(toolbar).not.toHaveAttribute('inert')
+  expect(screen.getByRole('button', { name: 'Disconnect' })).toBeInTheDocument()
+
+  await view.emit({ kind: 'closed', reason: 'gone' })
+  expect(toolbar).toHaveClass('invisible')
+  expect(toolbar).toHaveAttribute('inert')
+})
+
+test('the message covers the view without leaving room for the area to shrink', async () => {
+  const view = start()
+  const message = screen.getByText('Connecting…').parentElement
+  expect(message).toHaveClass('absolute', 'inset-0')
+  expect(view.container.firstElementChild).toHaveClass('relative')
+})
+
+test('Reconnect and Close tab work in the message over a laid-out area', async () => {
+  const view = await connect(true, true)
+  await view.emit({ kind: 'closed', reason: 'gone' })
+  fireEvent.click(screen.getByRole('button', { name: 'Close tab' }))
+  expect(removeTab).toHaveBeenCalledWith('t1')
+
+  fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }))
+  expect(view.driver.open).toHaveBeenCalledTimes(2)
+  expect(screen.getByText('Connecting…')).toBeInTheDocument()
+})
+
+test('a change of the display scaling with the same CSS size sends the new size and scale', async () => {
+  area = { width: 1000, height: 700 }
+  useFakeTimers()
+  const view = await connect(true, true)
+  changeRatio(1.5)
+  await wait(299)
+  expect(view.resize).not.toHaveBeenCalled()
+  await wait(1)
+
+  expect(view.resize.mock.calls).toEqual([['s1', { width: 1500, height: 1050, scale: 150 }]])
+})
+
+test('the scaling is watched at the ratio the window has and again after each change', async () => {
+  vi.stubGlobal('devicePixelRatio', 1)
+  area = { width: 1000, height: 700 }
+  useFakeTimers()
+  const view = await connect(true, true)
+  expect(ratioQueries.map((query) => query.media)).toEqual(['(resolution: 1dppx)'])
+
+  changeRatio(1.5)
+  expect(ratioQueries.map((query) => query.media)).toEqual([
+    '(resolution: 1dppx)',
+    '(resolution: 1.5dppx)',
+  ])
+  changeRatio(1)
+  await wait(300)
+  expect(view.resize).not.toHaveBeenCalled()
+
+  changeRatio(2)
+  await wait(300)
+  expect(view.resize.mock.calls).toEqual([['s1', { width: 2000, height: 1400, scale: 200 }]])
+  expect(ratioListeners()).toBe(1)
+})
+
+test('a new scale with the same size in device pixels is still sent', async () => {
+  vi.stubGlobal('devicePixelRatio', 1)
+  area = { width: 1500, height: 1200 }
+  useFakeTimers()
+  const view = await connect(true, true)
+  area = { width: 1000, height: 800 }
+  changeRatio(1.5)
+  await wait(300)
+
+  expect(view.resize.mock.calls).toEqual([['s1', { width: 1500, height: 1200, scale: 150 }]])
+})
+
+test('a scaling change lands with the size changes in one debounce', async () => {
+  area = { width: 1000, height: 700 }
+  useFakeTimers()
+  const view = await connect(true, true)
+  changeRatio(1.5)
+  await wait(200)
+  resizeTo(1200, 800)
+  await wait(299)
+  expect(view.resize).not.toHaveBeenCalled()
+  await wait(1)
+
+  expect(view.resize.mock.calls).toEqual([['s1', { width: 1800, height: 1200, scale: 150 }]])
+})
+
+test('no scaling listener is left at unmount', async () => {
+  const view = await connect(true, true)
+  expect(ratioListeners()).toBe(1)
+  changeRatio(1.5)
+  expect(ratioListeners()).toBe(1)
+  view.unmount()
+
+  expect(ratioListeners()).toBe(0)
+})
+
+test('a driver change moves the scaling listener to the new driver', async () => {
+  area = { width: 1000, height: 700 }
+  useFakeTimers()
+  const view = await connect(true, true)
+  const next = fakeDriver(true)
+  await act(async () => {
+    view.rerender(<RemoteDesktopView tabId="t1" driver={next.driver} active />)
+  })
+  expect(ratioListeners()).toBe(1)
+
+  await act(async () => next.opens[0].resolve(session('s2')))
+  changeRatio(1.5)
+  await wait(300)
+  expect(view.resize).not.toHaveBeenCalled()
+  expect(next.resize.mock.calls).toEqual([['s2', { width: 1500, height: 1050, scale: 150 }]])
+})
+
+test('no scaling listener is kept for a driver without resize', async () => {
+  await connect()
+  expect(ratioListeners()).toBe(0)
+})
+
+test('a size change waiting at a driver change is not sent to the old driver for the new session', async () => {
+  area = { width: 1000, height: 700 }
+  useFakeTimers()
+  const view = await connect(true, true)
+  resizeTo(900, 600)
+  await wait(200)
+  const next = fakeDriver(true)
+  await act(async () => {
+    view.rerender(<RemoteDesktopView tabId="t1" driver={next.driver} active />)
+  })
+  await act(async () => next.opens[0].resolve(session('s2')))
+  area = { width: 800, height: 500 }
+  await wait(500)
+
+  expect(view.resize).not.toHaveBeenCalled()
+  expect(next.resize).not.toHaveBeenCalled()
+})
+
+test('a key release before any key press does not use up the lock keys', async () => {
+  const view = await connect(true, true)
+  fireEvent.keyUp(view.canvas, { code: 'KeyA', key: 'a', ...LOCKS })
+  expect(view.locks).not.toHaveBeenCalled()
+
+  fireEvent.keyDown(view.canvas, { code: 'KeyB', key: 'b', ...LOCKS })
+  expect(view.locks.mock.calls).toEqual([['s1', { caps: true, num: true, scroll: false }]])
 })

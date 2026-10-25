@@ -14,6 +14,18 @@ const desk = vi.hoisted(() => ({
   icon: { kind: 'builtin' as const, name: 'server' },
   order: 0,
 }))
+const office = vi.hoisted(() => ({
+  id: 'rdp-1',
+  name: 'office',
+  host: '10.0.0.9',
+  port: 3390,
+  username: 'CORP\\faye',
+  domain: 'CORP',
+  secretId: 'vault-office',
+  keyboardLayout: 0x407,
+  icon: { kind: 'builtin' as const, name: 'server' },
+  order: 0,
+}))
 vi.mock('@/bindings', () => ({
   events: {
     tunnelStatus: { listen: vi.fn().mockResolvedValue(() => undefined) },
@@ -49,6 +61,10 @@ vi.mock('@/lib/vnc', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/vnc')>()
   return { vncDriver: vi.fn(actual.vncDriver) }
 })
+vi.mock('@/lib/rdp', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/rdp')>()
+  return { rdpDriver: vi.fn(actual.rdpDriver) }
+})
 vi.mock('@/stores/profileStore', () => ({
   useProfileStore: vi.fn(
     (sel: (s: { load: () => Promise<void>; profiles: unknown[] }) => unknown) =>
@@ -65,8 +81,12 @@ vi.mock('@/features/profiles/ProfileTree', () => ({
   ProfileTree: (props: {
     onNewVnc: () => void
     onNewVncProfile: () => void
+    onNewRdp: () => void
     onActivateVnc: (profile: typeof desk) => void
     onEditVnc: (profile: typeof desk) => void
+    onNewRdpProfile: () => void
+    onActivateRdp: (profile: typeof office) => void
+    onEditRdp: (profile: typeof office) => void
   }) => (
     <div data-testid="profile-tree">
       <button type="button" onClick={props.onNewVnc}>
@@ -75,11 +95,23 @@ vi.mock('@/features/profiles/ProfileTree', () => ({
       <button type="button" onClick={props.onNewVncProfile}>
         Add VNC profile
       </button>
+      <button type="button" onClick={props.onNewRdp}>
+        New RDP
+      </button>
       <button type="button" onClick={() => props.onActivateVnc(desk)}>
         Open desk
       </button>
       <button type="button" onClick={() => props.onEditVnc(desk)}>
         Edit desk
+      </button>
+      <button type="button" onClick={props.onNewRdpProfile}>
+        Add RDP profile
+      </button>
+      <button type="button" onClick={() => props.onActivateRdp(office)}>
+        Open office
+      </button>
+      <button type="button" onClick={() => props.onEditRdp(office)}>
+        Edit office
       </button>
     </div>
   ),
@@ -107,13 +139,16 @@ vi.mock('@/features/welcome/WelcomePage', () => ({
 }))
 
 import { message } from '@tauri-apps/plugin-dialog'
+import { rdpDriver } from '@/lib/rdp'
 import { deleteSecret, setSecret } from '@/lib/vault'
 import { vncDriver } from '@/lib/vnc'
-import { tabSecretIds, useSessionStore } from '@/stores/sessionStore'
+import { useRdpProfileStore } from '@/stores/rdpProfileStore'
+import { type RdpTab, tabSecretIds, useSessionStore } from '@/stores/sessionStore'
 import { useVncProfileStore } from '@/stores/vncProfileStore'
 import App from './App'
 
 const loadVncProfiles = vi.fn()
+const loadRdpProfiles = vi.fn()
 
 const tab1 = {
   id: 'tab-1',
@@ -135,6 +170,8 @@ beforeEach(() => {
   remote.props.length = 0
   loadVncProfiles.mockResolvedValue(undefined)
   useVncProfileStore.setState({ profiles: [desk], loaded: true, load: loadVncProfiles })
+  loadRdpProfiles.mockResolvedValue(undefined)
+  useRdpProfileStore.setState({ profiles: [office], loaded: true, load: loadRdpProfiles })
   useSessionStore.setState({
     tabs: [tab1, tab2],
     sessions: {
@@ -383,6 +420,161 @@ test('closing a quick-connect VNC tab deletes its password', async () => {
   expect(deleteSecret).toHaveBeenCalledWith('vault-id')
 })
 
+const rdpTab: RdpTab = {
+  id: 'tab-rdp',
+  kind: 'rdp',
+  title: 'pc:3389',
+  host: 'pc',
+  port: 3389,
+  username: 'alice',
+  domain: null,
+  secretId: 's1',
+  profileId: null,
+  keyboardLayout: null,
+}
+
+test('an RDP tab renders the remote view in its pane and tells it when it is active', () => {
+  useSessionStore.setState({ tabs: [tab1, rdpTab], activeTabId: 'tab-1' })
+  render(<App />)
+  expect(screen.getByTestId('tabpane-tab-rdp')).toContainElement(
+    screen.getByTestId('remote-tab-rdp'),
+  )
+  expect(screen.getByTestId('tabpane-tab-rdp').className).toContain('hidden')
+  expect(remote.props.at(-1)).toMatchObject({ tabId: 'tab-rdp', active: false })
+  act(() => {
+    useSessionStore.getState().setActiveTab('tab-rdp')
+  })
+  expect(screen.getByTestId('tabpane-tab-rdp').className).not.toContain('hidden')
+  expect(remote.props.at(-1)).toMatchObject({ tabId: 'tab-rdp', active: true })
+})
+
+test('re-rendering the app keeps the driver of an RDP tab', () => {
+  const tab = { ...rdpTab, domain: 'CORP', keyboardLayout: 0x407 }
+  useSessionStore.setState({ tabs: [tab], activeTabId: 'tab-rdp' })
+  const { rerender } = render(<App />)
+  const { driver } = remote.props[0]
+  expect(typeof (driver as { open: unknown }).open).toBe('function')
+  rerender(<App />)
+  act(() => {
+    useSessionStore.setState({ tabs: [{ ...tab }, tab1], activeTabId: 'tab-1' })
+  })
+  expect(remote.props.length).toBeGreaterThan(1)
+  for (const props of remote.props) expect(props.driver).toBe(driver)
+  expect(vi.mocked(rdpDriver).mock.calls).toEqual([
+    [
+      {
+        host: 'pc',
+        port: 3389,
+        username: 'alice',
+        domain: 'CORP',
+        secretId: 's1',
+        profileId: null,
+        keyboardLayout: 0x407,
+      },
+    ],
+  ])
+})
+
+test.each<[string, Partial<typeof rdpTab>]>([
+  ['host', { host: 'other' }],
+  ['port', { port: 3390 }],
+  ['user name', { username: 'bob' }],
+  ['domain', { domain: 'CORP' }],
+  ['secret', { secretId: 's2' }],
+  ['profile', { profileId: 'rdp-1' }],
+  ['keyboard layout', { keyboardLayout: 0x407 }],
+])('an RDP tab whose %s changed gets a new driver', (_what, change) => {
+  useSessionStore.setState({ tabs: [rdpTab], activeTabId: 'tab-rdp' })
+  render(<App />)
+  const { driver } = remote.props[0]
+  act(() => {
+    useSessionStore.setState({ tabs: [{ ...rdpTab, ...change }] })
+  })
+  expect(remote.props.at(-1)?.driver).not.toBe(driver)
+  expect(rdpDriver).toHaveBeenLastCalledWith({
+    host: change.host ?? 'pc',
+    port: change.port ?? 3389,
+    username: change.username ?? 'alice',
+    domain: change.domain ?? null,
+    secretId: change.secretId ?? 's1',
+    profileId: change.profileId ?? null,
+    keyboardLayout: change.keyboardLayout ?? null,
+  })
+})
+
+test('an RDP tab for another target gets a driver of its own', () => {
+  const other = { ...rdpTab, id: 'tab-rdp-2', port: 3390 }
+  useSessionStore.setState({ tabs: [rdpTab, other], activeTabId: 'tab-rdp' })
+  render(<App />)
+  const first = remote.props.find((p) => p.tabId === 'tab-rdp')
+  const second = remote.props.find((p) => p.tabId === 'tab-rdp-2')
+  expect(first?.driver).toBeDefined()
+  expect(second?.driver).toBeDefined()
+  expect(second?.driver).not.toBe(first?.driver)
+})
+
+async function connectRdp(fields: { username?: string; domain?: string; password?: string }) {
+  useSessionStore.setState({ tabs: [], sessions: {}, activeTabId: null })
+  render(<App />)
+  fireEvent.click(screen.getByRole('button', { name: 'New RDP' }))
+  fireEvent.change(screen.getByLabelText('Host'), { target: { value: 'pc' } })
+  fireEvent.change(screen.getByLabelText('Username'), { target: { value: fields.username ?? '' } })
+  fireEvent.change(screen.getByLabelText('Domain (optional)'), {
+    target: { value: fields.domain ?? '' },
+  })
+  fireEvent.change(screen.getByLabelText('Password'), { target: { value: fields.password ?? '' } })
+  await act(async () => {
+    fireEvent.click(screen.getByRole('button', { name: 'Connect' }))
+  })
+  return useSessionStore.getState().tabs
+}
+
+test('the RDP dialog opens a quick-connect tab with the stored password', async () => {
+  const tabs = await connectRdp({ username: ' alice ', domain: ' CORP ', password: 'hunter2' })
+  expect(setSecret).toHaveBeenCalledWith('hunter2')
+  expect(tabs).toEqual([
+    {
+      id: tabs[0].id,
+      kind: 'rdp',
+      title: 'pc:3389',
+      host: 'pc',
+      port: 3389,
+      username: 'alice',
+      domain: 'CORP',
+      secretId: 'vault-id',
+      profileId: null,
+      keyboardLayout: null,
+    },
+  ])
+  expect(screen.getByTestId(`tabpane-${tabs[0].id}`)).toBeInTheDocument()
+  expect(screen.queryByLabelText('Password')).not.toBeInTheDocument()
+})
+
+test('the RDP dialog opens a tab without a domain or a password when none is typed', async () => {
+  const tabs = await connectRdp({ username: 'alice', domain: '  ' })
+  expect(setSecret).not.toHaveBeenCalled()
+  expect(tabs).toHaveLength(1)
+  expect(tabs[0]).toMatchObject({ kind: 'rdp', domain: null, secretId: null, profileId: null })
+})
+
+test('an RDP password that cannot be stored opens no tab and is reported', async () => {
+  vi.mocked(setSecret).mockRejectedValueOnce(new Error('io: disk full'))
+  const tabs = await connectRdp({ username: 'alice', password: 'hunter2' })
+  expect(tabs).toEqual([])
+  expect(vi.mocked(message).mock.calls).toEqual([
+    ['Error: io: disk full', { title: 'Could not store the password', kind: 'error' }],
+  ])
+  expect(screen.queryByLabelText('Password')).not.toBeInTheDocument()
+})
+
+test('closing a quick-connect RDP tab deletes its password', async () => {
+  const tabs = await connectRdp({ username: 'alice', password: 'hunter2' })
+  act(() => {
+    useSessionStore.getState().removeTab(tabs[0].id)
+  })
+  expect(deleteSecret).toHaveBeenCalledWith('vault-id')
+})
+
 test('the saved VNC profiles are loaded at start', () => {
   render(<App />)
   expect(loadVncProfiles).toHaveBeenCalledTimes(1)
@@ -451,6 +643,82 @@ test('the tree opens the VNC profile dialog for a saved profile and for a new on
   fireEvent.click(screen.getByRole('button', { name: 'Add VNC profile' }))
   expect(screen.getByText('New VNC profile')).toBeInTheDocument()
   expect(screen.getByLabelText('Host')).toHaveValue('')
+})
+
+test('the saved RDP profiles are loaded at start', () => {
+  render(<App />)
+  expect(loadRdpProfiles).toHaveBeenCalledTimes(1)
+})
+
+function openOffice() {
+  useSessionStore.setState({ tabs: [], sessions: {}, activeTabId: null })
+  const { rerender } = render(<App />)
+  fireEvent.click(screen.getByRole('button', { name: 'Open office' }))
+  return { tabs: useSessionStore.getState().tabs, rerender }
+}
+
+const officeTarget = {
+  host: '10.0.0.9',
+  port: 3390,
+  username: 'CORP\\faye',
+  domain: 'CORP',
+  secretId: null,
+  profileId: 'rdp-1',
+  keyboardLayout: 0x407,
+}
+
+test('opening a saved RDP profile opens a tab with the profile id and without its secret', () => {
+  const { tabs } = openOffice()
+  expect(tabs).toEqual([{ id: tabs[0].id, kind: 'rdp', title: 'office', ...officeTarget }])
+  expect(tabSecretIds(tabs[0])).toEqual([])
+  expect(vi.mocked(rdpDriver).mock.calls).toEqual([[officeTarget]])
+})
+
+test('opening a saved RDP profile again opens another tab', () => {
+  openOffice()
+  fireEvent.click(screen.getByRole('button', { name: 'Open office' }))
+  const { tabs } = useSessionStore.getState()
+  expect(tabs).toHaveLength(2)
+  expect(tabs[1]).toMatchObject({ kind: 'rdp', ...officeTarget })
+  expect(tabs[1].id).not.toBe(tabs[0].id)
+})
+
+test('closing a tab of a saved RDP profile deletes no password', () => {
+  const { tabs } = openOffice()
+  act(() => {
+    useSessionStore.getState().removeTab(tabs[0].id)
+  })
+  expect(useSessionStore.getState().tabs).toHaveLength(0)
+  expect(deleteSecret).not.toHaveBeenCalled()
+})
+
+test('an RDP profile tab keeps its driver when the password or layout of the profile changes', () => {
+  const { rerender } = openOffice()
+  const { driver } = remote.props[0]
+  act(() => {
+    useRdpProfileStore.setState({
+      profiles: [{ ...office, secretId: 'vault-replaced', keyboardLayout: 0x807 }],
+    })
+  })
+  rerender(<App />)
+  expect(remote.props.length).toBeGreaterThan(1)
+  for (const props of remote.props) expect(props.driver).toBe(driver)
+  expect(vi.mocked(rdpDriver).mock.calls).toEqual([[officeTarget]])
+})
+
+test('the tree opens the RDP profile dialog for a saved profile and for a new one', () => {
+  render(<App />)
+  fireEvent.click(screen.getByRole('button', { name: 'Edit office' }))
+  expect(screen.getByText('Edit RDP profile')).toBeInTheDocument()
+  expect(screen.getByLabelText('Host')).toHaveValue('10.0.0.9')
+  expect(screen.getByLabelText('Domain (optional)')).toHaveValue('CORP')
+  fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+  expect(screen.queryByText('Edit RDP profile')).not.toBeInTheDocument()
+
+  fireEvent.click(screen.getByRole('button', { name: 'Add RDP profile' }))
+  expect(screen.getByText('New RDP profile')).toBeInTheDocument()
+  expect(screen.getByLabelText('Host')).toHaveValue('')
+  expect(screen.getByLabelText('Port')).toHaveValue(3389)
 })
 
 test('the zoom keys zoom the active local shell tab and no other tab', () => {

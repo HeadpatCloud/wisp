@@ -39,9 +39,22 @@ export function loadSnapshot(): SessionSnapshot | null {
     const parsed = JSON.parse(raw) as SessionSnapshot
     if (!Array.isArray(parsed.tabs) || parsed.tabs.length === 0) return null
     // VNC tabs saved by an older version have no username or profile.
-    const tabs = parsed.tabs.map((t) =>
-      t.kind === 'vnc' ? { ...t, username: t.username ?? null, profileId: t.profileId ?? null } : t,
-    )
+    const tabs = parsed.tabs.map((t) => {
+      if (t.kind === 'vnc') {
+        return { ...t, username: t.username ?? null, profileId: t.profileId ?? null }
+      }
+      if (t.kind === 'rdp') {
+        return {
+          ...t,
+          username: t.username ?? '',
+          domain: t.domain ?? null,
+          secretId: t.secretId ?? null,
+          profileId: t.profileId ?? null,
+          keyboardLayout: t.keyboardLayout ?? null,
+        }
+      }
+      return t
+    })
     return { ...parsed, tabs }
   } catch {
     return null

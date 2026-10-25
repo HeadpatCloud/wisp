@@ -2,6 +2,7 @@ import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, expect, test, vi } from 'vitest'
 import { useProfileStore } from '@/stores/profileStore'
+import { useRdpProfileStore } from '@/stores/rdpProfileStore'
 import { useS3ProfileStore } from '@/stores/s3ProfileStore'
 import { tabSecretIds, useSessionStore } from '@/stores/sessionStore'
 import { useVncProfileStore } from '@/stores/vncProfileStore'
@@ -32,6 +33,7 @@ beforeEach(() => {
   } as never)
   useS3ProfileStore.setState({ profiles: [], loaded: true } as never)
   useVncProfileStore.setState({ profiles: [], loaded: true })
+  useRdpProfileStore.setState({ profiles: [], loaded: true })
   useSessionStore.setState({ tabs: [], sessions: {}, activeTabId: null })
 })
 
@@ -115,5 +117,56 @@ test('running a VNC profile opens a new tab that holds the profile id and no sec
   expect(onOpenChange).toHaveBeenCalledWith(false)
 
   await user.click(screen.getByText('VNC: desk'))
+  expect(useSessionStore.getState().tabs).toHaveLength(2)
+})
+
+const office = {
+  id: 'rdp-1',
+  name: 'office',
+  host: '10.0.0.9',
+  port: 3390,
+  username: 'CORP\\faye',
+  domain: 'CORP',
+  secretId: 'vault-1',
+  keyboardLayout: 0x407,
+  icon: { kind: 'builtin' as const, name: 'server' },
+  order: 0,
+}
+
+test('a saved RDP profile is listed under Connect with its address', () => {
+  useRdpProfileStore.setState({ profiles: [office] })
+  render(<CommandPalette open onOpenChange={vi.fn()} />)
+  const row = screen.getByText('RDP: office').closest('button')
+  expect(row).toHaveTextContent('10.0.0.9:3390')
+  expect(row).toHaveTextContent('Connect')
+})
+
+test('running an RDP profile opens a new tab that holds the profile id and no secret', async () => {
+  useRdpProfileStore.setState({ profiles: [office] })
+  const onOpenChange = vi.fn()
+  const user = userEvent.setup()
+  render(<CommandPalette open onOpenChange={onOpenChange} />)
+  await user.type(screen.getByPlaceholderText('Search profiles and actions…'), 'rdp: office')
+  await user.keyboard('{Enter}')
+
+  const { tabs, activeTabId } = useSessionStore.getState()
+  expect(tabs).toEqual([
+    {
+      id: activeTabId,
+      kind: 'rdp',
+      title: 'office',
+      host: '10.0.0.9',
+      port: 3390,
+      username: 'CORP\\faye',
+      domain: 'CORP',
+      secretId: null,
+      profileId: 'rdp-1',
+      keyboardLayout: 0x407,
+    },
+  ])
+  expect(tabSecretIds(tabs[0])).toEqual([])
+  expect(onOpenChange).toHaveBeenCalledWith(false)
+
+  await user.click(screen.getByText('RDP: office'))
   expect(useSessionStore.getState().tabs).toHaveLength(2)
 })

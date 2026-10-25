@@ -51,6 +51,7 @@ mod tests {
             jump_host_id: jump.map(|s| s.to_string()),
             tunnels: vec![],
             appearance: None,
+            extra: Default::default(),
         }
     }
 

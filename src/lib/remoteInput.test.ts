@@ -240,7 +240,7 @@ describe('HeldKeys', () => {
     expect(held.release('KeyA')).toBeNull()
   })
 
-  it('releaseAll returns each held keysym once and leaves nothing held', () => {
+  it('releaseAll returns each held code and keysym once and leaves nothing held', () => {
     const held = new HeldKeys()
     held.press('ControlLeft', 0xffe3)
     held.press('KeyA', 0x61)
@@ -248,7 +248,10 @@ describe('HeldKeys', () => {
     held.press('KeyB', 0x62)
     held.press('KeyB', 0x62)
     held.release('KeyB')
-    expect(held.releaseAll()).toEqual([0xffe3, 0x61])
+    expect(held.releaseAll()).toEqual([
+      ['ControlLeft', 0xffe3],
+      ['KeyA', 0x61],
+    ])
     expect(held.releaseAll()).toEqual([])
     expect(held.release('ControlLeft')).toBeNull()
     expect(held.release('KeyA')).toBeNull()
@@ -285,9 +288,12 @@ describe('pointerButtons', () => {
     expect(pointerButtons(1 | 2 | 4)).toBe(7)
   })
 
-  it('ignores the back and forward buttons', () => {
-    expect(pointerButtons(8 | 16)).toBe(0)
-    expect(pointerButtons(1 | 8)).toBe(1)
+  it('maps the back and forward buttons above the VNC bits', () => {
+    expect(pointerButtons(8)).toBe(0x80)
+    expect(pointerButtons(16)).toBe(0x100)
+    expect(pointerButtons(8 | 16)).toBe(0x180)
+    expect(pointerButtons(1 | 8)).toBe(0x81)
+    expect(pointerButtons(31)).toBe(0x187)
   })
 })
 
@@ -319,13 +325,100 @@ describe('RemoteKeyboard', () => {
     vi.useRealTimers()
   })
 
-  function keyboard(platform: Platform) {
+  function keyboard(platform: Platform, scancodes = false) {
     const sent: [boolean, number][] = []
-    const kb = new RemoteKeyboard((down, keysym) => {
-      sent.push([down, keysym])
-    }, platform)
-    return { kb, sent }
+    const coded: [boolean, number, string][] = []
+    const kb = new RemoteKeyboard(
+      (down, keysym, code) => {
+        sent.push([down, keysym])
+        coded.push([down, keysym, code])
+      },
+      platform,
+      scancodes,
+    )
+    return { kb, sent, coded }
   }
+
+  it('sends the code of the key with every press and release', () => {
+    const { kb, coded } = keyboard('other')
+    kb.keydown({ code: 'ShiftLeft', key: 'Shift' })
+    kb.keydown({ code: 'KeyA', key: 'A' })
+    kb.keydown({ code: 'KeyA', key: 'A' })
+    kb.keyup({ code: 'KeyA', key: 'a' })
+    kb.keyup({ code: 'ShiftLeft', key: 'Shift' })
+    expect(coded).toEqual([
+      [true, 0xffe1, 'ShiftLeft'],
+      [true, 0x41, 'KeyA'],
+      [true, 0x41, 'KeyA'],
+      [false, 0x41, 'KeyA'],
+      [false, 0xffe1, 'ShiftLeft'],
+    ])
+  })
+
+  it('sends AltRight alone for AltGr on Windows', () => {
+    const { kb, coded } = keyboard('windows')
+    kb.keydown({ code: 'ControlLeft', key: 'Control', timeStamp: 0 })
+    kb.keydown({ code: 'AltRight', key: 'AltGraph', timeStamp: 1 })
+    kb.keyup({ code: 'AltRight', key: 'AltGraph' })
+    kb.keyup({ code: 'ControlLeft', key: 'Control' })
+    vi.advanceTimersByTime(100)
+    expect(coded).toEqual([
+      [true, 0xfe03, 'AltRight'],
+      [false, 0xfe03, 'AltRight'],
+    ])
+  })
+
+  it('sends a pending Control with its code when it is flushed', () => {
+    const { kb, coded } = keyboard('windows')
+    kb.keydown({ code: 'ControlLeft', key: 'Control' })
+    kb.flush()
+    expect(coded).toEqual([[true, 0xffe3, 'ControlLeft']])
+  })
+
+  it('releaseAll releases each held code once', () => {
+    const { kb, coded } = keyboard('other')
+    kb.keydown({ code: 'ControlLeft', key: 'Control' })
+    kb.keydown({ code: 'KeyA', key: 'a' })
+    kb.keydown({ code: 'KeyA', key: 'a' })
+    kb.releaseAll()
+    kb.releaseAll()
+    expect(coded.slice(3)).toEqual([
+      [false, 0xffe3, 'ControlLeft'],
+      [false, 0x61, 'KeyA'],
+    ])
+  })
+
+  it.each(['', 'Unidentified'])('clicks a key with code %j under that code', (code) => {
+    const { kb, coded } = keyboard('other')
+    kb.keydown({ code, key: 'a' })
+    expect(coded).toEqual([
+      [true, 0x61, code],
+      [false, 0x61, code],
+    ])
+  })
+
+  it('clicks Caps Lock with its code on macOS', () => {
+    const { kb, coded } = keyboard('mac')
+    kb.keydown({ code: 'CapsLock', key: 'CapsLock' })
+    kb.keyup({ code: 'CapsLock', key: 'CapsLock' })
+    expect(coded).toEqual([
+      [true, 0xffe5, 'CapsLock'],
+      [false, 0xffe5, 'CapsLock'],
+      [true, 0xffe5, 'CapsLock'],
+      [false, 0xffe5, 'CapsLock'],
+    ])
+  })
+
+  it('releases both Shift keys under their own codes on a single Windows keyup', () => {
+    const { kb, coded } = keyboard('windows')
+    kb.keydown({ code: 'ShiftLeft', key: 'Shift' })
+    kb.keydown({ code: 'ShiftRight', key: 'Shift' })
+    kb.keyup({ code: 'ShiftRight', key: 'Shift' })
+    expect(coded.slice(2)).toEqual([
+      [false, 0xffe2, 'ShiftRight'],
+      [false, 0xffe1, 'ShiftLeft'],
+    ])
+  })
 
   it('resends the first keysym on auto-repeat', () => {
     const { kb, sent } = keyboard('other')
@@ -345,6 +438,46 @@ describe('RemoteKeyboard', () => {
     const { kb, sent } = keyboard('other')
     expect(kb.keydown({ code: 'BracketLeft', key: 'Dead' })).toBe(false)
     expect(kb.keyup({ code: 'BracketLeft', key: 'Dead' })).toBe(false)
+    expect(sent).toEqual([])
+  })
+
+  it.each([
+    ['Equal', 'Dead'],
+    ['KeyA', 'Process'],
+    ['Convert', 'Convert'],
+  ])('sends %s with key %s by its code when the driver sends scancodes', (code, key) => {
+    const { kb, coded } = keyboard('windows', true)
+    expect(kb.keydown({ code, key })).toBe(true)
+    expect(kb.keyup({ code, key })).toBe(true)
+    expect(coded).toEqual([
+      [true, 0, code],
+      [false, 0, code],
+    ])
+  })
+
+  it.each([
+    ['Lang1', 'HangulMode'],
+    ['Lang2', 'HanjaMode'],
+  ])('presses and releases %s at once since the browser reports no keyup for it', (code, key) => {
+    const { kb, coded } = keyboard('windows', true)
+    expect(kb.keydown({ code, key })).toBe(true)
+    expect(coded).toEqual([
+      [true, 0, code],
+      [false, 0, code],
+    ])
+    kb.keyup({ code, key })
+    kb.releaseAll()
+    expect(coded).toHaveLength(2)
+  })
+
+  it.each([
+    ['', 'Dead'],
+    ['Unidentified', 'Dead'],
+    ['Lang3', 'Unidentified'],
+  ])('leaves %j with key %s to the caller when it has no scancode', (code, key) => {
+    const { kb, sent } = keyboard('windows', true)
+    expect(kb.keydown({ code, key })).toBe(false)
+    expect(kb.keyup({ code, key })).toBe(false)
     expect(sent).toEqual([])
   })
 

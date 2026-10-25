@@ -210,6 +210,7 @@ mod tests {
             secret_id: Some("vault-new".into()),
             icon: Default::default(),
             order: 0,
+            extra: Default::default(),
         }
     }
 

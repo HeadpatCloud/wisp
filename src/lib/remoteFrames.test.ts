@@ -83,6 +83,10 @@ describe('decodeFrame', () => {
     expect(decodeFrame(buf(7))).toEqual({ kind: 'sync' })
   })
 
+  it('decodes a default cursor', () => {
+    expect(decodeFrame(buf(8))).toEqual({ kind: 'cursorDefault' })
+  })
+
   it.each([
     ['rect', [1, 0, 1, 0, 2, 0, 1, 0, 1, 9, 8, 7, 255]],
     ['copy', [2, 0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6]],
@@ -91,6 +95,7 @@ describe('decodeFrame', () => {
     ['clipboard', [5, 0x68, 0xc3, 0xa9]],
     ['closed', [6, 0x62, 0x79, 0x65]],
     ['sync', [7]],
+    ['cursorDefault', [8]],
   ])('decodes a %s delivered as a number array like the ArrayBuffer form', (_, bytes) => {
     expect(decodeFrame(bytes)).toEqual(decodeFrame(buf(...bytes)))
   })
@@ -107,6 +112,7 @@ describe('decodeFrame', () => {
     ['a cursor with one pixel byte missing', buf(4, 0, 1, 0, 2, 0, 1, 0, 1, 1, 2, 3)],
     ['a cursor with trailing bytes', buf(4, 0, 1, 0, 2, 0, 1, 0, 1, 1, 2, 3, 4, 0)],
     ['a sync with a trailing byte', buf(7, 0)],
+    ['a default cursor with a trailing byte', buf(8, 0)],
     ['a number array of an unknown type', [9]],
   ])('rejects %s', (_, input) => {
     expect(() => decodeFrame(input)).toThrow('invalid frame message')

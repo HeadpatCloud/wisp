@@ -80,3 +80,12 @@ services:
     ports:
       - "127.0.0.1:2201:22"
       - "127.0.0.1:2202:2222"
+
+  xrdp:
+    build:
+      context: .
+      dockerfile: xrdp/Dockerfile
+    container_name: wisp-test-xrdp
+    init: true
+    ports:
+      - "127.0.0.1:3391:3389"

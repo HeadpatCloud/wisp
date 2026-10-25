@@ -1,8 +1,9 @@
 import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, expect, test, vi } from 'vitest'
-import type { VncProfile } from '@/bindings'
+import type { RdpProfile, VncProfile } from '@/bindings'
 import { useProfileStore } from '@/stores/profileStore'
+import { useRdpProfileStore } from '@/stores/rdpProfileStore'
 import { useS3ProfileStore } from '@/stores/s3ProfileStore'
 import { useSftpProfileStore } from '@/stores/sftpProfileStore'
 import { useVncProfileStore } from '@/stores/vncProfileStore'
@@ -39,6 +40,7 @@ beforeEach(() => {
     loaded: true,
   })
   useVncProfileStore.setState({ profiles: [], loaded: true })
+  useRdpProfileStore.setState({ profiles: [], loaded: true })
 })
 
 const noop = {
@@ -46,6 +48,10 @@ const noop = {
   onNewProfile: vi.fn(),
   onNewVnc: vi.fn(),
   onNewVncProfile: vi.fn(),
+  onNewRdp: vi.fn(),
+  onNewRdpProfile: vi.fn(),
+  onActivateRdp: vi.fn(),
+  onEditRdp: vi.fn(),
   onActivateVnc: vi.fn(),
   onEditVnc: vi.fn(),
   onNewFtp: vi.fn(),
@@ -195,6 +201,44 @@ test('the add menu offers a VNC profile next to the VNC quick connect', async ()
   expect(onNewVnc).not.toHaveBeenCalled()
 })
 
+test('the add menu offers an RDP connection after the VNC ones', async () => {
+  const onNewRdp = vi.fn()
+  const onNewVnc = vi.fn()
+  const user = userEvent.setup()
+  render(<ProfileTree {...noop} onNewRdp={onNewRdp} onNewVnc={onNewVnc} onEditProfile={vi.fn()} />)
+  await user.click(screen.getByRole('button', { name: 'New connection' }))
+  const labels = (await screen.findAllByRole('menuitem')).map((item) => item.textContent?.trim())
+  const first = labels.indexOf('VNC profile')
+  expect(first).toBeGreaterThan(-1)
+  expect(labels.slice(first, first + 4)).toEqual([
+    'VNC profile',
+    'VNC connection',
+    'RDP profile',
+    'RDP connection',
+  ])
+  await user.click(screen.getByText('RDP connection'))
+  expect(onNewRdp).toHaveBeenCalledTimes(1)
+  expect(onNewVnc).not.toHaveBeenCalled()
+})
+
+test('the add menu offers an RDP profile next to the RDP quick connect', async () => {
+  const onNewRdpProfile = vi.fn()
+  const onNewRdp = vi.fn()
+  const user = userEvent.setup()
+  render(
+    <ProfileTree
+      {...noop}
+      onNewRdpProfile={onNewRdpProfile}
+      onNewRdp={onNewRdp}
+      onEditProfile={vi.fn()}
+    />,
+  )
+  await user.click(screen.getByRole('button', { name: 'New connection' }))
+  await user.click(await screen.findByText('RDP profile'))
+  expect(onNewRdpProfile).toHaveBeenCalledTimes(1)
+  expect(onNewRdp).not.toHaveBeenCalled()
+})
+
 test('the empty hint is not shown when a VNC profile is all there is', () => {
   const hint = 'No hosts yet. Use + to add a profile, or Import from ~/.ssh/config.'
   useProfileStore.setState({ groups: [], profiles: [] })
@@ -203,5 +247,98 @@ test('the empty hint is not shown when a VNC profile is all there is', () => {
   render(<ProfileTree {...noop} onEditProfile={vi.fn()} />)
   expect(screen.getByText(hint)).toBeInTheDocument()
   act(() => useVncProfileStore.setState({ profiles: [desk] }))
+  expect(screen.queryByText(hint)).not.toBeInTheDocument()
+})
+
+const rdp = (id: string, name: string, host: string): RdpProfile => ({
+  id,
+  name,
+  host,
+  port: 3389,
+  username: 'faye',
+  domain: null,
+  secretId: null,
+  keyboardLayout: null,
+  icon: { kind: 'builtin', name: 'server' },
+  order: 0,
+})
+const office = rdp('rdp-1', 'office', '10.0.0.9')
+const lab = rdp('rdp-2', 'Lab PC', 'lab.example.com')
+
+test('saved RDP profiles are listed under their own heading with name and host', () => {
+  render(<ProfileTree {...noop} onEditProfile={vi.fn()} />)
+  expect(screen.queryByText('RDP')).not.toBeInTheDocument()
+  act(() => useRdpProfileStore.setState({ profiles: [office, lab] }))
+  expect(screen.getByText('RDP')).toBeInTheDocument()
+  for (const text of ['office', '10.0.0.9', 'Lab PC', 'lab.example.com']) {
+    expect(screen.getByText(text)).toBeInTheDocument()
+  }
+})
+
+test('the RDP section comes after the VNC section', () => {
+  useVncProfileStore.setState({ profiles: [desk] })
+  useRdpProfileStore.setState({ profiles: [office] })
+  render(<ProfileTree {...noop} onEditProfile={vi.fn()} />)
+  const vncHeading = screen.getByText('VNC')
+  const rdpHeading = screen.getByText('RDP')
+  expect(vncHeading.compareDocumentPosition(rdpHeading)).toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+  expect(screen.getByText('desk').compareDocumentPosition(rdpHeading)).toBe(
+    Node.DOCUMENT_POSITION_FOLLOWING,
+  )
+})
+
+test('double-click an RDP profile triggers activate', async () => {
+  useRdpProfileStore.setState({ profiles: [office, lab] })
+  const onActivateRdp = vi.fn()
+  const user = userEvent.setup()
+  render(<ProfileTree {...noop} onActivateRdp={onActivateRdp} onEditProfile={vi.fn()} />)
+  await user.click(screen.getByText('Lab PC'))
+  expect(onActivateRdp).not.toHaveBeenCalled()
+  await user.dblClick(screen.getByText('Lab PC'))
+  expect(onActivateRdp).toHaveBeenCalledTimes(1)
+  expect(onActivateRdp).toHaveBeenCalledWith(lab)
+})
+
+test.each([
+  ['name', 'LAB', 'Lab PC', 'office'],
+  ['host', '10.0', 'office', 'Lab PC'],
+])('search filters RDP profiles by %s', async (_by, typed, shown, hidden) => {
+  useRdpProfileStore.setState({ profiles: [office, lab] })
+  const user = userEvent.setup()
+  render(<ProfileTree {...noop} onEditProfile={vi.fn()} />)
+  await user.type(screen.getByPlaceholderText('Search...'), typed)
+  expect(screen.getByText(shown)).toBeInTheDocument()
+  expect(screen.queryByText(hidden)).not.toBeInTheDocument()
+})
+
+test('right-click Edit on an RDP profile opens it for editing', async () => {
+  useRdpProfileStore.setState({ profiles: [office, lab] })
+  const onEditRdp = vi.fn()
+  const user = userEvent.setup()
+  render(<ProfileTree {...noop} onEditRdp={onEditRdp} onEditProfile={vi.fn()} />)
+  await user.pointer({ keys: '[MouseRight]', target: screen.getByText('office') })
+  await user.click(await screen.findByText('Edit'))
+  expect(onEditRdp).toHaveBeenCalledWith(office)
+})
+
+test('right-click Delete on an RDP profile removes it through the store', async () => {
+  const remove = vi.fn()
+  useRdpProfileStore.setState({ profiles: [office, lab], remove } as never)
+  const user = userEvent.setup()
+  render(<ProfileTree {...noop} onEditProfile={vi.fn()} />)
+  await user.pointer({ keys: '[MouseRight]', target: screen.getByText('office') })
+  await user.click(await screen.findByText('Delete'))
+  expect(remove).toHaveBeenCalledTimes(1)
+  expect(remove).toHaveBeenCalledWith('rdp-1')
+})
+
+test('the empty hint is not shown when an RDP profile is all there is', () => {
+  const hint = 'No hosts yet. Use + to add a profile, or Import from ~/.ssh/config.'
+  useProfileStore.setState({ groups: [], profiles: [] })
+  useS3ProfileStore.setState({ profiles: [] })
+  useSftpProfileStore.setState({ profiles: [] })
+  render(<ProfileTree {...noop} onEditProfile={vi.fn()} />)
+  expect(screen.getByText(hint)).toBeInTheDocument()
+  act(() => useRdpProfileStore.setState({ profiles: [office] }))
   expect(screen.queryByText(hint)).not.toBeInTheDocument()
 })

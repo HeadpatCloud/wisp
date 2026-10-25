@@ -1,8 +1,9 @@
 # Test servers
 
-Seven VNC servers and one OpenSSH server in Docker for the live tests. Every port is
-published on `127.0.0.1` only. The passwords are fixed and written down here, so none of this
-may ever be reachable from a network.
+Seven VNC servers, one OpenSSH server and one xrdp server in Docker for the live tests. Every
+port is published on `127.0.0.1` only. The passwords are fixed and written down here, so none
+of this may ever be reachable from a network. A Windows Server VM in Hyper-V for the Windows
+RDP tests is described in [windows/README.md](windows/README.md).
 
 ## Start and stop
 
@@ -478,3 +479,126 @@ MEASURE shell_stays_responsive_while_a_tunnel_is_blocked median_ms=0.5 max_ms=1.
   once 15 s have added up. A run of the suite does not get there.
 - `printf 'ping\n' | socat - TCP:127.0.0.1:7100` closes its sending side as soon as `ping`
   is out and then waits for the answer.
+
+## xrdp server
+
+`xrdp` (container `wisp-test-xrdp`, `127.0.0.1:3391`) is xrdp 0.10.1 with xorgxrdp 0.10.2 on
+the same Debian 13.7. `start.sh` runs `xrdp-sesman` and `xrdp` in the foreground. User `wisp`,
+password `wisptest`. Every fact below was measured on 2026-10-21 with the app's own client
+(IronRDP), a hand-made X.224 request and Python's `ssl`.
+
+```bash
+docker compose -f test-env/docker-compose.yml up -d --build xrdp
+cargo test --manifest-path src-tauri/Cargo.toml --test live_rdp -- --ignored --test-threads=1
+```
+
+A run of `src-tauri/tests/live_rdp.rs` takes about 20 s. It stops and starts the container once.
+
+### Security
+
+`security_layer=negotiate`, so xrdp offers TLS and the old RDP security layer, and no NLA
+(CredSSP):
+
+| client requests | xrdp selects |
+|---|---|
+| RDP security only | RDP security |
+| TLS | TLS |
+| NLA (HYBRID) only, or HYBRID_EX only | RDP security, not a refusal |
+| TLS, HYBRID and HYBRID_EX (what the app sends) | TLS |
+
+The log says so for every connection:
+`Security protocol: configured [SSL|RDP], requested [SSL|HYBRID|HYBRID_EX|RDP], selected [SSL]`.
+The client gets TLS 1.3 with `TLS_AES_256_GCM_SHA384`. Without NLA the password goes to xrdp
+inside the TLS connection and xrdp checks it after the connection is up (see Wrong password).
+
+The certificate is made when the image is built (RSA 2048, `CN=wisp-test`), so it stays the
+same until that layer is built again. What a client is shown:
+
+```bash
+docker exec wisp-test-xrdp openssl x509 -in /etc/xrdp/cert.pem -noout -fingerprint -sha256
+```
+
+### The session
+
+- The size is the one the client asks for: 1280x800 gives 1280x800. The X server is
+  xorgxrdp's at depth 24 (32 bits per pixel in its framebuffer). xrdp sends the picture as
+  RemoteFX, which the client offers (`xrdp_caps_process_codecs: RemoteFX`). The colour depth
+  the RDP layer settled on is not in xrdp's log, and with RemoteFX it does not show.
+- The session gets display `:10` and runs as `wisp`. To look into it from outside:
+
+  ```bash
+  docker exec -u wisp -e DISPLAY=:10 wisp-test-xrdp xdotool getmouselocation
+  docker exec -u wisp -e DISPLAY=:10 wisp-test-xrdp sh -c 'xwd -root -silent | convert xwd:- rgb:-' > shot.rgb
+  ```
+
+  The same commands as for the VNC servers work there (`xrandr`, `xev`, `xclip`, `xwininfo`).
+- `startwm.sh` starts `twm` and the pattern `xterm` the VNC servers show, at +40+40. `twm`
+  frames it (the window with its frame is 804x503 at 40,40). The root window is black.
+- The session outlives the connection. The next login of `wisp` gets the same session back
+  (`++ reconnected session` in `/var/log/xrdp-sesman.log`) at the size that client asks for,
+  so a test that leaves the session resized is undone by the next login. A stop of the
+  container ends the session; the first login after a start makes a new one.
+- The picture: the whole screen arrives about 0.5 s after the login. It has all 9 colours of
+  the screenshot from inside, but RemoteFX is lossy: 58991 pixels differ from the screenshot,
+  by at most 25 in a channel, all of them within 8 px of the pattern window's frame
+  (32..852 x 32..551), where the text and the colour bars have edges. The black around it is
+  exact. The test allows a difference of up to 32 inside that box and none outside it, and does
+  not pin the count. The pointer is not in the picture; xrdp sends it as a cursor shape.
+- Keys: scancodes for `a`, Shift+`b`, `1`, Shift+`1` and Return type `aB1!\n` into an xterm
+  running `cat` (keyboard layout 0x409, `km-00000409.ini`). A Unicode key event is typed only
+  when the layout has a key for the character: `z` (0x7A) and `A` arrive as typed, `é` (0xE9)
+  and `€` (0x20AC) are dropped without a trace in the log.
+- Pointer: positions arrive as sent. `xev` sees left as button 1, right as 3, wheel up and
+  down as 4 and 5, wheel left and right as 6 and 7, and the two extra buttons as 8 and 9.
+- Clipboard: works both ways at once, no warm-up as with x11vnc. Text copied with `xclip`
+  inside reached the client, and the client's text was there for `xclip -o`, both 0.19 to
+  0.24 s after the `docker exec` that copied or the call that sent it, which is about what
+  one `docker exec` takes. `é` passes as UTF-8 both ways.
+- Display Control: offered. The client's request for 1024x768 resizes the X screen (`xrandr`
+  says `current 1024 x 768`) in about 10 ms on xrdp's side (`dynamic_monitor_process_queue:
+  Clearing completed resize`), and the client has the whole picture at the new size 0.19 to
+  0.28 s after asking. xrdp then deactivates and reactivates the connection, and its Deactivate
+  All PDU is the share control header alone (6 bytes, without the share id), which IronRDP
+  cannot decode. The app treats it as a Deactivate All.
+- No PDU the app counts as unhandled (`Session::skipped`) arrived in any test.
+
+### Wrong password
+
+There is no NLA, so a wrong password does not fail the login. The client is connected
+(about 70 ms) and sees xrdp's own window, the rest of the screen is never drawn: a 400x400
+`Connection Log` at 10,10 (colours `e1e1e1`, `0078d7`, `ffffff`, `b4b4b4`, `000000`) whose last
+line, about 1.5 s after the login, is `User does not exist, or could not be authenticated`, with
+an `OK` button. The log has the same line. The connection stays open; nothing ended it within
+68 s. Clicking `OK` was not tried.
+
+### How a connection ends
+
+- `close()` takes about 2 ms. The client asks for a shutdown, xrdp answers by ending the
+  connection and logs, at its default level `INFO`:
+
+  ```
+  [ERROR] xrdp_sec_recv: xrdp_mcs_recv failed
+  [ERROR] xrdp_rdp_recv: xrdp_sec_recv failed
+  [ERROR] libxrdp_process_data: xrdp_rdp_recv failed
+  [ERROR] xrdp_process_data_in: xrdp_process_loop failed
+  [ERROR] SSL_shutdown: Failure in SSL library (protocol error?)
+  [ERROR] SSL: error:0A000126:SSL routines::unexpected eof while reading
+  ```
+
+  With `LogLevel=DEBUG` the first line before these is `Received disconnection request`. A
+  connection that is cut instead starts with `SSL_read: Failure in SSL library`.
+- `docker stop` ends a connected session as a lost connection about 0.3 s after the stop
+  began; `docker stop` itself takes about 0.27 s. `docker start` brings xrdp back: it answers
+  a connection request 1.2 s after the start began, as `start.sh` gives `xrdp-sesman` a second
+  first.
+- The log is `/var/log/xrdp.log` (and `/var/log/xrdp-sesman.log`), not `docker logs`; console
+  logging did not reach `docker logs`. The files stay across restarts of the container, so the
+  tests read only the lines after a count they take first.
+
+## Windows Server VM
+
+`src-tauri/tests/live_rdp.rs` also drives the session against Windows Server 2025 in the Hyper-V
+VM `wisp-test-rdp`, which `windows/New-TestVm.ps1` creates and `windows/Remove-TestVm.ps1`
+removes. [windows/README.md](windows/README.md) lists what the scripts do, the probe that runs
+in the VM's session and what was measured there. With the VM running, the same command runs
+those tests too; without it they print why and pass.

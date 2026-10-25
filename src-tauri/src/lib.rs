@@ -29,7 +29,7 @@ pub mod live_ssh {
         auth_key, auth_password, connect, connect_over, new_forwards, SshHandle,
     };
     pub use crate::ssh::session::{open_pty, run_session};
-    pub use crate::tunnel::{run_dynamic, run_local, run_remote, TunnelStatus};
+    pub use crate::tunnel::{run_dynamic, run_local, run_remote, TunnelStatus, GRACE};
 }
 
 use std::sync::{Arc, Mutex};

@@ -22,7 +22,7 @@ use tokio::time::{sleep, timeout};
 use wisp_lib::live_ssh::{
     auth_key, auth_password, connect, connect_over, download, list, mkdir, new_forwards, open_pty,
     open_sftp, remove, rename, run_dynamic, run_local, run_remote, run_session, stat, upload, Sftp,
-    SshHandle, TunnelStatus,
+    SshHandle, TunnelStatus, GRACE,
 };
 use wisp_lib::{AppError, KnownHosts};
 
@@ -729,7 +729,7 @@ impl Drop for Started {
 }
 
 // The other direction: a service that sends without end to a local client that reads nothing.
-// It records what the shell does then; slow or unanswered echoes do not fail it.
+// The app ends that one connection; the shell and the forward itself go on.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn shell_while_a_tunnel_download_is_blocked() {
@@ -757,7 +757,7 @@ async fn shell_while_a_tunnel_download_is_blocked() {
             .unwrap();
     // A connection made before socat listens is closed again at once.
     let started = Instant::now();
-    let stream = loop {
+    let mut stream = loop {
         let mut stream = dial(port).await;
         let first = timeout(Duration::from_secs(2), stream.read_u8()).await;
         if matches!(first, Ok(Ok(0))) {
@@ -766,6 +766,19 @@ async fn shell_while_a_tunnel_download_is_blocked() {
         assert!(started.elapsed() < WAIT, "nothing arrives through the tunnel: {first:?}");
         sleep(Duration::from_millis(100)).await;
     };
+
+    // From the first byte on: what the client does not take piles up within a moment, and the
+    // connection waits for the forward for the grace time at most.
+    let limit = GRACE + Duration::from_secs(1);
+    let mut times = Vec::new();
+    for i in 0..20 {
+        let (command, wanted) = (format!("echo d{i}-$((40+2))"), format!("d{i}-42"));
+        let answered = shell.answers(&command, &wanted, limit).await;
+        times.push(answered.unwrap_or_else(|| panic!("echo {i} was not answered in {limit:?}")));
+    }
+    let slow = times.iter().filter(|took| **took > Duration::from_millis(100)).count();
+    assert!(slow <= 3, "{slow} of 20 echoes took more than 100 ms");
+    let (median, max) = median_and_max(times);
 
     // The tunnel reports its counters once a second; the flow has stopped when three reports
     // in a row are the same.
@@ -777,28 +790,23 @@ async fn shell_while_a_tunnel_download_is_blocked() {
         same = if now == taken && now > 0 { same + 1 } else { 0 };
         taken = now;
     }
-
-    let mut times = Vec::new();
-    for i in 0..20 {
-        let (command, wanted) = (format!("echo d{i}-$((40+2))"), format!("d{i}-42"));
-        times.extend(shell.answers(&command, &wanted, Duration::from_secs(5)).await);
-    }
-    times.sort();
-    let timed_out = 20 - times.len();
-    let of = |time: Option<&Duration>| match time {
-        Some(time) => format!("{:.1}", ms(*time)),
-        None => "none".to_string(),
-    };
+    // Ended or reset, as the system has it.
+    let closed = timeout(WAIT, stream.read_to_end(&mut Vec::new())).await;
+    assert!(closed.is_ok(), "the app left the blocked client's connection open");
     println!(
-        "MEASURE shell_while_a_tunnel_download_is_blocked median_ms={} max_ms={} \
-         timed_out={timed_out} quiet_median_ms={quiet_median:.1} quiet_max_ms={quiet_max:.1} \
-         taken_kib={}",
-        of(times.get(times.len() / 2)),
-        of(times.last()),
+        "MEASURE shell_while_a_tunnel_download_is_blocked median_ms={median:.1} max_ms={max:.1} \
+         quiet_median_ms={quiet_median:.1} quiet_max_ms={quiet_max:.1} ended_after_kib={} \
+         slow_echoes={slow}",
         taken / 1024
     );
 
-    drop(stream);
+    let mut again = dial(port).await;
+    let mut zeros = [1u8; 4096];
+    within(WAIT, "a new connection through the forward", again.read_exact(&mut zeros))
+        .await
+        .unwrap();
+    assert_eq!(zeros, [0u8; 4096]);
+    drop(again);
     shell.run("echo after-$((6*7))", "after-42").await;
     tunnel.abort.abort();
 }

@@ -305,10 +305,9 @@ docker compose -f test-env/docker-compose.yml up -d openssh
 cargo test --manifest-path src-tauri/Cargo.toml --test live_ssh -- --ignored --test-threads=1 --nocapture
 ```
 
-A run takes about five minutes, 90 s of it in `idle_session_survives` and 100 s in
-`shell_while_a_tunnel_download_is_blocked`. It writes up to 1.3 GB into the system's
-temporary folder and 2.5 GB into `/home/wisp/live` in the container, and removes both. Two things stay and grow with every run until the container is
-recreated: `/home/wisp/.bash_history` (about 2 KB a run) and the container's log (about
+A run takes about four minutes, 90 s of it in `idle_session_survives`. It writes up to 1.3 GB
+into the system's temporary folder and 2.5 GB into `/home/wisp/live` in the container, and
+removes both. Two things stay and grow with every run until the container is recreated: `/home/wisp/.bash_history` (about 2 KB a run) and the container's log (about
 0.25 MB a run). The tests count key exchanges in that log, from the moment a transfer starts
 (`docker logs --since`).
 
@@ -321,62 +320,130 @@ The same with an optimised build (the first build takes about two and a half min
 cargo test --release --manifest-path src-tauri/Cargo.toml --test live_ssh -- --ignored --test-threads=1 --nocapture
 ```
 
-### Measured with russh 0.61.2
+### Measured with russh 0.61.2 and 0.62.4
 
 2026-10-06, server and client on the same machine, nothing else running. russh and the
 server agreed on `mlkem768x25519-sha256`, host key `ssh-ed25519` and
 `chacha20-poly1305@openssh.com`.
 
-The range over 12 runs of the unoptimised `test` profile. Compare library versions on the
-rows marked yes; the others are too noisy, or are not the client's doing.
+The 0.61.2 debug column is the range over 12 runs of the unoptimised `test` profile on that day,
+widened where 0.61.2 itself measured outside it when it was run again on 2026-10-14 (3 suite
+runs, 6 more of `sftp_past_one_gibibyte`): the machine was slower that day, the quiet shell echo
+0.7 to 0.8 ms instead of 0.5 to 0.6. The 0.62.4 debug column is 6 suite runs: the first 3 ran
+back to back, the other 3 each right after a run of 0.61.2. Both release columns are 2 runs
+each, taking turns. One debug run of 0.62.4 (the second) took 241 s against 184 to 202 s for the
+others, and in it every login and transfer row was two to four times slower (jump host 905 ms,
+RSA login 125 ms against 37 ms, 1200 MiB download 22 s); its cause is not known. It alone is
+the low end of 0.62.4 in `sftp_round_trip` (download 31 against 51 MiB/s, 39 % below the
+0.61.2 minimum; upload 93 against 106, 12 % below) and of the forced rekeys upload. Without it, 0.62.4's
+upload rates are at most 11 % below the lowest 0.61.2 value of that day (1200 MiB: 152
+against 170 MiB/s; the 6 paired runs of that test alone: 164 to 198 against 164 to 181).
+A few echo maxima are above the 0.61.2 range in runs that were not the slow one (blocked
+tunnel 2.2 and 2.4 ms against 1.8, `shell_echo_and_resize` 1.4 ms against 1.0). Compare library
+versions on the rows marked yes; the others are too noisy, or are not the client's doing.
 
-| test | value | range | compare |
-|---|---|---|---|
-| `sftp_round_trip` (64 MiB) | upload MiB/s | 121 to 157 | yes |
-| | download MiB/s | 51 to 70 | yes |
-| `sftp_through_forced_rekeys` (64 MiB, port 2202) | upload MiB/s | 67 to 82 | yes |
-| | download MiB/s | 25.8 to 28.8 | yes |
-| | key exchanges during the upload | 25 to 32 | no, depends on the rate |
-| | key exchanges during the download | 85 | yes |
-| `sftp_past_one_gibibyte` (1200 MiB) | upload MiB/s | 183 to 203 | yes |
-| | download MiB/s | 64 to 69 | yes |
-| | key exchanges during the download / upload | 1 / 1 (one run) | yes |
-| `local_forward_carries_bulk_both_ways` (8 MiB) | MiB/s | 28.0 to 52.4 | no, pass or fail only |
-| `shell_stays_responsive_while_a_tunnel_is_blocked` | echo median ms | 0.5 to 0.6 | yes |
-| | echo maximum ms | 1.2 to 1.5 | yes |
-| | the same before the tunnel, median / maximum ms | 0.5 to 0.6 / 0.6 to 0.8 | yes |
-| | KiB written before the write blocked | 4224 to 5440 | no |
-| `shell_while_a_tunnel_download_is_blocked` | echoes unanswered after 5 s, of 20 | 20 (3 runs) | yes |
-| | KiB delivered before the flow stopped | 272 to 411 | no |
-| `shell_stays_responsive_during_a_transfer` (256 MiB) | echo median ms | 7.7 to 9.6 | yes |
-| | echo maximum ms | 10.2 to 24.7 | no, one late echo decides it |
-| | the same before the upload, median / maximum ms | 0.5 to 0.6 / 0.6 to 0.9 | yes |
-| | upload MiB/s | 142 to 173 | yes |
-| `shell_echo_and_resize` | echo ms | 0.5 to 0.7 | yes |
-| `idle_session_survives` | echo after 90 s, ms | 1.1 to 1.6 | yes |
-| `password_login` | connect ms | 21.9 to 25.8 | yes |
-| | wrong password refused after ms | 2143 or 4285 | no, the server's delay |
-| | login ms | 19.1 to 36.4 | no |
-| `key_login` | ed25519 ms | 19.5 to 20.3 | yes |
-| | RSA ms | 29.8 to 42.6 | no |
-| | ed25519 with passphrase ms | 339 to 447 | no, mostly unlocking the key |
-| `jump_host` | channel, connect and login of the second hop, ms | 233 to 255 | yes |
-| | echo ms | 0.7 to 0.9 | yes |
-| `dynamic_forward` | SOCKS5 greeting to reply, ms | 1.3 to 4.4 | no |
-| `remote_forward` | exchange ms | 179 to 181 | no, mostly `docker exec` |
+| test | value | 0.61.2 debug | 0.62.4 debug | 0.61.2 release | 0.62.4 release | compare |
+|---|---|---|---|---|---|---|
+| `sftp_round_trip` (64 MiB) | upload MiB/s | 106 to 157 | 93 to 118 | 86.5 to 172.5 | 151 to 172 | yes |
+| | download MiB/s | 51 to 70 | 31 to 76 | 128.2 to 136.3 | 127 to 134 | yes |
+| `sftp_through_forced_rekeys` (64 MiB, port 2202) | upload MiB/s | 58 to 82 | 53 to 61 | 129.8 to 179.1 | 134 to 166 | yes |
+| | download MiB/s | 23.9 to 28.8 | 21.6 to 25.9 | 50.5 to 50.9 | 49.4 to 50.2 | yes |
+| | key exchanges during the upload | 25 to 40 | 33 to 39 | 36 to 37 | 37 | no, depends on the rate |
+| | key exchanges during the download | 85 | 85 | 85 | 85 | yes |
+| `sftp_past_one_gibibyte` (1200 MiB) | upload MiB/s | 164 to 203 | 132 to 198 | 263.5 to 296.2 | 270 to 273 | yes |
+| | download MiB/s | 57.6 to 69 | 54.6 to 71 | 125.2 to 133.6 | 126 to 131 | yes |
+| | key exchanges during the download / upload | 1 / 1 | 1 / 1 | 1 / 1 | 1 / 1 | yes |
+| `local_forward_carries_bulk_both_ways` (8 MiB) | MiB/s | 28.0 to 52.4 | 30.3 to 36.6 | 21.2 to 50.8 | 45.9 to 46.8 | no, pass or fail only |
+| `shell_stays_responsive_while_a_tunnel_is_blocked` | echo median ms | 0.5 to 0.8 | 0.6 to 0.9 | 0.5 to 0.6 | 0.5 to 0.7 | yes |
+| | echo maximum ms | 1.2 to 1.8 | 0.7 to 2.4 | 1.1 to 1.2 | 0.6 to 24.9 (2 of 32 runs over 3 ms) | yes |
+| | the same before the tunnel, median / maximum ms | 0.5 to 0.8 / 0.6 to 1.4 | 0.6 to 0.8 / 0.8 to 1.2 | 0.5 / 0.6 to 0.7 | 0.5 / 0.6 | yes |
+| | KiB written before the write blocked | 4224 to 5440 | 4480 to 5440 | 4480 to 5568 | 5312 | no |
+| `shell_while_a_tunnel_download_is_blocked` | echo median ms | 0.7 to 0.9 | 0.7 to 1.0 | 0.5 to 0.6 | 0.6 to 0.7 | yes |
+| | echo maximum ms (the one that meets the freeze) | 2985 to 3015, the grace time (it runs from the last write) | 3003 to 3012 | 3000 to 3010 | 3013 to 3015 | yes |
+| | echoes slower than 100 ms, of 20 | 1 | 1 | 1 | 1 | yes |
+| | KiB delivered before the forward ended | 272 to 411 | 272 to 411 | 272 to 411 | 411 | no |
+| `shell_stays_responsive_during_a_transfer` (256 MiB) | echo median ms | 7.7 to 10.0 | 7.7 to 11.8 | 3.3 to 4.6 | 3.5 to 4.4 | yes |
+| | echo maximum ms | 10.2 to 24.7 | 12.3 to 30.8 | 26.8 to 28.5 | 6.6 to 29.3 | no, one late echo decides it |
+| | the same before the upload, median / maximum ms | 0.5 to 0.7 / 0.6 to 1.0 | 0.6 to 0.7 / 0.8 to 1.0 | 0.5 / 0.6 to 0.7 | 0.5 / 0.6 to 0.7 | yes |
+| | upload MiB/s | 120 to 173 | 116 to 165 | 226 to 282 | 245 | yes |
+| `shell_echo_and_resize` | echo ms | 0.5 to 1.0 | 0.8 to 1.4 | 0.5 to 0.6 | 0.6 | yes |
+| `idle_session_survives` | echo after 90 s, ms | 1.1 to 2.0 | 1.6 to 2.3 | 1.3 to 1.6 | 1.4 to 1.7 | yes |
+| `password_login` | connect ms | 21.9 to 31.2 | 26.3 to 33.0 | 14.7 to 15.5 | 16.9 to 17.5 | yes |
+| | wrong password refused after ms | 2143, 2737 or 4285 | 2737 | 2737 | 1369 or 2737 | no, the server's delay |
+| | login ms | 19.1 to 46.7 | 24.3 to 47.3 | 24.3 to 24.4 | 24.3 to 45.7 | no |
+| `key_login` | ed25519 ms | 16.5 to 23.8 | 16.5 to 23.5 | 14.8 to 20.6 | 15.2 to 15.8 | yes |
+| | RSA ms | 29.8 to 42.6 | 32.1 to 125.1 | 16.5 to 21.6 | 20.0 to 22.1 | no |
+| | ed25519 with passphrase ms | 339 to 477 | 343 to 769 | 137 to 139 | 143 | no, mostly unlocking the key |
+| `jump_host` | channel, connect and login of the second hop, ms | 233 to 298 | 272 to 905 | 267 to 275 | 256 to 271 | yes |
+| | echo ms | 0.7 to 1.2 | 0.9 to 1.6 | 0.7 to 0.8 | 0.6 to 0.8 | yes |
+| `dynamic_forward` | SOCKS5 greeting to reply, ms | 1.3 to 4.4 | 1.7 to 6.5 | 1.2 to 1.8 | 1.4 to 1.6 | no |
+| `remote_forward` | exchange ms | 179 to 213 | 202 to 293 | 201 to 204 | 203 to 223 | no, mostly `docker exec` |
 
 - Download rates include writing the file here, through eight handles at once; upload rates
   include reading it.
+- `russh` is held at `=0.62.4`. From 0.62.5 on the session takes no outgoing data from any
+  channel while one of them waits for window, so a tunnel whose far end reads nothing can hold
+  the shell back. `shell_stays_responsive_while_a_tunnel_is_blocked` alone failed with a
+  terminal silent for over 20 s in 5 of 30 runs on 0.63.3 and 7 of 30 on 0.64.0 (debug), 3 and
+  2 of 30 in release; on 0.62.4 it passed 30 of 30 in debug and in release, on 0.61.2 30 of 30
+  in debug.
+  The 0.62.0 to 0.62.5 releases also hold a self-deadlock: a handler that awaits
+  `reply.accept()` inside the session loop can wait for a slot in a queue only that loop
+  empties (fixed in 0.62.6). The app's handler therefore accepts in a task of its own.
+- Echo through a remote forward, in-process server, debug, 140 rounds each of 0.61.2 and 0.62.4
+  with the shipped relay: no frozen session on either; forwards ended by the grace 8 and 13
+  (Fisher's exact test, two-sided, p = 0.36: noise). The relay before the grace froze the
+  session in 17 and 28 rounds (p = 0.10: suggestive at most).
 - A wrong password is refused by `sshd` after 2.14 s or after 4.28 s, with one
   `Failed password` line in the log either way.
 - The echo times of the blocked tunnel are those of the quiet connection: on this version a
   channel that waits for window does not hold the others back. An upload does slow the
   shell, from 0.5 ms to 8 or 9.
-- The other direction freezes the whole connection. When a program connected to a local
-  forward stops reading while the service behind it keeps sending, no shell echo on the same
-  connection is answered (20 of 20 after 5 s each, 3 runs of 3) until that program closes
-  its connection; then the shell answers again. `shell_while_a_tunnel_download_is_blocked`
-  records this and passes either way.
+- The other direction used to freeze the whole connection for as long as the program stayed
+  silent (20 of 20 echoes unanswered after 5 s each, 3 runs of 3, until the program closed
+  its connection). `tunnel::relay` now keeps what the service sends in a backlog of 2 MiB per
+  forward and holds the service back when it is full, as before. A forward whose backlog is
+  full and whose program has taken nothing for `GRACE` (3 s) is closed. What that means:
+  - A program that reads at about 100 KiB/s or faster loses nothing. Measured through a
+    forward to a service that sends without end, a client reading at full speed, 100, 50, 20,
+    5, 1 MiB/s and 100 KiB/s (256 MiB, 70 MiB at 5, 14 MiB at 1 MiB/s, 1.4 MiB at 100 KiB/s;
+    five connections each): at the shipped 3 s all 35 completed. With 500 ms and 1 s the
+    100 KiB/s client was cut in 5 of 5 and with 2 s in 1 of 5; the faster rows completed at
+    500 ms already. The 100 KiB/s row also completed 10 of 10 at 3 s and at 4 s. The kernel
+    lets the relay write again in steps of about 256 KiB once the program reads, so the longest
+    silence seen was 2.57 s at 100 KiB/s, 0.26 s at 1 MiB/s and 0.065 s at 5 MiB/s. A program
+    that reads slower than about 100 KiB/s with a full backlog will be cut. The step size and
+    these times were measured on Windows loopback only; the cut-off rate may differ on
+    another system.
+  - While the backlog is full the whole SSH connection waits for that forward, the shell and
+    the other forwards with it. For a program that takes nothing this lasts `GRACE` at most
+    (it used to be without end): the test sees one echo of 20 take that long and the rest
+    under 100 ms. A program that trickles keeps the forward alive and the wait goes on: with a
+    client reading 100 KiB/s and a full backlog, shell echoes took 14.4 to 23.0 s (median
+    20.3 s, 8 echoes) and the connection was not ended; the relay before this change gave
+    11.9 to 20.4 s (median 19.0 s). A shell reply queues behind the data already on its way
+    to the slow forward, so it waits as long as the program needs to take that.
+  - A program that stops reading altogether while the service keeps sending loses its
+    connection once about 2 MiB are waiting and `GRACE` has passed. The shell and the other
+    forwards go on.
+  - A program that writes back what it reads, with a loop that blocks in its own write, can
+    stop for good: it waits to write, the relay's pump waits for the connection, the connection
+    waits for the full backlog. Nothing moves then and nothing will; only ending that one
+    forward helps, and it is ended after `GRACE`. The committed relay froze the whole connection
+    in that case, for ever. In an echo of 8 MiB through a remote forward (in-process server,
+    unoptimised build) the old relay froze the connection in 4 to 10 of 60 rounds and the new
+    one ended the forward in 2 to 6 of 60 (counters of both directions and of the program
+    unchanged over the whole grace in all 14 ends checked).
+  - A backlog deeper than about 100 KiB costs the unoptimised build speed in that echo. Debug
+    medians over 60 interleaved rounds: the relay before this change 79.5 to 97.2 MiB/s over
+    all runs, the new one 61.3 to 75.8, about 15 to 30 % lower; at the shipped 3 s, 64.0 against
+    79.5 in the same run (old relay: 2 rounds frozen for good, new relay: 1 forward ended,
+    counters unchanged over the whole grace). With the hold-back at 64 KiB the new code
+    measured 87.7 MiB/s, at 256 KiB 64.0, at 2 MiB 64.5 to 71.6. The optimised build shows no
+    difference beyond the spread (old 178.9, 2 MiB 170.8 MiB/s).
+  `shell_while_a_tunnel_download_is_blocked` asserts that every echo is answered within
+  `GRACE` plus 1 s, that at most 3 of 20 take more than 100 ms, that the blocked client's
+  connection is closed by the app and that a new connection through the forward works.
 
 One run of the optimised build (`--release`), for the order of magnitude:
 

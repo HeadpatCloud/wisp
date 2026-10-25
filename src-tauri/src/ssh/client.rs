@@ -13,6 +13,9 @@ use crate::ssh::known_hosts::{HostKeyVerdict, KnownHosts};
 
 pub type SshHandle = Handle<ClientHandler>;
 
+// The same limit as the TCP connect of an RDP session.
+const FORWARD_CONNECT_LIMIT: Duration = Duration::from_secs(10);
+
 #[derive(Clone)]
 pub struct RemoteTarget {
     pub target_host: String,
@@ -34,6 +37,7 @@ pub struct ClientHandler {
     remote_forwards: RemoteForwards,
     // Goes with the session; its forwards watch for that.
     alive: Arc<()>,
+    connect_limit: Duration,
 }
 
 impl Handler for ClientHandler {
@@ -71,6 +75,7 @@ impl Handler for ClientHandler {
         connected_port: u32,
         _originator_address: &str,
         _originator_port: u32,
+        reply: russh::client::ChannelOpenHandle,
         _session: &mut russh::client::Session,
     ) -> AppResult<()> {
         let target = {
@@ -80,16 +85,28 @@ impl Handler for ClientHandler {
                 .map_err(|_| AppError::Internal("remote_forwards poisoned".into()))?;
             map.get(&(connected_address.to_string(), connected_port)).cloned()
         };
-        let Some(target) = target else {
-            return Ok(());
+        // An accepted channel that is then dropped stays open on the server, and the client at the
+        // far end waits on it. A reply dropped unanswered refuses the channel only if the session's
+        // queue has room at that moment, so a refusal is sent and awaited like the accept.
+        let refuse = |reply: russh::client::ChannelOpenHandle| {
+            reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
         };
         let session = Arc::downgrade(&self.alive);
+        let limit = self.connect_limit;
+        // The accept queues a message for the session loop that is running this handler, so
+        // awaiting it here can wait for a slot only this handler's caller could free.
         tokio::spawn(async move {
-            let Ok(local) =
-                tokio::net::TcpStream::connect((target.target_host.as_str(), target.target_port)).await
-            else {
+            let Some(target) = target else {
+                refuse(reply).await;
                 return;
             };
+            let connecting =
+                tokio::net::TcpStream::connect((target.target_host.as_str(), target.target_port));
+            let Ok(Ok(local)) = tokio::time::timeout(limit, connecting).await else {
+                refuse(reply).await;
+                return;
+            };
+            reply.accept().await;
             let over = move || session.strong_count() == 0;
             crate::tunnel::relay(channel, local, target.up, target.down, over).await;
         });
@@ -111,6 +128,7 @@ pub async fn connect(
         port,
         remote_forwards,
         alive: Arc::default(),
+        connect_limit: FORWARD_CONNECT_LIMIT,
     };
     let handle = client::connect(config, (host.as_str(), port), handler).await?;
     Ok(handle)
@@ -126,6 +144,21 @@ pub async fn connect_over<R>(
 where
     R: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    connect_over_within(stream, host, port, known_hosts, remote_forwards, FORWARD_CONNECT_LIMIT)
+        .await
+}
+
+async fn connect_over_within<R>(
+    stream: R,
+    host: &str,
+    port: u16,
+    known_hosts: Arc<Mutex<KnownHosts>>,
+    remote_forwards: RemoteForwards,
+    connect_limit: Duration,
+) -> AppResult<SshHandle>
+where
+    R: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let config = client_config();
     let handler = ClientHandler {
         known_hosts,
@@ -133,6 +166,7 @@ where
         port,
         remote_forwards,
         alive: Arc::default(),
+        connect_limit,
     };
     let handle = client::connect_stream(config, stream, handler).await?;
     Ok(handle)
@@ -283,16 +317,31 @@ pub(crate) mod testing {
             _port_to_connect: u32,
             _originator_address: &str,
             _originator_port: u32,
+            reply: russh::server::ChannelOpenHandle,
             _session: &mut Session,
-        ) -> Result<bool, Self::Error> {
-            Ok(self.0.send(channel).is_ok())
+        ) -> Result<(), Self::Error> {
+            if self.0.is_closed() {
+                return Ok(());
+            }
+            let arrived = self.0.clone();
+            tokio::spawn(async move {
+                reply.accept().await;
+                let _ = arrived.send(channel);
+            });
+            Ok(())
         }
     }
 
+    type LoggedIn = (SshHandle, RemoteForwards, Handle, mpsc::UnboundedReceiver<Channel<Msg>>);
+
     // A logged-in client, the server's side of it, and the direct-tcpip channels the client
     // opens as they arrive at the server.
-    pub(crate) async fn session(
-    ) -> (SshHandle, RemoteForwards, Handle, mpsc::UnboundedReceiver<Channel<Msg>>) {
+    pub(crate) async fn session() -> LoggedIn {
+        session_within(super::FORWARD_CONNECT_LIMIT).await
+    }
+
+    // `connect_limit` is how long a remote forward waits for its local target.
+    pub(crate) async fn session_within(connect_limit: Duration) -> LoggedIn {
         let limit = Duration::from_secs(10);
         let key = include_str!("fixtures/id_ed25519_openssh");
         let host_key = russh::keys::decode_secret_key(key, None).unwrap();
@@ -306,7 +355,9 @@ pub(crate) mod testing {
         let mut known = KnownHosts::load(dir.path().join("known_hosts.json")).unwrap();
         known.record("server", 22, &fingerprint).unwrap();
         let (known, forwards) = (Arc::new(Mutex::new(known)), super::new_forwards());
-        let connecting = super::connect_over(client_side, "server", 22, known, forwards.clone());
+        let forwarding = forwards.clone();
+        let connecting =
+            super::connect_over_within(client_side, "server", 22, known, forwarding, connect_limit);
         let mut handle = timeout(limit, connecting).await.expect("connect hung").unwrap();
         let login = timeout(limit, handle.authenticate_none("me")).await.expect("login hung");
         assert!(login.unwrap().success());
@@ -530,5 +581,149 @@ mod tests {
         handle.disconnect(russh::Disconnect::ByApplication, "", "en").await.unwrap();
 
         forward_is_gone(&counter).await;
+    }
+
+    fn refused(opened: Result<Channel<Msg>, russh::Error>) -> bool {
+        use russh::ChannelOpenFailure::AdministrativelyProhibited;
+        matches!(opened, Err(russh::Error::ChannelOpenFailure(AdministrativelyProhibited)))
+    }
+
+    #[tokio::test]
+    async fn a_forwarded_channel_no_forward_matches_is_refused() {
+        let (_handle, _forwards, server, _opened) = super::testing::session().await;
+        let opening = server.channel_open_forwarded_tcpip("127.0.0.1", 7100, "127.0.0.1", 1);
+        let opened = timeout(Duration::from_secs(2), opening).await.expect("the open hangs");
+        assert!(refused(opened));
+    }
+
+    #[tokio::test]
+    async fn a_forwarded_channel_whose_target_refuses_the_connection_is_refused() {
+        let (_handle, forwards, server, _opened) = super::testing::session().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_port = listener.local_addr().unwrap().port();
+        drop(listener);
+        forwards.lock().unwrap().insert(
+            ("127.0.0.1".to_string(), 7100),
+            super::RemoteTarget {
+                target_host: "127.0.0.1".into(),
+                target_port: closed_port,
+                up: Arc::default(),
+                down: Arc::default(),
+            },
+        );
+        let opening = server.channel_open_forwarded_tcpip("127.0.0.1", 7100, "127.0.0.1", 1);
+        let opened = timeout(LIMIT, opening).await.expect("the open hangs");
+        assert!(refused(opened));
+    }
+
+    // TEST-NET-1 takes no connection and sends no refusal.
+    const BLACK_HOLE: &str = "192.0.2.1";
+
+    fn forward_to(forwards: &super::RemoteForwards, port: u32, host: &str, target_port: u16) {
+        forwards.lock().unwrap().insert(
+            ("127.0.0.1".to_string(), port),
+            super::RemoteTarget {
+                target_host: host.into(),
+                target_port,
+                up: Arc::default(),
+                down: Arc::default(),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forwarded_channel_whose_target_never_answers_is_refused_after_the_limit() {
+        let connect_limit = Duration::from_millis(300);
+        let (_handle, forwards, server, _opened) =
+            super::testing::session_within(connect_limit).await;
+        forward_to(&forwards, 7100, BLACK_HOLE, 9);
+        let started = Instant::now();
+        let opening = server.channel_open_forwarded_tcpip("127.0.0.1", 7100, "127.0.0.1", 1);
+        let opened = timeout(Duration::from_secs(3), opening).await.expect("the open hangs");
+        assert!(refused(opened));
+        assert!(started.elapsed() >= connect_limit, "{:?}", started.elapsed());
+    }
+
+    // A refusal by dropping the reply is lost when the session's queue is full at that moment.
+    #[tokio::test]
+    async fn forwarded_channels_are_refused_while_other_channels_flood_the_session() {
+        let connect_limit = Duration::from_millis(300);
+        let (handle, forwards, server, mut opened) =
+            super::testing::session_within(connect_limit).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_port = listener.local_addr().unwrap().port();
+        drop(listener);
+        forward_to(&forwards, 7200, "127.0.0.1", closed_port);
+        forward_to(&forwards, 7300, BLACK_HOLE, 9);
+        tokio::spawn(async move {
+            while let Some(mut channel) = opened.recv().await {
+                tokio::spawn(async move { while channel.wait().await.is_some() {} });
+            }
+        });
+        let handle = Arc::new(handle);
+        let mut writers = Vec::new();
+        for _ in 0..32 {
+            let channel = handle.channel_open_direct_tcpip("service", 80, "127.0.0.1", 1);
+            let channel = timeout(LIMIT, channel).await.expect("no channel").unwrap();
+            writers.push(tokio::spawn(async move {
+                let chunk = vec![0x55u8; 32 * 1024];
+                while channel.data(&chunk[..]).await.is_ok() {}
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        for round in 0..15 {
+            let port = [7100, 7200, 7300][round % 3];
+            let opening = server.channel_open_forwarded_tcpip("127.0.0.1", port, "127.0.0.1", 1);
+            let opened = timeout(Duration::from_secs(2), opening).await;
+            let opened = opened.unwrap_or_else(|_| panic!("round {round} to {port} got no answer"));
+            assert!(refused(opened), "round {round} to {port}");
+        }
+        for writer in writers {
+            writer.abort();
+        }
+    }
+
+    // An open is answered while many channels fill the session's inbound queue. (Does not fail
+    // with the accept awaited in the handler either: the queue was not seen full at an open.)
+    #[tokio::test]
+    async fn remote_forward_opens_while_other_channels_flood_the_session() {
+        let (handle, forwards, server, mut opened) = super::testing::session().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        forwards.lock().unwrap().insert(
+            ("127.0.0.1".to_string(), 7100),
+            super::RemoteTarget {
+                target_host: "127.0.0.1".into(),
+                target_port: listener.local_addr().unwrap().port(),
+                up: Arc::default(),
+                down: Arc::default(),
+            },
+        );
+        tokio::spawn(async move {
+            while let Some(mut channel) = opened.recv().await {
+                tokio::spawn(async move { while channel.wait().await.is_some() {} });
+            }
+        });
+        let handle = Arc::new(handle);
+        let mut writers = Vec::new();
+        for _ in 0..32 {
+            let channel = handle.channel_open_direct_tcpip("service", 80, "127.0.0.1", 1);
+            let channel = timeout(LIMIT, channel).await.expect("no channel").unwrap();
+            writers.push(tokio::spawn(async move {
+                let chunk = vec![0x55u8; 32 * 1024];
+                while channel.data(&chunk[..]).await.is_ok() {}
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        for _ in 0..20 {
+            let opening = server.channel_open_forwarded_tcpip("127.0.0.1", 7100, "127.0.0.1", 1);
+            let two = Duration::from_secs(2);
+            let _far = timeout(two, opening).await.expect("the open got no answer").unwrap();
+            timeout(two, listener.accept()).await.expect("no connection").unwrap();
+        }
+        for writer in writers {
+            writer.abort();
+        }
     }
 }

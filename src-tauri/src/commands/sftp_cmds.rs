@@ -586,10 +586,12 @@ f0GsSG2Fq+0yfaqqx4M4AAAAAAECAwQF
         async fn channel_open_session(
             &mut self,
             channel: SshChannel<Msg>,
+            reply: ssh_server::ChannelOpenHandle,
             _session: &mut Session,
-        ) -> Result<bool, Self::Error> {
+        ) -> Result<(), Self::Error> {
             self.channels.insert(channel.id(), channel);
-            Ok(true)
+            tokio::spawn(async move { reply.accept().await });
+            Ok(())
         }
 
         async fn subsystem_request(

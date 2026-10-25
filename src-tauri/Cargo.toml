@@ -34,7 +34,9 @@ chacha20poly1305 = "0.10.1"
 getrandom = "0.4"
 zeroize = { version = "1.9.0", features = ["zeroize_derive", "serde"] }
 base64 = "0.22"
-russh = { version = "0.61.2", default-features = false, features = ["ring", "rsa"] }
+# 0.62.0 to 0.62.5 can deadlock a handler that awaits reply.accept() (ours does not, fixed in
+# 0.62.6); 0.62.5 and later hold back every channel while one waits for window: 0.62.4 it is
+russh = { version = "=0.62.4", default-features = false, features = ["ring", "rsa"] }
 russh-sftp = "2.3"
 tauri-plugin-dialog = "2"
 bytes = "1"

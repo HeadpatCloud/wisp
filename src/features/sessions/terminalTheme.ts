@@ -169,5 +169,6 @@ export function applyTerminalSettings(term: Terminal, fit: FitAddon, s: Appearan
   term.options.cursorStyle = s.cursorStyle
   term.options.cursorBlink = s.cursorBlink
   term.options.scrollback = s.scrollback
-  if (metricsChanged) fit.fit()
+  // A hidden terminal would be fitted to a bogus size; its observer refits it once shown.
+  if (metricsChanged && term.element?.getClientRects().length) fit.fit()
 }

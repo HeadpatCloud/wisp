@@ -282,3 +282,9 @@ test('returns null when nothing restorable was stored', () => {
   })
   expect(loadSnapshot()).toBeNull()
 })
+
+test('a local tab keeps its zoom across a restart', () => {
+  const local: Tab = { id: 't9', kind: 'local', title: 'Local shell', program: null, zoom: 2 }
+  saveSnapshot({ tabs: [local], sessions: {}, activeTabId: 't9' })
+  expect(loadSnapshot()?.tabs).toEqual([local])
+})

@@ -217,3 +217,19 @@ test('removeTab on a view tab drops only the tab, never a session', () => {
   expect(useSessionStore.getState().tabs).toHaveLength(1)
   expect(useSessionStore.getState().sessions.sess1).toBeDefined()
 })
+
+test('setLocalZoom zooms one local tab within the SSH range', () => {
+  const s = useSessionStore.getState()
+  s.openLocalShell()
+  s.openLocalShell()
+  const [first, second] = useSessionStore.getState().tabs
+  s.setLocalZoom(first.id, 3)
+  const tabs = () => useSessionStore.getState().tabs
+  expect(tabs()[0]).toMatchObject({ zoom: 3 })
+  expect(tabs()[1]).not.toHaveProperty('zoom')
+  s.setLocalZoom(first.id, 40)
+  expect(tabs()[0]).toMatchObject({ zoom: 12 })
+  s.setLocalZoom(first.id, -40)
+  expect(tabs()[0]).toMatchObject({ zoom: -6 })
+  expect(tabs()[1].id).toBe(second.id)
+})

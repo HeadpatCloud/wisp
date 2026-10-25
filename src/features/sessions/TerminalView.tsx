@@ -102,12 +102,17 @@ export function TerminalView({
       clear: () => term.clearSelection(),
     })
 
-    fit.fit()
+    // In a hidden tab the computed size is "100%", which fit reads as 100 px and shrinks the
+    // PTY to a few columns; the observer refits once the tab is shown.
+    const refit = () => {
+      if (container.getClientRects().length > 0) fit.fit()
+    }
+    refit()
     // fit's resize event isn't replayed to the listener above, so report the
     // initial fitted size explicitly - otherwise the PTY opens at 80x24.
     onResize(term.cols, term.rows)
 
-    const ro = new ResizeObserver(() => fit.fit())
+    const ro = new ResizeObserver(refit)
     ro.observe(container)
 
     return () => {
@@ -129,5 +134,7 @@ export function TerminalView({
     }
   }, [settings])
 
-  return <div ref={containerRef} className="h-full w-full" />
+  // Clipped: after a font change the old grid briefly overflows, and the split panel's scrollbars
+  // would shrink the size fit measures.
+  return <div ref={containerRef} className="h-full w-full overflow-hidden" />
 }

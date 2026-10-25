@@ -77,6 +77,10 @@ function splitActivePane(direction: 'horizontal' | 'vertical') {
 function nudgeZoom(delta: number, reset = false) {
   const st = useSessionStore.getState()
   const t = st.tabs.find((tab) => tab.id === st.activeTabId)
+  if (t?.kind === 'local') {
+    st.setLocalZoom(t.id, reset ? 0 : (t.zoom ?? 0) + delta)
+    return
+  }
   if (t?.kind !== 'session') return
   const cur = st.sessions[t.activePaneId]?.zoom ?? 0
   st.setZoom(t.activePaneId, reset ? 0 : cur + delta)
@@ -440,7 +444,7 @@ export default function App() {
                   data-testid={`tabpane-${t.id}`}
                   className={cn('absolute inset-0', t.id !== activeTabId && 'hidden')}
                 >
-                  <LocalTerminalView program={t.program} />
+                  <LocalTerminalView tabId={t.id} program={t.program} />
                 </div>
               ))}
               {vncTabs.map((t) => (

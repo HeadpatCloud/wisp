@@ -1,11 +1,26 @@
 import { useCallback, useEffect, useMemo, useRef } from 'react'
 import { closeLocal, openLocal, resizeLocal, writeLocal } from '@/lib/local'
+import { useSessionStore } from '@/stores/sessionStore'
 import { appearanceOf, useSettingsStore } from '@/stores/settingsStore'
 import { TerminalView } from './TerminalView'
 
-export function LocalTerminalView({ program = null }: { program?: string | null }) {
+export function LocalTerminalView({
+  tabId,
+  program = null,
+}: {
+  tabId: string
+  program?: string | null
+}) {
   const raw = useSettingsStore((s) => s.settings)
-  const settings = useMemo(() => appearanceOf(raw), [raw])
+  const zoom = useSessionStore((s) => {
+    const t = s.tabs.find((tab) => tab.id === tabId)
+    return t?.kind === 'local' ? (t.zoom ?? 0) : 0
+  })
+  const settings = useMemo(() => {
+    const base = appearanceOf(raw)
+    return zoom ? { ...base, fontSize: Math.max(6, base.fontSize + zoom) } : base
+  }, [raw, zoom])
+  const wrapRef = useRef<HTMLDivElement>(null)
   const writeRef = useRef<((data: Uint8Array) => void) | null>(null)
   const idRef = useRef<string | null>(null)
   const sizeRef = useRef({ cols: 80, rows: 24 })
@@ -40,8 +55,24 @@ export function LocalTerminalView({ program = null }: { program?: string | null 
     }
   }, [program])
 
+  // Non-passive so Ctrl+wheel zooms this tab instead of the whole webview.
+  useEffect(() => {
+    const el = wrapRef.current
+    if (!el) return
+    const onWheel = (ev: WheelEvent) => {
+      if (!ev.ctrlKey || ev.deltaY === 0) return
+      ev.preventDefault()
+      const st = useSessionStore.getState()
+      const t = st.tabs.find((tab) => tab.id === tabId)
+      const cur = t?.kind === 'local' ? (t.zoom ?? 0) : 0
+      st.setLocalZoom(tabId, cur + (ev.deltaY < 0 ? 1 : -1))
+    }
+    el.addEventListener('wheel', onWheel, { passive: false })
+    return () => el.removeEventListener('wheel', onWheel)
+  }, [tabId])
+
   return (
-    <div className="h-full w-full bg-background p-1">
+    <div ref={wrapRef} className="h-full w-full bg-background p-1">
       <TerminalView onData={onData} onResize={onResize} bindWrite={bindWrite} settings={settings} />
     </div>
   )

@@ -46,6 +46,7 @@ export interface LocalTab {
   kind: 'local'
   title: string
   program: string | null
+  zoom?: number
 }
 
 export interface VncTab {
@@ -106,6 +107,10 @@ export function tabSecretIds(t: Tab): string[] {
   return []
 }
 
+function clampZoom(zoom: number): number {
+  return Math.max(-6, Math.min(12, zoom))
+}
+
 function viewKey(v: TabView): string {
   if (v.kind === 'profile-editor') return `profile-editor:${v.profileId ?? 'new'}`
   if (v.kind === 'group-editor') return `group-editor:${v.groupId ?? 'new'}`
@@ -152,6 +157,7 @@ interface SessionState {
   reconnect: (sessionId: string) => void
   toggleBroadcast: (tabId: string) => void
   setZoom: (sessionId: string, zoom: number) => void
+  setLocalZoom: (tabId: string, zoom: number) => void
   restoreTabs: (snapshot: {
     tabs: Tab[]
     sessions: Record<string, PaneSession>
@@ -416,8 +422,15 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
     set({
       sessions: {
         ...get().sessions,
-        [sessionId]: { ...prev, zoom: Math.max(-6, Math.min(12, zoom)) },
+        [sessionId]: { ...prev, zoom: clampZoom(zoom) },
       },
     })
   },
+
+  setLocalZoom: (tabId, zoom) =>
+    set({
+      tabs: get().tabs.map((t) =>
+        t.id === tabId && t.kind === 'local' ? { ...t, zoom: clampZoom(zoom) } : t,
+      ),
+    }),
 }))

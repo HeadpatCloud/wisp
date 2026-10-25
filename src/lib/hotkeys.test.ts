@@ -23,8 +23,44 @@ test('chordOf normalizes modifiers and case', () => {
     'ctrl+shift+p',
   )
   expect(chordOf({ ctrlKey: true, metaKey: false, altKey: false, shiftKey: false, key: '=' })).toBe(
-    'ctrl+=',
+    'ctrl+plus',
   )
+})
+
+test('zoom in answers the plus key on every layout', () => {
+  const zoomIn = vi.fn()
+  renderHook(() => useHotkeys({ zoomIn }, {}))
+  // German "+" key, US "=" key, US Shift+"=", numpad "+".
+  press({ key: '+', code: 'BracketRight', ctrlKey: true })
+  press({ key: '=', code: 'Equal', ctrlKey: true })
+  press({ key: '+', code: 'Equal', ctrlKey: true, shiftKey: true })
+  press({ key: '+', code: 'NumpadAdd', ctrlKey: true })
+  expect(zoomIn).toHaveBeenCalledTimes(4)
+})
+
+test.each(['ctrl+=', 'ctrl+shift+=', 'ctrl++', 'ctrl+shift++'])(
+  'a zoom in override saved as %s still answers the plus key',
+  (override) => {
+    const zoomIn = vi.fn()
+    renderHook(() => useHotkeys({ zoomIn }, { zoomIn: override }))
+    press({ key: '+', code: 'BracketRight', ctrlKey: true })
+    press({ key: '=', code: 'Equal', ctrlKey: true })
+    press({ key: '+', code: 'Equal', ctrlKey: true, shiftKey: true })
+    expect(zoomIn).toHaveBeenCalledTimes(3)
+  },
+)
+
+test('a saved plus override is shown and compared as the plus chord', () => {
+  expect(chordFor('zoomIn', { zoomIn: 'ctrl+shift+=' })).toBe('ctrl+plus')
+  expect(formatChord(chordFor('zoomIn', { zoomIn: 'ctrl+shift++' }))).toBe('Ctrl+Plus')
+  expect(chordFor('zoomIn', { zoomIn: 'alt+shift+=' })).toBe('alt+plus')
+  expect(conflictFor('zoomOut', 'ctrl+plus', { zoomIn: 'ctrl+=' })).toBe('zoomIn')
+  expect(conflictFor('zoomOut', 'ctrl+plus', { zoomIn: 'ctrl+shift++' })).toBe('zoomIn')
+})
+
+test('a saved override with another key keeps its Shift', () => {
+  expect(chordFor('palette', { palette: 'ctrl+shift+k' })).toBe('ctrl+shift+k')
+  expect(chordFor('zoomOut', { zoomOut: 'ctrl+shift+-' })).toBe('ctrl+shift+-')
 })
 
 test('chordFor falls back to the default until overridden', () => {

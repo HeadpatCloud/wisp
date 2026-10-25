@@ -90,6 +90,9 @@ vi.mock('@/features/sessions/TabBar', () => ({
 vi.mock('@/features/sessions/PanesView', () => ({
   PanesView: ({ tab }: { tab: { id: string } }) => <div data-testid={`panesview-${tab.id}`} />,
 }))
+vi.mock('@/features/sessions/LocalTerminalView', () => ({
+  LocalTerminalView: ({ tabId }: { tabId: string }) => <div data-testid={`local-${tabId}`} />,
+}))
 vi.mock('@/features/sessions/ViewHost', () => ({
   ViewHost: () => <div data-testid="view-host" />,
 }))
@@ -448,4 +451,27 @@ test('the tree opens the VNC profile dialog for a saved profile and for a new on
   fireEvent.click(screen.getByRole('button', { name: 'Add VNC profile' }))
   expect(screen.getByText('New VNC profile')).toBeInTheDocument()
   expect(screen.getByLabelText('Host')).toHaveValue('')
+})
+
+test('the zoom keys zoom the active local shell tab and no other tab', () => {
+  useSessionStore.setState({
+    tabs: [
+      tab1,
+      { id: 'l1', kind: 'local', title: 'Local shell', program: null },
+      { id: 'l2', kind: 'local', title: 'Local shell', program: null },
+    ],
+    activeTabId: 'l1',
+  })
+  render(<App />)
+  expect(screen.getByTestId('local-l1')).toBeInTheDocument()
+  const zoom = () =>
+    useSessionStore.getState().tabs.map((t) => (t.kind === 'local' ? t.zoom : undefined))
+  fireEvent.keyDown(window, { key: '=', ctrlKey: true })
+  fireEvent.keyDown(window, { key: '=', ctrlKey: true })
+  expect(zoom()).toEqual([undefined, 2, undefined])
+  fireEvent.keyDown(window, { key: '-', ctrlKey: true })
+  expect(zoom()).toEqual([undefined, 1, undefined])
+  fireEvent.keyDown(window, { key: '0', ctrlKey: true })
+  expect(zoom()).toEqual([undefined, 0, undefined])
+  expect(useSessionStore.getState().sessions.s1.zoom).toBeUndefined()
 })

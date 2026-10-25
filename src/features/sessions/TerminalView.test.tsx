@@ -104,10 +104,27 @@ function renderView(props: Partial<React.ComponentProps<typeof TerminalView>> = 
   )
 }
 
+let observed: (() => void) | null = null
+
 beforeEach(() => {
   vi.clearAllMocks()
   m.term.cols = 80
   m.term.rows = 24
+  observed = null
+  globalThis.ResizeObserver = class {
+    constructor(cb: () => void) {
+      observed = cb
+    }
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  } as unknown as typeof ResizeObserver
+  // As in a browser: nothing inside a display:none subtree has a box.
+  vi.spyOn(HTMLElement.prototype, 'getClientRects').mockImplementation(function (
+    this: HTMLElement,
+  ) {
+    return (this.closest('.hidden') ? [] : [new DOMRect(0, 0, 800, 600)]) as unknown as DOMRectList
+  })
   Object.defineProperty(navigator, 'clipboard', {
     value: {
       writeText: vi.fn().mockResolvedValue(undefined),
@@ -121,6 +138,30 @@ test('reports the fitted size via onResize on mount', () => {
   const onResize = vi.fn()
   renderView({ onResize })
   expect(onResize).toHaveBeenCalledWith(120, 40)
+})
+
+// A hidden tab's container reports "100%" as its size, which fit reads as 100 px.
+test('a terminal in a hidden tab keeps its size until it is shown', () => {
+  const onResize = vi.fn()
+  const wrapper = document.createElement('div')
+  wrapper.className = 'hidden'
+  document.body.appendChild(wrapper)
+  render(
+    <TerminalView onData={vi.fn()} onResize={onResize} bindWrite={() => {}} settings={settings} />,
+    {
+      container: wrapper,
+    },
+  )
+  expect(onResize).toHaveBeenCalledWith(80, 24)
+  expect(onResize).not.toHaveBeenCalledWith(120, 40)
+
+  observed?.()
+  expect(m.term.cols).toBe(80)
+
+  wrapper.className = ''
+  observed?.()
+  expect(m.term.cols).toBe(120)
+  wrapper.remove()
 })
 
 test('opens, forwards data + resize, binds a write sink, disposes', () => {

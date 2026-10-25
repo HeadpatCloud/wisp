@@ -10,7 +10,7 @@ export const HOTKEY_ACTIONS = [
   { id: 'splitRight', label: 'Split pane right', default: 'ctrl+alt+arrowright' },
   { id: 'splitDown', label: 'Split pane down', default: 'ctrl+alt+arrowdown' },
   { id: 'closePane', label: 'Close pane', default: 'ctrl+shift+x' },
-  { id: 'zoomIn', label: 'Zoom in', default: 'ctrl+=' },
+  { id: 'zoomIn', label: 'Zoom in', default: 'ctrl+plus' },
   { id: 'zoomOut', label: 'Zoom out', default: 'ctrl+-' },
   { id: 'zoomReset', label: 'Reset zoom', default: 'ctrl+0' },
   { id: 'broadcast', label: 'Toggle broadcast input', default: 'ctrl+shift+i' },
@@ -22,12 +22,15 @@ export type HotkeyAction = (typeof HOTKEY_ACTIONS)[number]['id']
 export function chordOf(
   ev: Pick<KeyboardEvent, 'ctrlKey' | 'metaKey' | 'altKey' | 'shiftKey' | 'key'>,
 ): string {
+  // A bare "+" would split the chord, and the plus key needs Shift on some layouts and not on
+  // others, so "+" and "=" are one Shift-less token.
+  const plus = ev.key === '+' || ev.key === '='
   const parts: string[] = []
   if (ev.ctrlKey) parts.push('ctrl')
   if (ev.metaKey) parts.push('meta')
   if (ev.altKey) parts.push('alt')
-  if (ev.shiftKey) parts.push('shift')
-  parts.push(ev.key.toLowerCase())
+  if (ev.shiftKey && !plus) parts.push('shift')
+  parts.push(plus ? 'plus' : ev.key.toLowerCase())
   return parts.join('+')
 }
 
@@ -43,7 +46,15 @@ export function formatChord(chord: string): string {
 }
 
 export function chordFor(action: HotkeyAction, overrides: Record<string, string>): string {
-  return overrides[action] ?? HOTKEY_ACTIONS.find((a) => a.id === action)?.default ?? ''
+  const chord = overrides[action] ?? HOTKEY_ACTIONS.find((a) => a.id === action)?.default ?? ''
+  // Overrides saved before chordOf made "+" and "=" one Shift-less token would never match.
+  const key = chord === '+' || chord.endsWith('++') ? '+' : chord.slice(chord.lastIndexOf('+') + 1)
+  if (key !== '+' && key !== '=') return chord
+  const modifiers = chord
+    .slice(0, chord.length - key.length)
+    .split('+')
+    .filter((m) => m !== '' && m !== 'shift')
+  return [...modifiers, 'plus'].join('+')
 }
 
 // The action already bound to `chord`, so a rebind can't silently shadow another one.

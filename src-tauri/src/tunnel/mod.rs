@@ -113,6 +113,13 @@ pub async fn relay(
     let (far, near) = channel.split();
     let writer = near.make_writer();
     let _close = CloseOnDrop(Some(near));
+    // Linux wakes a blocked writer only once a third of the send buffer is free again, and on
+    // loopback that buffer starts at 2.5 MiB: a peer reading 160 KiB/s saw no write finish for
+    // 5 s and lost its forward. With little left unsent, a write finishes as the peer reads.
+    #[cfg(target_os = "linux")]
+    if socket2::SockRef::from(lw.as_ref()).set_tcp_notsent_lowat(128 * 1024).is_err() {
+        return;
+    }
     // In a task of its own: sharing one with the receiving side, the local peer is read too
     // slowly when much arrives for it, and the session stalls more often when a peer sends
     // back what it gets.

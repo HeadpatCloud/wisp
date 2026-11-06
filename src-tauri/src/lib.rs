@@ -169,6 +169,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
             rdp_cmds::rdp_resize,
             rdp_cmds::rdp_ack,
             rdp_cmds::rdp_close,
+            rdp_cmds::rdp_close_all,
         ])
         .events(collect_events![ssh_cmds::SshStatus, tunnel::TunnelStatus])
 }

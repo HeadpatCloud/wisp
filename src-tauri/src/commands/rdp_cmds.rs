@@ -447,6 +447,15 @@ pub async fn rdp_close(rdps: State<'_, RdpSessions>, id: String) -> AppResult<()
     Ok(())
 }
 
+// Before an update is installed: on Windows the updater ends the app with process::exit, which
+// skips the close at the exit.
+#[tauri::command]
+#[specta::specta]
+pub async fn rdp_close_all(rdps: State<'_, RdpSessions>) -> AppResult<()> {
+    rdps.close_all().await;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -654,6 +663,30 @@ mod tests {
         timeout(WAIT, rdps.close("tab-1")).await.expect("close hung");
         assert!(rdps.session("tab-1").await.is_none());
         timeout(WAIT, gone(&mut server)).await.expect("the server did not see the end");
+    }
+
+    #[tokio::test]
+    async fn the_close_all_command_ends_every_session_as_the_exit_does() {
+        let app = tauri::test::mock_app();
+        app.manage(RdpSessions::default());
+        let mut servers = Vec::new();
+        for id in ["tab-1", "tab-2"] {
+            let server = listen().await;
+            open_through(&app.state::<RdpSessions>(), id, server.addr.unwrap().port()).await;
+            servers.push(server);
+        }
+        timeout(WAIT, rdp_close_all(app.state())).await.expect("close all hung").unwrap();
+        for server in &mut servers {
+            let ended = loop {
+                let seen = timeout(WAIT, server.seen.recv()).await.expect("timed out");
+                if let Seen::Gone(error) = seen.expect("gone") {
+                    break error;
+                }
+            };
+            assert_eq!(ended, None, "the session was not shut down");
+        }
+        let rdps = app.state::<RdpSessions>();
+        assert!(rdps.session("tab-1").await.is_none() && rdps.session("tab-2").await.is_none());
     }
 
     #[tokio::test]

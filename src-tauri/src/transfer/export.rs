@@ -6,6 +6,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use super::bundle::{KeyFile, Payload};
+use super::plan::gateway_secret;
 use super::{Env, ExportOptions, ExportSelection};
 use crate::store::model::{ProfileKey, ProfileStore};
 
@@ -121,6 +122,7 @@ pub fn build(
     }
     for p in &payload.rdp_profiles {
         owners.push((&p.name, p.secret_id.as_deref(), &[]));
+        owners.push((&p.name, gateway_secret(p.gateway.as_ref()), &[]));
     }
 
     let mut secrets = Vec::new();
@@ -160,7 +162,7 @@ pub fn build(
 mod tests {
     use super::*;
     use crate::store::model::{
-        AuthMethod, Group, IconRef, Profile, ProfileKey, RdpProfile, VncProfile,
+        AuthMethod, Group, IconRef, Profile, ProfileKey, RdpGateway, RdpProfile, VncProfile,
     };
     use crate::transfer::MapEnv;
 
@@ -239,6 +241,9 @@ mod tests {
             domain: Some("CORP".into()),
             secret_id: secret.map(Into::into),
             keyboard_layout: Some(0x407),
+            audio: true,
+            shared_folder: None,
+            gateway: None,
             icon: IconRef::default(),
             order: 0,
             extra: Default::default(),
@@ -393,6 +398,77 @@ mod tests {
         let (payload, warnings) = build(&data, &MapEnv::default(), &sel, &opts);
         assert_eq!(payload.rdp_profiles.len(), 2);
         assert!(payload.secrets.is_empty());
+        assert_eq!(warnings, ["Couldn't read a saved password for \"office\""]);
+    }
+
+    fn through(same_login: bool, secret: Option<&str>, p: RdpProfile) -> RdpProfile {
+        let gateway = RdpGateway {
+            host: "gw.corp".into(),
+            port: 443,
+            same_login,
+            username: if same_login { "" } else { "CORP\\gw" }.into(),
+            secret_id: secret.map(Into::into),
+            extra: Default::default(),
+        };
+        RdpProfile { gateway: Some(gateway), ..p }
+    }
+
+    #[test]
+    fn rdp_gateway_password_is_exported_under_its_secret_id_only_when_asked() {
+        let mut data = store();
+        data.rdp_profiles = vec![
+            through(false, Some("gw-pw"), rdp("office", Some("rdp-pw"))),
+            through(true, None, rdp("lab", None)),
+        ];
+        let sel =
+            ExportSelection { rdp_ids: vec!["office".into(), "lab".into()], ..Default::default() };
+        let mut env = MapEnv::default();
+        env.secrets.insert("rdp-pw".into(), b"pass".to_vec());
+        env.secrets.insert("gw-pw".into(), b"gateway pass".to_vec());
+
+        let (plain, warnings) = build(&data, &env, &sel, &ExportOptions::default());
+        assert_eq!(plain.rdp_profiles, data.rdp_profiles);
+        assert!(plain.secrets.is_empty() && warnings.is_empty());
+
+        let opts = ExportOptions { include_secrets: true, include_keys: false };
+        let (full, warnings) = build(&data, &env, &sel, &opts);
+        assert_eq!(full.rdp_profiles, data.rdp_profiles);
+        let secrets: Vec<_> = full.secrets.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(secrets, [("gw-pw", "gateway pass"), ("rdp-pw", "pass")]);
+        assert!(warnings.is_empty());
+    }
+
+    // A gateway switched to the same login keeps the vault id of its own password, unused.
+    #[test]
+    fn a_same_login_gateway_exports_no_password_of_its_own() {
+        let mut data = store();
+        data.rdp_profiles = vec![
+            through(true, Some("gw-old"), rdp("office", Some("rdp-pw"))),
+            through(true, Some("gw-gone"), rdp("lab", None)),
+        ];
+        let sel =
+            ExportSelection { rdp_ids: vec!["office".into(), "lab".into()], ..Default::default() };
+        let mut env = MapEnv::default();
+        env.secrets.insert("rdp-pw".into(), b"pass".to_vec());
+        env.secrets.insert("gw-old".into(), b"old gateway pass".to_vec());
+        let opts = ExportOptions { include_secrets: true, include_keys: false };
+        let (payload, warnings) = build(&data, &env, &sel, &opts);
+        let secrets: Vec<_> = payload.secrets.keys().map(String::as_str).collect();
+        assert_eq!(secrets, ["rdp-pw"]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn unreadable_rdp_gateway_password_becomes_a_warning() {
+        let mut data = store();
+        data.rdp_profiles = vec![through(false, Some("gw-pw"), rdp("office", Some("rdp-pw")))];
+        let sel = ExportSelection { rdp_ids: vec!["office".into()], ..Default::default() };
+        let mut env = MapEnv::default();
+        env.secrets.insert("rdp-pw".into(), b"pass".to_vec());
+        let opts = ExportOptions { include_secrets: true, include_keys: false };
+        let (payload, warnings) = build(&data, &env, &sel, &opts);
+        let secrets: Vec<_> = payload.secrets.keys().map(String::as_str).collect();
+        assert_eq!(secrets, ["rdp-pw"]);
         assert_eq!(warnings, ["Couldn't read a saved password for \"office\""]);
     }
 }

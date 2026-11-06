@@ -32,6 +32,8 @@ export const useRdpProfileStore = create<RdpProfileState>()((set, get) => ({
     // Only once the profile is gone: one that could not be deleted still needs its password.
     // Best effort, a secret left behind in the vault does no harm.
     if (target?.secretId) await commands.deleteSecret(target.secretId).catch(() => {})
+    const gatewaySecret = target?.gateway?.secretId
+    if (gatewaySecret) await commands.deleteSecret(gatewaySecret).catch(() => {})
     set({ profiles: unwrap(await commands.listRdpProfiles()) })
   },
 }))

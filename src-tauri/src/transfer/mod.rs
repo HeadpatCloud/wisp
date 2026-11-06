@@ -18,6 +18,7 @@ pub trait Env {
     fn secret(&self, id: &str) -> Option<Zeroizing<Vec<u8>>>;
     fn read_file(&self, path: &str) -> Option<Vec<u8>>;
     fn icon_exists(&self, rel: &str) -> bool;
+    fn dir_exists(&self, path: &str) -> bool;
 }
 
 pub struct LocalEnv<'a> {
@@ -56,6 +57,13 @@ impl Env for LocalEnv<'_> {
         // The path comes from an imported bundle and is later joined onto the config dir.
         is_icon_path(rel) && self.config_dir.join(rel).is_file()
     }
+
+    fn dir_exists(&self, path: &str) -> bool {
+        // The path comes from an imported bundle: looking up a UNC path would send the user's
+        // credentials to that server, and a relative one would be read against the working
+        // directory.
+        !is_network_path(path) && Path::new(path).is_absolute() && Path::new(path).is_dir()
+    }
 }
 
 // True for Windows paths that leave the local drives: UNC shares, verbatim and device paths, and
@@ -74,6 +82,7 @@ pub struct MapEnv {
     pub secrets: HashMap<String, Vec<u8>>,
     pub files: HashMap<String, Vec<u8>>,
     pub icons: HashSet<String>,
+    pub dirs: HashSet<String>,
 }
 
 #[cfg(test)]
@@ -88,6 +97,10 @@ impl Env for MapEnv {
 
     fn icon_exists(&self, rel: &str) -> bool {
         self.icons.contains(rel)
+    }
+
+    fn dir_exists(&self, path: &str) -> bool {
+        self.dirs.contains(path)
     }
 }
 
@@ -317,6 +330,36 @@ mod tests {
             {
                 assert!(env.read_file(path).is_none());
             }
+        }
+    }
+
+    #[test]
+    fn dir_exists_only_for_folders_on_a_local_drive() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault =
+            Vault::open_with_key(dir.path().join("vault.enc"), Zeroizing::new([1u8; 32])).unwrap();
+        let env = LocalEnv { vault: &vault, config_dir: dir.path() };
+        let share = dir.path().join("share");
+        std::fs::create_dir(&share).unwrap();
+        assert!(env.dir_exists(share.to_str().unwrap()));
+        assert!(!env.dir_exists(dir.path().join("vault.enc").to_str().unwrap()));
+        assert!(!env.dir_exists(dir.path().join("gone").to_str().unwrap()));
+        assert!(!env.dir_exists(""));
+
+        assert!(Path::new("src").is_dir());
+        assert!(!env.dir_exists("src"));
+
+        #[cfg(windows)]
+        {
+            let verbatim = format!("\\\\?\\{}", share.to_str().unwrap());
+            assert!(Path::new(&verbatim).is_dir());
+            assert!(!env.dir_exists(&verbatim));
+            assert!(!env.dir_exists("\\??\\C:\\Windows"));
+            // An address reserved for documentation: nothing answers there, and Windows needs
+            // about 20 seconds to find that out.
+            let started = std::time::Instant::now();
+            assert!(!env.dir_exists("\\\\192.0.2.1\\share"));
+            assert!(started.elapsed() < std::time::Duration::from_secs(1));
         }
     }
 }

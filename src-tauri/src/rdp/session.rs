@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
@@ -29,6 +30,9 @@ use ironrdp_pdu::rdp::vc::{ChannelControlFlags, ChannelPduHeader};
 use ironrdp_pdu::surface_commands::{FrameAction, SurfaceCommand};
 use ironrdp_pdu::x224::X224;
 use ironrdp_pdu::Action;
+use ironrdp_rdpdr::{NoopRdpdrBackend, Rdpdr};
+use ironrdp_rdpsnd::client::{NoopRdpsndBackend, Rdpsnd, RdpsndClientHandler};
+use ironrdp_rdpsnd_native::cpal::RdpsndBackend;
 use ironrdp_session::image::DecodedImage;
 use ironrdp_session::{
     fast_path, ActiveStage, ActiveStageBuilder, ActiveStageOutput, SessionError, SessionErrorKind,
@@ -46,8 +50,12 @@ use tokio_rustls::client::TlsStream;
 
 use super::clipboard::{self, Clipboard, Step, PASTE_LIMIT};
 use super::connect::{login, size_supported, Connected, Target};
+use super::drive::Drive;
 use super::err;
+use super::gateway;
 use super::input::{Input, Translator};
+use super::share;
+use super::sound::Player;
 use crate::commands::ssh_cmds::KnownHostsState;
 use crate::error::{AppError, AppResult};
 use crate::remote::{keep_alive, FrameOp};
@@ -77,6 +85,7 @@ pub struct Session {
     buttons: AtomicU16,
     task: Mutex<JoinSet<()>>,
     skipped: Arc<std::sync::Mutex<BTreeMap<String, usize>>>,
+    played: Arc<AtomicU64>,
 }
 
 pub(crate) enum Command {
@@ -126,6 +135,29 @@ impl Session {
         limit: Duration,
         sent: &AtomicBool,
     ) -> AppResult<Session> {
+        // A share that cannot work stops the connect: going on without it would look like a
+        // broken share.
+        let root = match &target.share {
+            None => None,
+            Some(share) if !share::valid_name(share.name) => {
+                return Err(err("a share name has 1 to 7 letters, digits, - or _"));
+            }
+            Some(share) => {
+                let root = std::fs::canonicalize(share.root).ok().filter(|root| root.is_dir());
+                let missing = || {
+                    let folder = share.root.display();
+                    err(format!("the shared folder {folder} does not exist on this computer"))
+                };
+                Some(root.ok_or_else(missing)?)
+            }
+        };
+        let played = Arc::default();
+        let attach = attach(target, &played, root);
+        if let Some(gateway) = &target.gateway {
+            let (tunnel, local) = gateway::open(gateway, target.host, target.port, known).await?;
+            let connected = login(tunnel, local, target, known, attach, sent).await?;
+            return Ok(Self::from_connected(connected, played, sink));
+        }
         let host = crate::net::normalize_host(target.host);
         let tcp = timeout(limit, TcpStream::connect((host.as_str(), target.port)))
             .await
@@ -134,22 +166,25 @@ impl Session {
         keep_alive(&tcp)?;
         let local = tcp.local_addr()?;
         let connected = login(tcp, local, target, known, attach, sent).await?;
-        Ok(Self::from_connected(connected, sink))
+        Ok(Self::from_connected(connected, played, sink))
     }
 
+    // `played` is the counter `attach` gave the sound channel.
     pub(crate) fn from_connected<S>(
         connected: Connected<S>,
+        played: Arc<AtomicU64>,
         sink: impl FnMut(FrameOp) + Send + 'static,
     ) -> Session
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
     {
         let (first, tick) = (Some(FIRST_RESIZE_LIMIT), CLIPBOARD_TICK);
-        Self::from_connected_within(connected, sink, RESIZE_LIMIT, first, tick, PASTE_LIMIT)
+        Self::from_connected_within(connected, played, sink, RESIZE_LIMIT, first, tick, PASTE_LIMIT)
     }
 
     fn from_connected_within<S>(
         connected: Connected<S>,
+        played: Arc<AtomicU64>,
         sink: impl FnMut(FrameOp) + Send + 'static,
         resize_limit: Duration,
         first_resize_limit: Option<Duration>,
@@ -222,12 +257,18 @@ impl Session {
         task.spawn(running.run(messages, acks.clone()));
         let buttons = AtomicU16::new(0);
         let task = Mutex::new(task);
-        Session { width, height, opened: Instant::now(), commands, acks, buttons, task, skipped }
+        let opened = Instant::now();
+        Session { width, height, opened, commands, acks, buttons, task, skipped, played }
     }
 
     // For the live tests: how often each PDU that IronRDP has no use for was skipped.
     pub fn skipped(&self) -> BTreeMap<String, usize> {
         self.skipped.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    // For the live tests: the audio bytes handed to the player since the open.
+    pub fn played(&self) -> u64 {
+        self.played.load(Ordering::Relaxed)
     }
 
     // The view has applied everything up to one more `Sync`.
@@ -646,10 +687,40 @@ where
     }
 }
 
-fn attach(connector: ClientConnector) -> ClientConnector {
-    let display = DisplayControlClient::new(|_| Ok(Vec::new()));
-    let channels = DrdynvcClient::new().with_dynamic_channel(display);
-    clipboard::attach(connector).with_static_channel(channels)
+// `root` is the canonical folder of `target.share`.
+fn attach(
+    target: &Target<'_>,
+    played: &Arc<AtomicU64>,
+    root: Option<PathBuf>,
+) -> impl FnOnce(ClientConnector) -> ClientConnector {
+    let played = target.audio.then(|| Arc::clone(played));
+    let shared = root.zip(target.share.as_ref().map(|share| share.name.to_owned()));
+    move |connector| {
+        let display = DisplayControlClient::new(|_| Ok(Vec::new()));
+        let channels = DrdynvcClient::new().with_dynamic_channel(display);
+        let connector = clipboard::attach(connector).with_static_channel(channels);
+        let sound = played.is_some();
+        // With sound off too: a server sends nothing on rdpdr to a client without an rdpsnd
+        // channel, and xrdp 0.10.1's channel server ends when a connection without one closes
+        // after one with it. The silent player offers no format, so nothing can be played to it.
+        let player: Box<dyn RdpsndClientHandler> = match played {
+            Some(played) => Box::new(Player::new(RdpsndBackend::new(), played)),
+            None => Box::new(NoopRdpsndBackend),
+        };
+        let connector = connector.with_static_channel(Rdpsnd::new(player));
+        let Some((root, name)) = shared else {
+            // Windows Server 2025 plays no sound to a client without an rdpdr channel, drives or
+            // not: the session's audio device waits 5 s for it and then plays into nothing.
+            if sound {
+                let rdpdr = Rdpdr::new(Box::new(NoopRdpdrBackend), "wisp".into());
+                return connector.with_static_channel(rdpdr);
+            }
+            return connector;
+        };
+        let drive = Drive::new(root, name.clone());
+        let rdpdr = Rdpdr::new(Box::new(drive), "wisp".into()).with_drives(Some(vec![(1, name)]));
+        connector.with_static_channel(rdpdr)
+    }
 }
 
 fn closed() -> AppError {
@@ -1023,11 +1094,13 @@ mod tests {
     use ironrdp_pdu::input::mouse_x::PointerXFlags;
     use ironrdp_pdu::input::{MousePdu, MouseXPdu};
     use ironrdp_pdu::mcs::DisconnectReason;
+    use ironrdp_pdu::rdp::client_info::ClientInfoFlags;
     use ironrdp_pdu::rdp::server_error_info::{
         ProtocolIndependentCode as Code, ProtocolIndependentConnectionBrokerCode as Broker,
         ProtocolIndependentLicensingCode as Licence, RdpSpecificCode,
     };
     use ironrdp_pdu::rdp::vc::ChannelControlFlags;
+    use ironrdp_rdpsnd::pdu::Version;
     use ironrdp_server::{DisplayUpdate, RGBAPointer, ServerEvent};
     use ironrdp_tokio::FramedWrite as _;
     use tokio::io::{duplex, AsyncWriteExt as _, DuplexStream};
@@ -1038,15 +1111,19 @@ mod tests {
 
     use super::*;
     use crate::rdp::testserver::{
-        accept_scripted, accept_scripted_keeping, accept_scripted_with, bitmap, certificate,
-        channel_chunk, deactivate_all, error_info, fast_path_update, fragments, frame_marker,
-        garbage, mcs_disconnect, monitor_layout, off_thread, play_sound, reactivate_scripted,
-        read_client, short_deactivate_all, short_frames, shutdown_denied, surface_bits,
-        surface_command, unlisted_error_info, Channels, ClientPdu, Login, Mouse, Options,
-        ScriptedFramed, Seen, TestServer,
+        accept_scripted, accept_scripted_asking, accept_scripted_keeping, accept_scripted_with,
+        bitmap, certificate, channel_chunk, deactivate_all, error_info, fast_path_update, fragments,
+        frame_marker, garbage, mcs_disconnect, monitor_layout, off_thread, play_sound,
+        reactivate_scripted, read_client, short_deactivate_all, short_frames, shutdown_denied,
+        sound_formats, sound_training, surface_bits, surface_command, unlisted_error_info, wave,
+        wave2, wave_info, windows_formats, xrdp_formats, Asked, Channels, ClientPdu, Login, Mouse,
+        Options, ScriptedFramed, Seen, TestServer,
     };
     use crate::error::AppError;
     use crate::rdp::clipboard::MAX_TEXT;
+    use crate::rdp::connect::config;
+    use crate::rdp::gateway::Gateway;
+    use crate::rdp::share::Share;
     use crate::remote::trust::fingerprint;
     use crate::ssh::known_hosts::KnownHosts;
 
@@ -1080,6 +1157,9 @@ mod tests {
             height: 768,
             scale: 100,
             keyboard_layout: 0x409,
+            audio: false,
+            share: None,
+            gateway: None,
         }
     }
 
@@ -1178,6 +1258,11 @@ mod tests {
 
     type Attach = fn(ClientConnector) -> ClientConnector;
 
+    // What `attach` attaches with sound off.
+    fn muted(connector: ClientConnector) -> ClientConnector {
+        attach(&target(HOST, PORT), &Arc::default(), None)(connector)
+    }
+
     // The tick of the clipboard timeouts and how long a paste request may stay unanswered.
     type Clipboard = (Duration, Duration);
 
@@ -1211,7 +1296,16 @@ mod tests {
         let connected = logged_in_with(client, known, attach).await;
         let (sink, ops) = mpsc::unbounded_channel();
         let sink = move |op| sink.send(op).unwrap();
-        (Session::from_connected_within(connected, sink, RESIZE_LIMIT, None, tick, limit), ops)
+        let session = Session::from_connected_within(
+            connected,
+            Arc::default(),
+            sink,
+            RESIZE_LIMIT,
+            None,
+            tick,
+            limit,
+        );
+        (session, ops)
     }
 
     // A session against a server whose frames the test writes; `script` gets the stream once the
@@ -1315,7 +1409,7 @@ mod tests {
             }
             sink.send(op).unwrap();
         };
-        assert!(slot.set(Session::from_connected(connected, sink)).is_ok());
+        assert!(slot.set(Session::from_connected(connected, Arc::default(), sink)).is_ok());
 
         let mut expected = Screen::new(SIZE.0, SIZE.1);
         let mut screen = Screen::new(SIZE.0, SIZE.1);
@@ -1845,19 +1939,27 @@ mod tests {
             FrameOp::Rect { .. } => panic!("the sink broke"),
             op => sink.send(op).unwrap(),
         };
-        let session = Session::from_connected(connected, sink);
+        let session = Session::from_connected(connected, Arc::default(), sink);
         server.display.send(bitmap(0, 0, 8, 8, shade(1))).unwrap();
         assert_eq!(rest(&mut ops).await, [FrameOp::Closed(NOT_UNDERSTOOD.into())]);
         within(session.close()).await;
     }
 
     // The client lists its static channels by type id, and the server numbers them in that order.
+    // Type ids change with the compiler and the build settings, so the number is the channel's
+    // place among all that `muted` attaches.
+    fn muted_channel<T: 'static>() -> u16 {
+        let connector = muted(ClientConnector::new(config(&target(HOST, PORT)), local()));
+        let at = connector.static_channels.type_ids().position(|id| id == TypeId::of::<T>());
+        u16::try_from(at.unwrap()).unwrap()
+    }
+
     fn clipboard_channel() -> u16 {
-        u16::from(TypeId::of::<CliprdrClient>() > TypeId::of::<DrdynvcClient>())
+        muted_channel::<CliprdrClient>()
     }
 
     fn dynamic_channel() -> u16 {
-        1 - clipboard_channel()
+        muted_channel::<DrdynvcClient>()
     }
 
     // A Format Data Response whose channel message is `size` bytes long.
@@ -1913,7 +2015,7 @@ mod tests {
                     flood(&mut framed, &channels, channel, every_chunk_is_first).await;
                     framed
                 };
-                let rig = scripted_with(SIZE, attach, CLIPBOARD, script).await;
+                let rig = scripted_with(SIZE, muted, CLIPBOARD, script).await;
                 let (server, _session, mut ops) = rig;
                 let closed = [FrameOp::Closed(NOT_UNDERSTOOD.into())];
                 assert_eq!(rest(&mut ops).await, closed, "{channel} {every_chunk_is_first}");
@@ -1931,7 +2033,7 @@ mod tests {
             write(&mut framed, surface_bits(8, 8, 16, 16, shade(4))).await;
             framed
         };
-        let (server, _session, mut ops) = scripted_with(SIZE, attach, CLIPBOARD, script).await;
+        let (server, _session, mut ops) = scripted_with(SIZE, muted, CLIPBOARD, script).await;
         let mut expected = Screen::new(SIZE.0, SIZE.1);
         expected.paint(8, 8, 16, 16, shade(4));
         let mut screen = Screen::new(SIZE.0, SIZE.1);
@@ -2108,7 +2210,7 @@ mod tests {
             message(&mut framed, &channels, clipboard_channel(), &data, true).await;
             framed
         };
-        let (server, _session, mut ops) = scripted_with(SIZE, attach, CLIPBOARD, script).await;
+        let (server, _session, mut ops) = scripted_with(SIZE, muted, CLIPBOARD, script).await;
         assert_eq!(rest(&mut ops).await, [FrameOp::Closed(NOT_UNDERSTOOD.into())]);
         drop(within(server).await.unwrap());
     }
@@ -2122,7 +2224,7 @@ mod tests {
             write(&mut framed, surface_bits(8, 8, 16, 16, shade(4))).await;
             framed
         };
-        let (server, _session, mut ops) = scripted_with(SIZE, attach, CLIPBOARD, script).await;
+        let (server, _session, mut ops) = scripted_with(SIZE, muted, CLIPBOARD, script).await;
         let mut expected = Screen::new(SIZE.0, SIZE.1);
         expected.paint(8, 8, 16, 16, shade(4));
         let mut screen = Screen::new(SIZE.0, SIZE.1);
@@ -2453,7 +2555,7 @@ mod tests {
             write(&mut framed, surface_bits(8, 8, 16, 16, shade(4))).await;
             framed
         };
-        let (server, _session, mut ops) = scripted_with(SIZE, attach, CLIPBOARD, script).await;
+        let (server, _session, mut ops) = scripted_with(SIZE, muted, CLIPBOARD, script).await;
         let mut expected = Screen::new(SIZE.0, SIZE.1);
         expected.paint(8, 8, 16, 16, shade(4));
         let mut screen = Screen::new(SIZE.0, SIZE.1);
@@ -2502,7 +2604,7 @@ mod tests {
                 }
                 framed
             };
-            let (server, _session, mut ops) = scripted_with(SIZE, attach, CLIPBOARD, script).await;
+            let (server, _session, mut ops) = scripted_with(SIZE, muted, CLIPBOARD, script).await;
             assert_eq!(rest(&mut ops).await, [FrameOp::Closed(NOT_UNDERSTOOD.into())]);
             drop(within(server).await.unwrap());
         })
@@ -2593,7 +2695,7 @@ mod tests {
             ];
             reactivate_scripted(framed, &channels, acceptor, BIGGER, &between).await
         });
-        let (session, mut ops) = join_with(client, &pinned(HOST, PORT), attach, CLIPBOARD).await;
+        let (session, mut ops) = join_with(client, &pinned(HOST, PORT), muted, CLIPBOARD).await;
         let mut seen = Vec::new();
         while !seen.contains(&FrameOp::Clipboard("copied".into())) {
             let op = next(&mut ops).await;
@@ -2615,7 +2717,7 @@ mod tests {
             message(&mut framed, &channels, clipboard_channel(), &data, true).await;
             framed
         };
-        let (server, _session, mut ops) = scripted_with(SIZE, attach, CLIPBOARD, script).await;
+        let (server, _session, mut ops) = scripted_with(SIZE, muted, CLIPBOARD, script).await;
         assert_eq!(rest(&mut ops).await, [FrameOp::Closed(NOT_UNDERSTOOD.into())]);
         drop(within(server).await.unwrap());
     }
@@ -2792,7 +2894,8 @@ mod tests {
         let ops = off_thread(Duration::from_secs(3), move || async move {
             let connected = logged_in(client, &known).await;
             let (sink, mut ops) = mpsc::unbounded_channel();
-            let session = Session::from_connected(connected, move |op| sink.send(op).unwrap());
+            let sink = move |op| sink.send(op).unwrap();
+            let session = Session::from_connected(connected, Arc::default(), sink);
             let mut left = Vec::new();
             let wait = Duration::from_millis(500);
             while let Some(op) = timeout(wait, ops.recv()).await.unwrap_or(None) {
@@ -3297,6 +3400,7 @@ mod tests {
         let (sink, ops) = mpsc::unbounded_channel();
         let session = Session::from_connected_within(
             connected,
+            Arc::default(),
             move |op| sink.send(op).unwrap(),
             RESIZE_LIMIT,
             None,
@@ -3698,7 +3802,7 @@ mod tests {
             write(&mut framed, surface_bits(8, 8, 16, 16, shade(4))).await;
             framed
         };
-        let (server, _session, mut ops) = scripted_with(SIZE, attach, CLIPBOARD, script).await;
+        let (server, _session, mut ops) = scripted_with(SIZE, muted, CLIPBOARD, script).await;
         let mut expected = Screen::new(SIZE.0, SIZE.1);
         expected.paint(8, 8, 16, 16, shade(4));
         let mut screen = Screen::new(SIZE.0, SIZE.1);
@@ -3728,7 +3832,7 @@ mod tests {
             write(&mut framed, send(clip_pdu(5, RESPONSE_OK, &late))).await;
             framed
         };
-        let (server, _session, mut ops) = scripted_with(SIZE, attach, (tick, limit), script).await;
+        let (server, _session, mut ops) = scripted_with(SIZE, muted, (tick, limit), script).await;
         assert_eq!(next(&mut ops).await, FrameOp::Clipboard("late".into()));
         drop(within(server).await.unwrap());
     }
@@ -3769,12 +3873,13 @@ mod tests {
         let server = TestServer::on(options, stream).await;
         let (target, known) = (target(HOST, PORT), pinned(HOST, PORT));
         let sent = AtomicBool::default();
-        let connected = within(login(client, local(), &target, &known, attach, &sent)).await;
+        let connected = within(login(client, local(), &target, &known, muted, &sent)).await;
         let connected = connected.unwrap_or_else(|e| panic!("login failed: {e:?}"));
         let (sink, ops) = mpsc::unbounded_channel();
         let sink = move |op| sink.send(op).unwrap();
         let session = Session::from_connected_within(
             connected,
+            Arc::default(),
             sink,
             limit,
             first,
@@ -4148,10 +4253,11 @@ mod tests {
             });
             let (target, known) = (target(HOST, PORT), pinned(HOST, PORT));
             let sent = AtomicBool::default();
-            let connected = within(login(client, local(), &target, &known, attach, &sent)).await;
+            let connected = within(login(client, local(), &target, &known, muted, &sent)).await;
             let connected = connected.unwrap_or_else(|e| panic!("login failed: {e:?}"));
             let (sink, _ops) = mpsc::unbounded_channel();
-            let session = Session::from_connected(connected, move |op| sink.send(op).unwrap());
+            let sink = move |op| sink.send(op).unwrap();
+            let session = Session::from_connected(connected, Arc::default(), sink);
             session.resize(640, 480, 100).await.unwrap();
             session.resize(800, 600, 100).await.unwrap();
             assert!(within(quiet_rx).await.unwrap(), "the client wrote something");
@@ -4215,7 +4321,7 @@ mod tests {
             let after = layouts_and_acks(&mut framed, &channels, 300).await;
             (before, inside, after)
         };
-        let (server, session, mut ops) = scripted_with(SIZE, attach, CLIPBOARD, script).await;
+        let (server, session, mut ops) = scripted_with(SIZE, muted, CLIPBOARD, script).await;
         session.resize(640, 480, 100).await.unwrap();
         asked_tx.send(()).unwrap();
         drawn(&session, &mut ops).await;
@@ -4238,7 +4344,7 @@ mod tests {
             let after = layouts_and_acks(&mut framed, &channels, 300).await;
             (before, after)
         };
-        let (server, session, _ops) = scripted_with(SIZE, attach, CLIPBOARD, script).await;
+        let (server, session, _ops) = scripted_with(SIZE, muted, CLIPBOARD, script).await;
         session.resize(640, 480, 100).await.unwrap();
         asked_tx.send(()).unwrap();
         let (before, after) = within(server).await.unwrap();
@@ -4262,7 +4368,7 @@ mod tests {
             write(&mut framed, surface_bits(8, 8, 16, 16, shade(5))).await;
             layouts_and_acks(&mut framed, &channels, 300).await
         });
-        let (session, mut ops) = join_with(client, &pinned(HOST, PORT), attach, CLIPBOARD).await;
+        let (session, mut ops) = join_with(client, &pinned(HOST, PORT), muted, CLIPBOARD).await;
         assert_eq!(resized(&session, &mut ops).await, BIGGER);
         session.resize(640, 480, 100).await.unwrap();
         asked_tx.send(()).unwrap();
@@ -4282,7 +4388,7 @@ mod tests {
             let after = layouts_and_acks(&mut framed, &channels, 200).await;
             (before, after)
         };
-        let (server, session, _ops) = scripted_with(SIZE, attach, CLIPBOARD, script).await;
+        let (server, session, _ops) = scripted_with(SIZE, muted, CLIPBOARD, script).await;
         session.resize(640, 480, 100).await.unwrap();
         asked_tx.send(()).unwrap();
         let (before, after) = timeout(Duration::from_secs(60), server).await.unwrap().unwrap();
@@ -4303,7 +4409,7 @@ mod tests {
             let after = layouts_and_acks(&mut framed, &channels, 200).await;
             (before, after)
         };
-        let (server, session, mut ops) = scripted_with(SIZE, attach, CLIPBOARD, script).await;
+        let (server, session, mut ops) = scripted_with(SIZE, muted, CLIPBOARD, script).await;
         drawn(&session, &mut ops).await;
         session.resize(640, 480, 100).await.unwrap();
         asked_tx.send(()).unwrap();
@@ -4329,12 +4435,226 @@ mod tests {
             let after = layouts_and_acks(&mut framed, &channels, 300).await;
             (before, after)
         });
-        let (session, mut ops) = join_with(client, &pinned(HOST, PORT), attach, CLIPBOARD).await;
+        let (session, mut ops) = join_with(client, &pinned(HOST, PORT), muted, CLIPBOARD).await;
         assert_eq!(resized(&session, &mut ops).await, BIGGER);
         session.resize(640, 480, 100).await.unwrap();
         asked_tx.send(()).unwrap();
         let (before, after) = within(server).await.unwrap();
         assert_eq!(before, []);
         assert_eq!(after, [ClientPdu::Layout]);
+    }
+
+    // A session with `attach` and sound as `audio` says, against a scripted server that also tells
+    // what the client asked for.
+    async fn sounding<T, Fut>(
+        audio: bool,
+        script: impl FnOnce(ScriptedFramed<DuplexStream>, Channels, Asked) -> Fut + Send + 'static,
+    ) -> (JoinHandle<T>, Session, Ops)
+    where
+        T: Send + 'static,
+        Fut: Future<Output = T> + Send + 'static,
+    {
+        let (client, stream) = duplex(1 << 16);
+        let server = tokio::spawn(async move {
+            let (framed, channels, asked) = accept_scripted_asking(stream, SIZE).await;
+            script(framed, channels, asked).await
+        });
+        let target = Target { audio, ..target(HOST, PORT) };
+        let (known, sent, played) = (pinned(HOST, PORT), AtomicBool::default(), Arc::default());
+        let attach = attach(&target, &played, None);
+        let connected = within(login(client, local(), &target, &known, attach, &sent)).await;
+        let connected = connected.unwrap_or_else(|e| panic!("login failed: {e:?}"));
+        let (sink, ops) = mpsc::unbounded_channel();
+        let sink = move |op| sink.send(op).unwrap();
+        (server, Session::from_connected(connected, played, sink), ops)
+    }
+
+    fn listed(asked: &Asked) -> Vec<&str> {
+        let mut names: Vec<_> = asked.channels.iter().map(String::as_str).collect();
+        names.sort_unstable();
+        names
+    }
+
+    // The server plays `pdus` on the sound channel, then draws a square that the test waits for.
+    async fn played_through(pdus: Vec<Vec<u8>>) -> (Session, Asked) {
+        let (server, session, mut ops) = sounding(true, |mut framed, channels, asked| async move {
+            let sound = asked.sound().expect("the client asked for no sound channel");
+            for pdu in pdus {
+                message(&mut framed, &channels, sound, &pdu, true).await;
+            }
+            write(&mut framed, surface_bits(8, 8, 16, 16, shade(3))).await;
+            (framed, asked)
+        })
+        .await;
+        let mut expected = Screen::new(SIZE.0, SIZE.1);
+        expected.paint(8, 8, 16, 16, shade(3));
+        let mut screen = Screen::new(SIZE.0, SIZE.1);
+        while screen.rgba != expected.rgba {
+            flush(&mut ops, &mut screen).await;
+        }
+        quiet(&mut ops).await;
+        let (_framed, asked) = within(server).await.unwrap();
+        (session, asked)
+    }
+
+    #[tokio::test]
+    async fn audio_on_plays_what_the_server_sends() {
+        let silence = [0; 4096];
+        let mut pdus = vec![sound_formats(Version::V8, windows_formats()), sound_training()];
+        pdus.extend((1..=3).map(|block| wave2(u16::from(block) * 93, block, &silence)));
+        let (session, asked) = played_through(pdus).await;
+        assert_eq!(session.played(), 3 * 4096);
+        assert!(!asked.flags.contains(ClientInfoFlags::NO_AUDIO_PLAYBACK));
+        assert_eq!(listed(&asked), ["cliprdr", "drdynvc", "rdpdr", "rdpsnd"]);
+    }
+
+    #[tokio::test]
+    async fn wave_info_and_wave_do_not_end_the_session() {
+        let silence = [0; 8192];
+        let mut pdus = vec![sound_formats(Version::V5, xrdp_formats()), sound_training()];
+        for block in 1..=3 {
+            pdus.push(wave_info(u16::from(block) * 42, block, &silence));
+            pdus.push(wave(&silence));
+        }
+        let (session, _asked) = played_through(pdus).await;
+        assert_eq!(session.played(), 3 * 8192);
+    }
+
+    #[tokio::test]
+    async fn audio_off_asks_for_no_sound() {
+        let (server, session, _ops) =
+            sounding(false, |framed, _channels, asked| async move { (framed, asked) }).await;
+        let (_framed, asked) = within(server).await.unwrap();
+        assert!(asked.flags.contains(ClientInfoFlags::NO_AUDIO_PLAYBACK));
+        assert_eq!(listed(&asked), ["cliprdr", "drdynvc", "rdpsnd"]);
+        assert_eq!(session.played(), 0);
+    }
+
+    // A connect with `share` to a port nobody listens on: what it gives, after checking that
+    // nothing was sent.
+    async fn shared_to_nowhere(share: Share<'_>) -> AppError {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let target = Target { share: Some(share), ..target("127.0.0.1", port) };
+        let (known, sent) = (pinned("127.0.0.1", port), AtomicBool::default());
+        let (sink, mut ops) = mpsc::unbounded_channel();
+        let sink = move |op| sink.send(op).unwrap();
+        let connecting = Session::connect(&target, &known, sink, &sent);
+        let session = timeout(WAIT, connecting).await.expect("connect hung");
+        let refused = session.err().expect("the connect worked");
+        assert!(!sent.load(Ordering::Relaxed));
+        assert_eq!(rest(&mut ops).await, []);
+        refused
+    }
+
+    #[tokio::test]
+    async fn a_missing_shared_folder_stops_the_connect_before_any_network_activity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (missing, file) = (dir.path().join("missing"), dir.path().join("file.txt"));
+        std::fs::write(&file, "not a folder").unwrap();
+        for root in [&missing, &file] {
+            let refused = shared_to_nowhere(Share { root, name: "wisp" }).await;
+            let folder = root.display();
+            let expected =
+                format!("rdp: the shared folder {folder} does not exist on this computer");
+            assert_eq!(text(&refused), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_invalid_share_name_stops_the_connect() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["", "toolong8", "wi sp", "w\u{ef}sp", "a/b"] {
+            let refused = shared_to_nowhere(Share { root: dir.path(), name }).await;
+            let expected = "rdp: a share name has 1 to 7 letters, digits, - or _";
+            assert_eq!(text(&refused), expected, "{name:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_share_that_cannot_work_stops_the_connect_before_the_gateway_is_asked() {
+        let gateway = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = gateway.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let shares = [Share { root: &missing, name: "wisp" }, Share { root: dir.path(), name: "" }];
+        for share in shares {
+            let through = Some(Gateway { host: "127.0.0.1", port, username: "gw", password: "pw" });
+            let target = Target { share: Some(share), gateway: through, ..target(HOST, PORT) };
+            let (known, sent) = (pinned(HOST, PORT), AtomicBool::default());
+            let connecting = Session::connect(&target, &known, |_| {}, &sent);
+            let refused = timeout(WAIT, connecting).await.expect("connect hung");
+            assert!(text(&refused.err().expect("the connect worked")).contains("share"));
+        }
+        let asked = timeout(Duration::from_millis(200), gateway.accept()).await;
+        assert!(asked.is_err(), "the gateway was asked");
+    }
+
+    // A session with `attach`, a shared folder and sound as `audio` says, against a scripted
+    // server that also tells what the client asked for.
+    async fn sharing<T, Fut>(
+        audio: bool,
+        script: impl FnOnce(ScriptedFramed<DuplexStream>, Channels, Asked) -> Fut + Send + 'static,
+    ) -> (JoinHandle<T>, Session, Ops, tempfile::TempDir)
+    where
+        T: Send + 'static,
+        Fut: Future<Output = T> + Send + 'static,
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let (client, stream) = duplex(1 << 16);
+        let server = tokio::spawn(async move {
+            let (framed, channels, asked) = accept_scripted_asking(stream, SIZE).await;
+            script(framed, channels, asked).await
+        });
+        let share = Some(Share { root: &root, name: "wisp" });
+        let target = Target { audio, share, ..target(HOST, PORT) };
+        let (known, sent, played) = (pinned(HOST, PORT), AtomicBool::default(), Arc::default());
+        let attach = attach(&target, &played, Some(root.clone()));
+        let connected = within(login(client, local(), &target, &known, attach, &sent)).await;
+        let connected = connected.unwrap_or_else(|e| panic!("login failed: {e:?}"));
+        let (sink, ops) = mpsc::unbounded_channel();
+        let sink = move |op| sink.send(op).unwrap();
+        (server, Session::from_connected(connected, played, sink), ops, dir)
+    }
+
+    #[tokio::test]
+    async fn a_share_attaches_the_drive_and_a_sound_channel_even_with_sound_off() {
+        for audio in [false, true] {
+            let script = |framed, _channels, asked| async move { (framed, asked) };
+            let (server, _session, _ops, _dir) = sharing(audio, script).await;
+            let (_framed, asked) = within(server).await.unwrap();
+            assert_eq!(listed(&asked), ["cliprdr", "drdynvc", "rdpdr", "rdpsnd"], "{audio}");
+            let silent = asked.flags.contains(ClientInfoFlags::NO_AUDIO_PLAYBACK);
+            assert_eq!(silent, !audio);
+        }
+    }
+
+    #[tokio::test]
+    async fn drive_requests_the_crate_cannot_decode_do_not_end_the_session() {
+        let script = |mut framed, channels, asked: Asked| async move {
+            let drive = asked.channels.iter().position(|name| name == "rdpdr").unwrap();
+            // FLUSH_BUFFERS, QUERY_SECURITY, SET_SECURITY, SET_VOLUME_INFORMATION, LOCK_CONTROL
+            for (completion, major) in [0x09u32, 0x14, 0x15, 0x0b, 0x11].into_iter().enumerate() {
+                let mut irp = vec![0x72, 0x44, 0x52, 0x49];
+                for field in [1, 0, completion as u32, major, 0] {
+                    irp.extend(field.to_le_bytes());
+                }
+                irp.extend([0; 32]);
+                message(&mut framed, &channels, drive as u16, &irp, true).await;
+            }
+            write(&mut framed, surface_bits(8, 8, 16, 16, shade(4))).await;
+            framed
+        };
+        let (server, _session, mut ops, _dir) = sharing(false, script).await;
+        let mut expected = Screen::new(SIZE.0, SIZE.1);
+        expected.paint(8, 8, 16, 16, shade(4));
+        let mut screen = Screen::new(SIZE.0, SIZE.1);
+        while screen.rgba != expected.rgba {
+            flush(&mut ops, &mut screen).await;
+        }
+        quiet(&mut ops).await;
+        drop(within(server).await.unwrap());
     }
 }

@@ -8,10 +8,12 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use super::bundle::{KeyFile, Payload};
-use super::plan::{digest, field, group_depth, plan, same_tunnel, Plan};
+use super::plan::{digest, field, gateway_secret, group_depth, plan, same_tunnel, Plan};
 use super::{ApplySummary, Env, ItemDecision, ItemKind, ItemProblem, ReviewItem};
 use crate::error::{AppError, AppResult};
-use crate::store::model::{AuthMethod, Group, IconRef, Profile, ProfileKey, ProfileStore, Tunnel};
+use crate::store::model::{
+    AuthMethod, Group, IconRef, Profile, ProfileKey, ProfileStore, RdpGateway, Tunnel,
+};
 use crate::store::{normalize_keys, Store};
 use crate::vault::Vault;
 
@@ -607,6 +609,8 @@ pub fn stage(
                         field::USERNAME => next.username = inc.username.clone(),
                         field::DOMAIN => next.domain = inc.domain.clone(),
                         field::KEYBOARD_LAYOUT => next.keyboard_layout = inc.keyboard_layout,
+                        field::AUDIO => next.audio = inc.audio,
+                        field::SHARED_FOLDER => next.shared_folder = inc.shared_folder.clone(),
                         field::ICON => next.icon = inc.icon.clone(),
                         field::PASSWORD => {
                             s.replaced.extend(next.secret_id.take());
@@ -614,6 +618,28 @@ pub fn stage(
                         }
                         _ => {}
                     }
+                }
+                // The password lands on the gateway the profile ends up with, so it waits for the
+                // gateway row.
+                let old = next.gateway.as_ref().and_then(|g| g.secret_id.clone());
+                if fields.contains(field::GATEWAY) {
+                    let kept = gateway_secret(next.gateway.as_ref()).map(str::to_string);
+                    next.gateway = inc.gateway.clone().map(|g| RdpGateway {
+                        secret_id: if g.same_login { None } else { kept },
+                        ..g
+                    });
+                }
+                if fields.contains(field::GATEWAY_PASSWORD) {
+                    match next.gateway.as_mut().filter(|g| !g.same_login) {
+                        Some(g) => g.secret_id = s.secret(gateway_secret(inc.gateway.as_ref())),
+                        None => s.problem(
+                            &key,
+                            "Gateway password needs the incoming RD Gateway".into(),
+                        ),
+                    }
+                }
+                if old.as_deref() != next.gateway.as_ref().and_then(|g| g.secret_id.as_deref()) {
+                    s.replaced.extend(old);
                 }
                 if let Some(slot) = s.data.rdp_profiles.iter_mut().find(|x| x.id == local_id) {
                     *slot = next;
@@ -625,11 +651,19 @@ pub fn stage(
                 let id =
                     s.final_id(ItemKind::Rdp, &inc.id).expect("accepted rdp profile has an id");
                 let secret_id = s.secret(inc.secret_id.as_deref());
+                let gateway = inc.gateway.clone().map(|g| RdpGateway {
+                    secret_id: s.secret(gateway_secret(Some(&g))),
+                    ..g
+                });
+                let shared_folder =
+                    inc.shared_folder.clone().filter(|f| s.env.dir_exists(&f.path));
                 let order = s.data.rdp_profiles.iter().map(|x| x.order + 1).max().unwrap_or(0);
                 let icon = s.icon(&inc.icon);
                 s.data.rdp_profiles.push(crate::store::model::RdpProfile {
                     id: id.clone(),
                     secret_id,
+                    shared_folder,
+                    gateway,
                     icon,
                     order,
                     ..inc.clone()
@@ -796,6 +830,9 @@ fn substitute(data: &mut ProfileStore, secrets: &[String], keys: &[String]) {
     }
     for p in data.rdp_profiles.iter_mut() {
         fix(&mut p.secret_id);
+        if let Some(g) = p.gateway.as_mut() {
+            fix(&mut g.secret_id);
+        }
     }
 }
 
@@ -900,8 +937,8 @@ pub fn remove_unreferenced_keys(keys_dir: &Path, previous: &[ProfileKey], data: 
 mod tests {
     use super::*;
     use crate::store::model::{
-        AuthMethod, Group, IconRef, Profile, ProfileKey, RdpProfile, S3Profile, SftpProfile,
-        VncProfile,
+        AuthMethod, Group, IconRef, Profile, ProfileKey, RdpGateway, RdpProfile, S3Profile,
+        SftpProfile, SharedFolder, VncProfile,
     };
     use crate::transfer::bundle::KeyFile;
     use crate::transfer::plan::plan;
@@ -987,6 +1024,9 @@ mod tests {
             domain: None,
             secret_id: None,
             keyboard_layout: None,
+            audio: true,
+            shared_folder: None,
+            gateway: None,
             icon: IconRef::default(),
             order: 0,
             extra: Default::default(),
@@ -1519,6 +1559,9 @@ mod tests {
             domain: None,
             secret_id: Some(v.set_secret(b"pw").unwrap()),
             keyboard_layout: Some(0x407),
+            audio: true,
+            shared_folder: None,
+            gateway: None,
             icon: IconRef::Custom { path: "icons/6f1c2a9e-8d0b-4c57-9a3e-2b7d5e41f0c8.png".into() },
             order: 3,
             extra: Default::default(),
@@ -1907,6 +1950,278 @@ mod tests {
         assert!(execute(&mut store, &mut v, &dir.path().join("keys"), staged).is_err());
         assert_eq!((store.snapshot(), on_disk("profiles.json"), on_disk("vault.enc")), before);
         assert_eq!(v.get_secret(&old).unwrap().as_slice(), b"old");
+    }
+
+    fn gateway(same_login: bool, username: &str, secret: Option<&str>) -> RdpGateway {
+        RdpGateway {
+            host: "gw.corp".into(),
+            port: 443,
+            same_login,
+            username: username.into(),
+            secret_id: secret.map(Into::into),
+            extra: Default::default(),
+        }
+    }
+
+    fn share() -> SharedFolder {
+        SharedFolder {
+            path: "/home/faye/share".into(),
+            name: "faye".into(),
+            extra: Default::default(),
+        }
+    }
+
+    #[test]
+    fn matched_rdp_profile_takes_sound_and_the_shared_folder_when_accepted() {
+        let pc = rdp("pc", "office", "h1");
+        let mac = RdpProfile { audio: false, shared_folder: Some(share()), ..pc.clone() };
+        let payload = Payload { rdp_profiles: vec![mac.clone()], ..Default::default() };
+        let local = ProfileStore { rdp_profiles: vec![pc.clone()], ..store_of(vec![]) };
+        let mut env = MapEnv::default();
+        env.dirs.insert("/home/faye/share".into());
+        let planned = plan(&local, &payload, &env);
+
+        let staged = stage(&local, &payload, &planned, &[accept("rdp:pc", &["audio"])], &env);
+        let sound_off = RdpProfile { audio: false, ..pc.clone() };
+        assert_eq!(staged.unwrap().data.rdp_profiles, [sound_off]);
+
+        let both = [accept("rdp:pc", &["audio", "sharedFolder"])];
+        let staged = stage(&local, &payload, &planned, &both, &env).unwrap();
+        assert_eq!(staged.data.rdp_profiles, [mac]);
+        assert_eq!(staged.summary, ApplySummary { added: 0, updated: 1 });
+    }
+
+    // A stored RDP profile with `local` as its gateway and the same profile from another machine
+    // with `incoming`, whose gateway password "mac-gw" the export carries.
+    fn stage_gateway(
+        local: Option<RdpGateway>,
+        incoming: Option<RdpGateway>,
+        fields: &[&str],
+    ) -> Result<Staged, Vec<ItemProblem>> {
+        let pc = RdpProfile { gateway: local, ..rdp("pc", "office", "h1") };
+        let mac = RdpProfile { gateway: incoming, ..pc.clone() };
+        let mut payload = Payload { rdp_profiles: vec![mac], ..Default::default() };
+        payload.secrets.insert("mac-gw".into(), Zeroizing::new("new".into()));
+        let local = ProfileStore { rdp_profiles: vec![pc], ..store_of(vec![]) };
+        let mut env = MapEnv::default();
+        env.secrets.insert("old-gw".into(), b"old".to_vec());
+        let planned = plan(&local, &payload, &env);
+        let offered: Vec<_> = planned.items[0].fields.iter().map(|f| f.field.as_str()).collect();
+        for field in fields {
+            assert!(offered.contains(field), "{field} is not offered: {offered:?}");
+        }
+        stage(&local, &payload, &planned, &[accept("rdp:pc", fields)], &env)
+    }
+
+    #[test]
+    fn accepted_gateway_keeps_the_local_gateway_password_when_both_use_their_own_login() {
+        let local = gateway(false, "CORP\\gw", Some("old-gw"));
+        let incoming = gateway(false, "CORP\\other", Some("mac-gw"));
+        let staged = stage_gateway(Some(local), Some(incoming), &["gateway"]).unwrap();
+        let kept = gateway(false, "CORP\\other", Some("old-gw"));
+        assert_eq!(staged.data.rdp_profiles[0].gateway, Some(kept));
+        assert!(staged.secrets.is_empty() && staged.replaced_secrets.is_empty());
+    }
+
+    #[test]
+    fn accepted_gateway_without_its_own_login_drops_the_local_gateway_password() {
+        let local = || Some(gateway(false, "CORP\\gw", Some("old-gw")));
+        let staged = stage_gateway(local(), None, &["gateway"]).unwrap();
+        assert_eq!(staged.data.rdp_profiles[0].gateway, None);
+        assert!(staged.secrets.is_empty());
+        assert_eq!(staged.replaced_secrets, ["old-gw"]);
+
+        let same = gateway(true, "", None);
+        let staged = stage_gateway(local(), Some(same.clone()), &["gateway"]).unwrap();
+        assert_eq!(staged.data.rdp_profiles[0].gateway, Some(same));
+        assert!(staged.secrets.is_empty());
+        assert_eq!(staged.replaced_secrets, ["old-gw"]);
+    }
+
+    #[test]
+    fn accepted_gateway_password_is_stored_anew_and_replaces_the_local_one() {
+        let local = || Some(gateway(false, "CORP\\gw", Some("old-gw")));
+        let incoming = || Some(gateway(false, "CORP\\other", Some("mac-gw")));
+        let placeholder = Some(format!("{SECRET_PREFIX}0"));
+
+        let both = ["gateway", "gatewayPassword"];
+        let staged = stage_gateway(local(), incoming(), &both).unwrap();
+        let taken = RdpGateway { secret_id: placeholder.clone(), ..incoming().unwrap() };
+        assert_eq!(staged.data.rdp_profiles[0].gateway, Some(taken));
+        assert_eq!(staged.secrets[0].as_str(), "new");
+        assert_eq!(staged.replaced_secrets, ["old-gw"]);
+
+        // Only the password: the local gateway stays, with the new password.
+        let staged = stage_gateway(local(), incoming(), &["gatewayPassword"]).unwrap();
+        let kept = RdpGateway { secret_id: placeholder.clone(), ..local().unwrap() };
+        assert_eq!(staged.data.rdp_profiles[0].gateway, Some(kept));
+        assert_eq!(staged.secrets[0].as_str(), "new");
+        assert_eq!(staged.replaced_secrets, ["old-gw"]);
+
+        // No gateway here yet: nothing to replace.
+        let staged = stage_gateway(None, incoming(), &both).unwrap();
+        let added = RdpGateway { secret_id: placeholder, ..incoming().unwrap() };
+        assert_eq!(staged.data.rdp_profiles[0].gateway, Some(added));
+        assert_eq!(staged.secrets[0].as_str(), "new");
+        assert!(staged.replaced_secrets.is_empty());
+
+        let staged = stage_gateway(None, incoming(), &["gateway"]).unwrap();
+        let without = RdpGateway { secret_id: None, ..incoming().unwrap() };
+        assert_eq!(staged.data.rdp_profiles[0].gateway, Some(without));
+        assert!(staged.secrets.is_empty() && staged.replaced_secrets.is_empty());
+    }
+
+    #[test]
+    fn gateway_password_without_a_gateway_of_its_own_login_is_a_problem() {
+        let incoming = || Some(gateway(false, "CORP\\other", Some("mac-gw")));
+        for local in [None, Some(gateway(true, "", None))] {
+            let problems = stage_gateway(local.clone(), incoming(), &["gatewayPassword"])
+                .err()
+                .unwrap_or_else(|| panic!("accepted with {local:?}"));
+            assert_eq!(
+                problems,
+                [ItemProblem {
+                    key: "rdp:pc".into(),
+                    message: "Gateway password needs the incoming RD Gateway".into(),
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn new_rdp_profile_brings_its_gateway_password_and_a_shared_folder_that_is_here() {
+        let inc = RdpProfile {
+            secret_id: Some("mac-pw".into()),
+            shared_folder: Some(share()),
+            gateway: Some(gateway(false, "CORP\\gw", Some("mac-gw"))),
+            ..rdp("r", "office", "h9")
+        };
+        let mut payload = Payload { rdp_profiles: vec![inc.clone()], ..Default::default() };
+        payload.secrets.insert("mac-pw".into(), Zeroizing::new("pw".into()));
+        payload.secrets.insert("mac-gw".into(), Zeroizing::new("gw".into()));
+        let local = store_of(vec![]);
+        let mut env = MapEnv::default();
+        env.dirs.insert("/home/faye/share".into());
+        let planned = plan(&local, &payload, &env);
+        let staged = stage(&local, &payload, &planned, &[accept("rdp:r", &[])], &env).unwrap();
+        let p = &staged.data.rdp_profiles[0];
+        assert_eq!(p.shared_folder, Some(share()));
+        let gateway_secret = p.gateway.as_ref().unwrap().secret_id.clone().unwrap();
+        assert!(gateway_secret.starts_with(SECRET_PREFIX));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        let mut v = vault(dir.path());
+        execute(&mut store, &mut v, &dir.path().join("keys"), staged).unwrap();
+        let p = &store.rdp_profiles()[0];
+        let gw = p.gateway.as_ref().unwrap();
+        assert_eq!(v.get_secret(gw.secret_id.as_deref().unwrap()).unwrap().as_slice(), b"gw");
+        assert_eq!(v.get_secret(p.secret_id.as_deref().unwrap()).unwrap().as_slice(), b"pw");
+        let same_secrets = RdpProfile {
+            secret_id: inc.secret_id.clone(),
+            gateway: inc.gateway.clone(),
+            ..p.clone()
+        };
+        assert_eq!(same_secrets, inc);
+        assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().rdp_profiles(), [p.clone()]);
+    }
+
+    #[test]
+    fn new_rdp_profile_has_no_gateway_password_the_bundle_does_not_bring() {
+        for (gw, carried) in [
+            (gateway(false, "CORP\\gw", Some("mac-gw")), false),
+            (gateway(true, "", Some("mac-gw")), true),
+        ] {
+            let inc = RdpProfile { gateway: Some(gw.clone()), ..rdp("r", "office", "h9") };
+            let mut payload = Payload { rdp_profiles: vec![inc], ..Default::default() };
+            if carried {
+                payload.secrets.insert("mac-gw".into(), Zeroizing::new("gw".into()));
+            }
+            let staged = run(&store_of(vec![]), &payload, &[accept("rdp:r", &[])]).unwrap();
+            let none = RdpGateway { secret_id: None, ..gw };
+            assert_eq!(staged.data.rdp_profiles[0].gateway, Some(none));
+            assert!(staged.secrets.is_empty());
+        }
+    }
+
+    #[test]
+    fn rdp_profile_added_without_a_shared_folder_that_is_not_here() {
+        let inc = RdpProfile { shared_folder: Some(share()), ..rdp("r", "office", "h9") };
+        let payload = Payload { rdp_profiles: vec![inc.clone()], ..Default::default() };
+        let staged = run(&store_of(vec![]), &payload, &[accept("rdp:r", &[])]).unwrap();
+        assert_eq!(staged.data.rdp_profiles[0], RdpProfile { shared_folder: None, ..inc });
+
+        // The same for a match the user adds as new.
+        let pc = RdpProfile { shared_folder: None, ..rdp("pc", "office", "h1") };
+        let mac = RdpProfile { shared_folder: Some(share()), port: 3390, ..pc.clone() };
+        let payload = Payload { rdp_profiles: vec![mac], ..Default::default() };
+        let local = ProfileStore { rdp_profiles: vec![pc.clone()], ..store_of(vec![]) };
+        let d = ItemDecision { key: "rdp:pc".into(), accept: true, as_new: true, fields: vec![] };
+        let staged = run(&local, &payload, &[d]).unwrap();
+        assert_eq!(staged.data.rdp_profiles[0], pc);
+        let added = &staged.data.rdp_profiles[1];
+        assert_eq!((added.port, &added.shared_folder), (3390, &None));
+    }
+
+    // A stored RDP profile whose gateway password is in the vault, and an import that takes the
+    // `fields` of the same profile from another machine with `incoming` as its gateway.
+    fn rdp_gateway_import(
+        dir: &std::path::Path,
+        incoming: Option<RdpGateway>,
+        fields: &[&str],
+    ) -> (Store, Vault, String, Staged) {
+        let mut store = Store::load(dir.to_path_buf()).unwrap();
+        let mut v = vault(dir);
+        let old = v.set_secret(b"old").unwrap();
+        let gw = gateway(false, "CORP\\gw", Some(&old));
+        let pc = RdpProfile { gateway: Some(gw), ..rdp("pc", "office", "h1") };
+        store.upsert_rdp_profile(pc).unwrap();
+        let mac = RdpProfile { gateway: incoming, ..rdp("mac", "office", "h1") };
+        let mut payload = Payload { rdp_profiles: vec![mac], ..Default::default() };
+        payload.secrets.insert("mac-gw".into(), Zeroizing::new("new".into()));
+        let staged = run(&store.snapshot(), &payload, &[accept("rdp:mac", fields)]).unwrap();
+        assert_eq!(staged.replaced_secrets, [old.clone()]);
+        (store, v, old, staged)
+    }
+
+    fn gateway_imports() -> [(Option<RdpGateway>, &'static [&'static str]); 3] {
+        [
+            (Some(gateway(false, "CORP\\gw", Some("mac-gw"))), &["gatewayPassword"]),
+            (None, &["gateway"]),
+            (Some(gateway(true, "", None)), &["gateway"]),
+        ]
+    }
+
+    #[test]
+    fn rdp_gateway_import_deletes_the_replaced_gateway_password_after_the_commit() {
+        for (incoming, fields) in gateway_imports() {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut store, mut v, old, staged) = rdp_gateway_import(dir.path(), incoming, fields);
+            execute(&mut store, &mut v, &dir.path().join("keys"), staged).unwrap();
+            assert!(!v.has_secret(&old), "{fields:?}");
+            let p = &store.rdp_profiles()[0];
+            match p.gateway.as_ref().and_then(|g| g.secret_id.as_deref()) {
+                Some(id) => assert_eq!(v.get_secret(id).unwrap().as_slice(), b"new"),
+                None => assert_eq!(fields, ["gateway"]),
+            }
+            assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().rdp_profiles(), [p.clone()]);
+        }
+    }
+
+    #[test]
+    fn failed_rdp_gateway_import_leaves_the_store_and_the_vault_as_they_were() {
+        for (incoming, fields) in gateway_imports() {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut store, mut v, old, staged) = rdp_gateway_import(dir.path(), incoming, fields);
+            let on_disk = |name: &str| std::fs::read(dir.path().join(name)).unwrap();
+            let before = (store.snapshot(), on_disk("profiles.json"), on_disk("vault.enc"));
+            // A directory where the temp file should be makes the store write fail.
+            std::fs::create_dir(dir.path().join("profiles.json.tmp")).unwrap();
+            assert!(execute(&mut store, &mut v, &dir.path().join("keys"), staged).is_err());
+            let after = (store.snapshot(), on_disk("profiles.json"), on_disk("vault.enc"));
+            assert_eq!(after, before, "{fields:?}");
+            assert_eq!(v.get_secret(&old).unwrap().as_slice(), b"old");
+        }
     }
 
     #[test]

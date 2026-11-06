@@ -492,7 +492,7 @@ docker compose -f test-env/docker-compose.yml up -d --build xrdp
 cargo test --manifest-path src-tauri/Cargo.toml --test live_rdp -- --ignored --test-threads=1
 ```
 
-A run of `src-tauri/tests/live_rdp.rs` takes about 20 s. It stops and starts the container once.
+A run of `src-tauri/tests/live_rdp.rs` takes about 40 s. It stops and starts the container once.
 
 ### Security
 
@@ -594,6 +594,45 @@ an `OK` button. The log has the same line. The connection stays open; nothing en
 - The log is `/var/log/xrdp.log` (and `/var/log/xrdp-sesman.log`), not `docker logs`; console
   logging did not reach `docker logs`. The files stay across restarts of the container, so the
   tests read only the lines after a count they take first.
+
+### Sound and the shared folder
+
+Measured on 2026-11-06 with the app's client and the same Debian 13.7 and xrdp 0.10.1. The image
+adds pipewire 1.4.2 (`pipewire`, `pipewire-bin`, `wireplumber`, `pipewire-pulse`),
+`pipewire-module-xrdp` 0.2 and `fuse3` 3.17.2.
+
+- Sound: xrdp's channel server (`xrdp-chansrv`) sends the client what the session's sound server
+  plays into it. Debian 13 has no `pulseaudio-module-xrdp`, only `pipewire-module-xrdp`.
+  `startwm.sh` starts a D-Bus session bus, `pipewire`, `wireplumber` and `pipewire-pulse`, then
+  `/usr/libexec/pipewire-module-xrdp/load_pw_modules.sh`, which does nothing when pipewire does
+  not answer yet (hence the sleeps). The bus comes from `dbus-daemon`: `dbus-launch` is in
+  `dbus-x11`, which is not installed. The output goes to `/tmp/pipewire.log`,
+  `/tmp/wireplumber.log`, `/tmp/pipewire-pulse.log` and `/tmp/load_pw_modules.log`; lines about
+  the missing system bus and realtime scheduling are expected in a container. About 2 s after a
+  session starts, its sink is there:
+
+  ```bash
+  docker exec -u wisp -e XDG_RUNTIME_DIR=/tmp/xdg-1000 wisp-test-xrdp pw-cli ls Node
+  ```
+
+  lists `xrdp-sink` (`Audio/Sink`) and `xrdp-source` (`Audio/Source`). The tests play two
+  seconds of silence into it, so that nothing is heard on the machine running them:
+  `head -c 352800 /dev/zero | pw-cat -p -a --target xrdp-sink --rate 44100 --channels 2 --format s16 -`
+  with the same `XDG_RUNTIME_DIR`.
+- xrdp offers its formats as the client connects, and the client takes PCM 44100 Hz, 2 channels,
+  16 bit (`sound_process_output_format: wFormatNo 0` in `~/.local/share/xrdp/xrdp-chansrv.10.log`;
+  `sound_process_training` logs a round trip of 1 to 200 ms). The two seconds arrive as 43 or 44
+  blocks of 8192 bytes, 352256 or 360448 bytes.
+- Shared folder: chansrv mounts `~/thinclient_drives` with FUSE when the client announces a drive,
+  and shows it as a folder named after the share, `~/thinclient_drives/wisp`, next to a
+  `.clipboard` folder. For the mount the compose service passes `/dev/fuse` and adds `SYS_ADMIN`,
+  and chansrv needs a setuid `fusermount` on its PATH: `fuse3` ships `/usr/bin/fusermount` as a
+  link to the setuid `fusermount3`, which is enough. While the connection is up, `mount` shows
+  `xrdp-chansrv on /home/wisp/thinclient_drives type fuse.xrdp-chansrv (rw,nosuid,nodev,...)`;
+  after it closed, the mount is gone. What the client refuses (a link out of the share, a name
+  with `:`) fails inside with `Permission denied`.
+- The client opens the sound channel even with sound off, as xrdp 0.10.1's `xrdp-chansrv` exits
+  when a connection without it closes after one with it in the same session.
 
 ## Windows Server VM
 

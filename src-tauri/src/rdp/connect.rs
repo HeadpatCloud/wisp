@@ -26,6 +26,8 @@ use tokio_rustls::TlsConnector;
 use x509_cert::der::Decode as _;
 
 use super::err;
+use super::gateway::Gateway;
+use super::share::Share;
 use crate::commands::ssh_cmds::KnownHostsState;
 use crate::error::{AppError, AppResult};
 use crate::remote::tls;
@@ -49,6 +51,9 @@ pub struct Target<'a> {
     pub height: u16,
     pub scale: u32,
     pub keyboard_layout: u32,
+    pub audio: bool,
+    pub share: Option<Share<'a>>,
+    pub gateway: Option<Gateway<'a>>,
 }
 
 pub(crate) struct Connected<S> {
@@ -95,7 +100,7 @@ pub(crate) fn config(target: &Target<'_>) -> Config {
         // The user name goes out only after the certificate has been checked.
         request_data: Some(NegoRequestData::cookie("wisp".to_owned())),
         autologon: !target.password.is_empty(),
-        enable_audio_playback: false,
+        enable_audio_playback: target.audio,
         performance_flags: PerformanceFlags::default(),
         license_cache: None,
         timezone_info: TimezoneInfo::default(),
@@ -407,6 +412,9 @@ mod tests {
             height: 768,
             scale: 100,
             keyboard_layout: 0x409,
+            audio: false,
+            share: None,
+            gateway: None,
         }
     }
 
@@ -721,6 +729,8 @@ mod tests {
         assert!(config.bitmap.is_none() && config.compression_type.is_none());
         assert!(config.enable_server_pointer && !config.pointer_software_rendering);
         assert!(!config.enable_audio_playback);
+        let sound = Target { audio: true, ..target("alice", "pw") };
+        assert!(super::config(&sound).enable_audio_playback);
         assert_eq!(config.client_name, "wisp");
     }
 

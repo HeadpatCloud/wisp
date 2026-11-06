@@ -70,12 +70,20 @@ ironrdp-input = "0.7"
 ironrdp-svc = "0.8"
 ironrdp-core = "0.2"
 ironrdp-tokio = "0.10"
+ironrdp-rdpsnd = "0.9"
+ironrdp-rdpsnd-native = { version = "0.7", default-features = false }
+ironrdp-rdpdr = "0.7"
+ironrdp-mstsgu = { path = "vendor/ironrdp-mstsgu" }
+rustls-platform-verifier = "0.7"
 x509-cert = { version = "0.2", default-features = false, features = ["std"] }
 # 0.12.5 adds an enum variant that sspi 0.23 matches exhaustively
 picky-krb = "=0.12.4"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_UI_Input_KeyboardAndMouse"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_UI_Input_KeyboardAndMouse"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
@@ -85,10 +93,15 @@ ironrdp-server = { version = "0.13", default-features = false }
 ironrdp-acceptor = "0.10"
 anyhow = "1"
 async-trait = "0.1"
+tokio-tungstenite = "0.29"
 
-# See vendor/ironrdp-connector/VENDORED.md, vendor/ironrdp-acceptor/VENDORED.md and
-# vendor/ironrdp-async/VENDORED.md
+# See vendor/ironrdp-connector/VENDORED.md, vendor/ironrdp-acceptor/VENDORED.md,
+# vendor/ironrdp-async/VENDORED.md, vendor/ironrdp-rdpsnd/VENDORED.md,
+# vendor/ironrdp-rdpsnd-native/VENDORED.md and vendor/ironrdp-rdpdr/VENDORED.md
 [patch.crates-io]
 ironrdp-connector = { path = "vendor/ironrdp-connector" }
 ironrdp-acceptor = { path = "vendor/ironrdp-acceptor" }
 ironrdp-async = { path = "vendor/ironrdp-async" }
+ironrdp-rdpsnd = { path = "vendor/ironrdp-rdpsnd" }
+ironrdp-rdpsnd-native = { path = "vendor/ironrdp-rdpsnd-native" }
+ironrdp-rdpdr = { path = "vendor/ironrdp-rdpdr" }

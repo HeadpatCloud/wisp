@@ -7,8 +7,8 @@ use sha2::{Digest, Sha256};
 use super::bundle::Payload;
 use super::{Env, FieldDiff, ItemKind, ItemStatus, LocalMatch, ReviewItem};
 use crate::store::model::{
-    AuthMethod, Group, IconRef, Profile, ProfileAppearance, ProfileKey, ProfileStore, RdpProfile,
-    S3Profile, SftpProfile, Tunnel, TunnelKind, VncProfile,
+    AuthMethod, Group, IconRef, Profile, ProfileAppearance, ProfileKey, ProfileStore, RdpGateway,
+    RdpProfile, S3Profile, SftpProfile, SharedFolder, Tunnel, TunnelKind, VncProfile,
 };
 use crate::store::normalize_keys;
 
@@ -42,6 +42,10 @@ pub mod field {
     pub const BUCKET: &str = "bucket";
     pub const DOMAIN: &str = "domain";
     pub const KEYBOARD_LAYOUT: &str = "keyboardLayout";
+    pub const AUDIO: &str = "audio";
+    pub const SHARED_FOLDER: &str = "sharedFolder";
+    pub const GATEWAY: &str = "gateway";
+    pub const GATEWAY_PASSWORD: &str = "gatewayPassword";
 }
 
 // The same list as the profile dialog offers; a test keeps them equal.
@@ -160,6 +164,32 @@ fn layout_label(layout: Option<u32>) -> String {
             None => format!("0x{id:x}"),
         },
     }
+}
+
+fn folder_label(folder: Option<&SharedFolder>) -> String {
+    match folder {
+        None => "None".into(),
+        Some(f) => format!("{} as {}", f.path, f.name),
+    }
+}
+
+fn gateway_label(gateway: Option<&RdpGateway>) -> String {
+    match gateway {
+        None => "None".into(),
+        Some(g) if g.same_login => format!("{}:{}, same login", g.host, g.port),
+        Some(g) => format!("{}:{}, {}", g.host, g.port, g.username),
+    }
+}
+
+// A gateway that takes the RDP login has no password of its own.
+pub fn gateway_secret(gateway: Option<&RdpGateway>) -> Option<&str> {
+    gateway.filter(|g| !g.same_login).and_then(|g| g.secret_id.as_deref())
+}
+
+// A shared folder is a path on the exporting machine, and one that is not a folder here would stop
+// every connect.
+fn missing_folder<'a>(p: &'a RdpProfile, env: &dyn Env) -> Option<&'a str> {
+    p.shared_folder.as_ref().map(|f| f.path.as_str()).filter(|path| !env.dir_exists(path))
 }
 
 fn auth(a: AuthMethod) -> String {
@@ -342,6 +372,7 @@ fn keys_field(
 }
 
 fn password_field(
+    field: &str,
     label: &str,
     local: Option<&str>,
     incoming: Option<&str>,
@@ -355,7 +386,7 @@ fn password_field(
         return;
     }
     fields.push(FieldDiff {
-        field: field::PASSWORD.into(),
+        field: field.into(),
         label: label.into(),
         local: if current.is_some() { "••••".into() } else { "(none)".into() },
         incoming: if current.is_some() { "•••• (different)".into() } else { "••••".into() },
@@ -513,6 +544,7 @@ impl Collector<'_> {
         }
         keys_field(Some(l.keys.as_slice()), &inc.keys, self.payload, env, &mut fields, notes);
         password_field(
+            field::PASSWORD,
             "Password",
             l.secret_id.as_deref(),
             inc.secret_id.as_deref(),
@@ -539,6 +571,7 @@ impl Collector<'_> {
         icon_field(&l.icon, &inc.icon, env, &mut fields, notes);
         keys_field(Some(l.keys.as_slice()), &inc.keys, self.payload, env, &mut fields, notes);
         password_field(
+            field::PASSWORD,
             "Password",
             l.secret_id.as_deref(),
             inc.secret_id.as_deref(),
@@ -597,6 +630,7 @@ impl Collector<'_> {
         );
         icon_field(&l.icon, &inc.icon, env, &mut fields, notes);
         password_field(
+            field::PASSWORD,
             "Secret access key",
             l.secret_id.as_deref(),
             inc.secret_id.as_deref(),
@@ -627,6 +661,7 @@ impl Collector<'_> {
         );
         icon_field(&l.icon, &inc.icon, env, &mut fields, notes);
         password_field(
+            field::PASSWORD,
             "Password",
             l.secret_id.as_deref(),
             inc.secret_id.as_deref(),
@@ -669,11 +704,46 @@ impl Collector<'_> {
             layout_label(l.keyboard_layout),
             layout_label(inc.keyboard_layout),
         );
+        let sound = |on: bool| if on { "On" } else { "Off" }.to_string();
+        push(&mut fields, field::AUDIO, "Sound", sound(l.audio), sound(inc.audio));
+        match missing_folder(inc, env) {
+            None => push(
+                &mut fields,
+                field::SHARED_FOLDER,
+                "Shared folder",
+                folder_label(l.shared_folder.as_ref()),
+                folder_label(inc.shared_folder.as_ref()),
+            ),
+            Some(path) if l.shared_folder.is_none() => {
+                notes.push(format!("Shared folder left out; not on this machine: {path}"));
+            }
+            Some(path) if l.shared_folder != inc.shared_folder => {
+                notes.push(format!("Kept your local shared folder; not on this machine: {path}"));
+            }
+            Some(_) => {}
+        }
+        push(
+            &mut fields,
+            field::GATEWAY,
+            "RD Gateway",
+            gateway_label(l.gateway.as_ref()),
+            gateway_label(inc.gateway.as_ref()),
+        );
         icon_field(&l.icon, &inc.icon, env, &mut fields, notes);
         password_field(
+            field::PASSWORD,
             "Password",
             l.secret_id.as_deref(),
             inc.secret_id.as_deref(),
+            self.payload,
+            env,
+            &mut fields,
+        );
+        password_field(
+            field::GATEWAY_PASSWORD,
+            "Gateway password",
+            gateway_secret(l.gateway.as_ref()),
+            gateway_secret(inc.gateway.as_ref()),
             self.payload,
             env,
             &mut fields,
@@ -882,7 +952,10 @@ pub fn plan(local: &ProfileStore, payload: &Payload, env: &dyn Env) -> Plan {
     );
     for (inc, found) in payload.rdp_profiles.iter().zip(found) {
         let key = ItemKind::Rdp.key(&inc.id);
-        let as_new = vec![];
+        let mut as_new = vec![];
+        if let Some(path) = missing_folder(inc, env) {
+            as_new.push(format!("Shared folder left out; not on this machine: {path}"));
+        }
         match found {
             Some(l) => {
                 let mut notes = vec![];
@@ -900,7 +973,8 @@ pub fn plan(local: &ProfileStore, payload: &Payload, env: &dyn Env) -> Plan {
 mod tests {
     use super::*;
     use crate::store::model::{
-        AuthMethod, Group, IconRef, Profile, ProfileKey, RdpProfile, SftpProfile, VncProfile,
+        AuthMethod, Group, IconRef, Profile, ProfileKey, RdpGateway, RdpProfile, SftpProfile,
+        SharedFolder, VncProfile,
     };
     use crate::transfer::bundle::KeyFile;
     use crate::transfer::MapEnv;
@@ -968,10 +1042,35 @@ mod tests {
             domain: None,
             secret_id: None,
             keyboard_layout: None,
+            audio: true,
+            shared_folder: None,
+            gateway: None,
             icon: IconRef::default(),
             order: 0,
             extra: Default::default(),
         }
+    }
+
+    fn gateway(same_login: bool, secret: Option<&str>) -> RdpGateway {
+        RdpGateway {
+            host: "gw.corp".into(),
+            port: 443,
+            same_login,
+            username: if same_login { "" } else { "CORP\\gw" }.into(),
+            secret_id: secret.map(Into::into),
+            extra: Default::default(),
+        }
+    }
+
+    fn folder(path: &str, name: &str) -> SharedFolder {
+        SharedFolder { path: path.into(), name: name.into(), extra: Default::default() }
+    }
+
+    fn rows(item: &ReviewItem) -> Vec<(&str, &str, &str, &str)> {
+        item.fields
+            .iter()
+            .map(|f| (f.field.as_str(), f.label.as_str(), f.local.as_str(), f.incoming.as_str()))
+            .collect()
     }
 
     fn local_rdp(rdp_profiles: Vec<RdpProfile>) -> ProfileStore {
@@ -1676,5 +1775,251 @@ mod tests {
             ("icon", "server", "custom image")
         );
         assert!(p.items[0].notes.is_empty());
+    }
+
+    #[test]
+    fn changed_rdp_profile_lists_sound_folder_and_gateway_in_order() {
+        let pc = RdpProfile {
+            secret_id: Some("local-sec".into()),
+            gateway: Some(gateway(true, None)),
+            ..rdp("r1", "office", "h1")
+        };
+        let mac = RdpProfile {
+            name: "office (mac)".into(),
+            host: "h2".into(),
+            port: 3390,
+            username: "CORP\\faye".into(),
+            domain: Some("CORP".into()),
+            keyboard_layout: Some(0x407),
+            audio: false,
+            shared_folder: Some(folder("/home/faye/share", "faye")),
+            gateway: Some(gateway(false, Some("mac-gw"))),
+            secret_id: Some("mac-sec".into()),
+            icon: IconRef::Builtin { name: "monitor".into() },
+            ..pc.clone()
+        };
+        let mut payload = incoming_rdp(vec![mac]);
+        payload.secrets.insert("mac-sec".into(), Zeroizing::new("other".into()));
+        payload.secrets.insert("mac-gw".into(), Zeroizing::new("gateway".into()));
+        let mut env = MapEnv::default();
+        env.secrets.insert("local-sec".into(), b"mine".to_vec());
+        env.dirs.insert("/home/faye/share".into());
+
+        let p = plan(&local_rdp(vec![pc]), &payload, &env);
+        assert_eq!(
+            rows(&p.items[0]),
+            [
+                ("name", "Name", "office", "office (mac)"),
+                ("host", "Host", "h1", "h2"),
+                ("port", "Port", "3389", "3390"),
+                ("username", "Username", "faye", "CORP\\faye"),
+                ("domain", "Domain", "(none)", "CORP"),
+                ("keyboardLayout", "Keyboard layout", "Automatic", "German"),
+                ("audio", "Sound", "On", "Off"),
+                ("sharedFolder", "Shared folder", "None", "/home/faye/share as faye"),
+                ("gateway", "RD Gateway", "gw.corp:443, same login", "gw.corp:443, CORP\\gw"),
+                ("icon", "Icon", "server", "monitor"),
+                ("password", "Password", "••••", "•••• (different)"),
+                ("gatewayPassword", "Gateway password", "(none)", "••••"),
+            ]
+        );
+        assert!(p.items[0].notes.is_empty() && p.items[0].notes_as_new.is_empty());
+    }
+
+    #[test]
+    fn rdp_sound_folder_and_gateway_are_shown_as_text() {
+        let pc = rdp("r1", "office", "h1");
+        let mut env = MapEnv::default();
+        env.dirs.insert("C:\\Users\\faye".into());
+        let shown = |local: RdpProfile, incoming: RdpProfile| {
+            let p = plan(&local_rdp(vec![local]), &incoming_rdp(vec![incoming]), &env);
+            assert_eq!(p.items[0].fields.len(), 1);
+            let row = &p.items[0].fields[0];
+            [row.field.clone(), row.label.clone(), row.local.clone(), row.incoming.clone()]
+        };
+
+        let off = RdpProfile { audio: false, ..pc.clone() };
+        assert_eq!(shown(pc.clone(), off.clone()), ["audio", "Sound", "On", "Off"]);
+        assert_eq!(shown(off, pc.clone()), ["audio", "Sound", "Off", "On"]);
+
+        let share = |f: SharedFolder| RdpProfile { shared_folder: Some(f), ..pc.clone() };
+        let faye = share(folder("C:\\Users\\faye", "faye"));
+        let label = "C:\\Users\\faye as faye";
+        let shared = "Shared folder";
+        assert_eq!(shown(pc.clone(), faye.clone()), ["sharedFolder", shared, "None", label]);
+        assert_eq!(shown(faye.clone(), pc.clone()), ["sharedFolder", shared, label, "None"]);
+        let docs = share(folder("C:\\Users\\faye", "docs"));
+        let renamed = "C:\\Users\\faye as docs";
+        assert_eq!(shown(faye, docs), ["sharedFolder", shared, label, renamed]);
+
+        let through = |g: RdpGateway| RdpProfile { gateway: Some(g), ..pc.clone() };
+        let same = through(gateway(true, None));
+        let own = through(gateway(false, Some("gw-1")));
+        let (same_label, own_label) = ("gw.corp:443, same login", "gw.corp:443, CORP\\gw");
+        assert_eq!(shown(pc.clone(), same.clone()), ["gateway", "RD Gateway", "None", same_label]);
+        assert_eq!(
+            shown(same.clone(), own.clone()),
+            ["gateway", "RD Gateway", same_label, own_label]
+        );
+        assert_eq!(shown(own.clone(), pc.clone()), ["gateway", "RD Gateway", own_label, "None"]);
+        let moved = through(RdpGateway { port: 8443, ..gateway(true, None) });
+        let moved_label = "gw.corp:8443, same login";
+        assert_eq!(shown(same, moved), ["gateway", "RD Gateway", same_label, moved_label]);
+
+        // The other machine keeps the gateway password under its own id.
+        let elsewhere = through(gateway(false, Some("gw-2")));
+        let p = plan(&local_rdp(vec![own]), &incoming_rdp(vec![elsewhere]), &env);
+        assert!(p.items.is_empty());
+        assert_eq!(p.unchanged, 1);
+    }
+
+    #[test]
+    fn rdp_gateway_password_row_only_when_bundle_carries_a_different_one() {
+        let mut pc =
+            RdpProfile { gateway: Some(gateway(false, None)), ..rdp("pc", "office", "h1") };
+        let mut payload = incoming_rdp(vec![pc.clone()]);
+        let mut env = MapEnv::default();
+        env.secrets.insert("local-gw".into(), b"same".to_vec());
+        let unchanged = |pc: &RdpProfile, payload: &Payload| {
+            let p = plan(&local_rdp(vec![pc.clone()]), payload, &env);
+            p.items.is_empty() && p.unchanged == 1
+        };
+
+        assert!(unchanged(&pc, &payload), "neither side has a gateway password");
+        pc.gateway = Some(gateway(false, Some("local-gw")));
+        assert!(unchanged(&pc, &payload), "only this machine has one");
+        payload.rdp_profiles[0].gateway = Some(gateway(false, Some("mac-gw")));
+        assert!(unchanged(&pc, &payload), "exported without passwords");
+        payload.secrets.insert("mac-gw".into(), Zeroizing::new("same".into()));
+        assert!(unchanged(&pc, &payload), "the same gateway password");
+
+        payload.secrets.insert("mac-gw".into(), Zeroizing::new("other".into()));
+        let p = plan(&local_rdp(vec![pc.clone()]), &payload, &env);
+        assert_eq!(
+            rows(&p.items[0]),
+            [("gatewayPassword", "Gateway password", "••••", "•••• (different)")]
+        );
+
+        pc.gateway = Some(gateway(false, None));
+        let p = plan(&local_rdp(vec![pc.clone()]), &payload, &env);
+        assert_eq!(
+            rows(&p.items[0]),
+            [("gatewayPassword", "Gateway password", "(none)", "••••")]
+        );
+
+        pc.gateway = None;
+        let p = plan(&local_rdp(vec![pc.clone()]), &payload, &env);
+        let fields: Vec<_> = rows(&p.items[0]).into_iter().map(|r| (r.0, r.2, r.3)).collect();
+        assert_eq!(
+            fields,
+            [
+                ("gateway", "None", "gw.corp:443, CORP\\gw"),
+                ("gatewayPassword", "(none)", "••••")
+            ]
+        );
+
+        // A gateway that takes the RDP login has no password of its own.
+        pc.gateway = Some(gateway(false, Some("local-gw")));
+        payload.rdp_profiles[0].gateway = Some(gateway(true, Some("mac-gw")));
+        let p = plan(&local_rdp(vec![pc]), &payload, &env);
+        let fields: Vec<_> = p.items[0].fields.iter().map(|f| f.field.as_str()).collect();
+        assert_eq!(fields, ["gateway"]);
+    }
+
+    #[test]
+    fn rdp_shared_folder_that_is_not_on_this_machine_is_never_offered() {
+        let pc = RdpProfile {
+            shared_folder: Some(folder("C:\\Users\\faye", "faye")),
+            ..rdp("pc", "office", "h1")
+        };
+        let mac = RdpProfile {
+            id: "mac".into(),
+            name: "office (mac)".into(),
+            shared_folder: Some(folder("/home/faye/share", "faye")),
+            ..pc.clone()
+        };
+        let (l, payload) = (local_rdp(vec![pc.clone()]), incoming_rdp(vec![mac.clone()]));
+        let left_out = "Shared folder left out; not on this machine: /home/faye/share";
+
+        let p = plan(&l, &payload, &MapEnv::default());
+        let item = &p.items[0];
+        assert_eq!(item.status, ItemStatus::Conflict);
+        let fields: Vec<_> = item.fields.iter().map(|f| f.field.as_str()).collect();
+        assert_eq!(fields, ["name"]);
+        assert_eq!(
+            item.notes,
+            ["Kept your local shared folder; not on this machine: /home/faye/share"]
+        );
+        assert_eq!(item.notes_as_new, [left_out]);
+
+        let mut env = MapEnv::default();
+        env.dirs.insert("/home/faye/share".into());
+        let p = plan(&l, &payload, &env);
+        let item = &p.items[0];
+        assert_eq!(
+            rows(item)[1],
+            (
+                "sharedFolder",
+                "Shared folder",
+                "C:\\Users\\faye as faye",
+                "/home/faye/share as faye"
+            )
+        );
+        assert!(item.notes.is_empty() && item.notes_as_new.is_empty());
+
+        // Nothing else differs, so nothing is left to review.
+        let only_folder = RdpProfile { name: pc.name.clone(), ..mac };
+        let p = plan(&l, &incoming_rdp(vec![only_folder]), &MapEnv::default());
+        assert!(p.items.is_empty());
+        assert_eq!(p.unchanged, 1);
+
+        // The same missing folder on both sides changes nothing and needs no note.
+        let renamed = RdpProfile { name: "office 2".into(), ..pc.clone() };
+        let p = plan(&l, &incoming_rdp(vec![renamed]), &MapEnv::default());
+        assert!(p.items[0].notes.is_empty());
+        assert_eq!(
+            p.items[0].notes_as_new,
+            ["Shared folder left out; not on this machine: C:\\Users\\faye"]
+        );
+    }
+
+    // Without a local shared folder there is nothing to keep.
+    #[test]
+    fn a_missing_incoming_folder_on_a_profile_here_without_one_is_left_out() {
+        let pc = rdp("pc", "office", "h1");
+        let mac = RdpProfile {
+            id: "mac".into(),
+            name: "office (mac)".into(),
+            shared_folder: Some(folder("/home/faye/share", "faye")),
+            ..pc.clone()
+        };
+        let p = plan(&local_rdp(vec![pc]), &incoming_rdp(vec![mac]), &MapEnv::default());
+        let item = &p.items[0];
+        let fields: Vec<_> = item.fields.iter().map(|f| f.field.as_str()).collect();
+        assert_eq!(fields, ["name"]);
+        let left_out = "Shared folder left out; not on this machine: /home/faye/share";
+        assert_eq!(item.notes, [left_out]);
+        assert_eq!(item.notes_as_new, [left_out]);
+    }
+
+    #[test]
+    fn new_rdp_profile_with_a_shared_folder_that_is_not_on_this_machine_is_noted() {
+        let inc = RdpProfile {
+            shared_folder: Some(folder("/home/faye/share", "faye")),
+            ..rdp("r1", "office", "h1")
+        };
+        let payload = incoming_rdp(vec![inc]);
+
+        let p = plan(&local_rdp(vec![]), &payload, &MapEnv::default());
+        let item = &p.items[0];
+        assert_eq!(item.status, ItemStatus::New);
+        let left_out = "Shared folder left out; not on this machine: /home/faye/share";
+        assert_eq!(item.notes, [left_out]);
+        assert_eq!(item.notes_as_new, [left_out]);
+
+        let mut env = MapEnv::default();
+        env.dirs.insert("/home/faye/share".into());
+        let p = plan(&local_rdp(vec![]), &payload, &env);
+        assert!(p.items[0].notes.is_empty() && p.items[0].notes_as_new.is_empty());
     }
 }

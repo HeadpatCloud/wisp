@@ -133,9 +133,40 @@ pub struct RdpProfile {
     pub domain: Option<String>,
     pub secret_id: Option<String>,
     pub keyboard_layout: Option<u32>,
+    #[serde(default = "default_true")]
+    pub audio: bool,
+    #[serde(default)]
+    pub shared_folder: Option<SharedFolder>,
+    #[serde(default)]
+    pub gateway: Option<RdpGateway>,
     #[serde(default)]
     pub icon: IconRef,
     pub order: u32,
+    #[serde(flatten)]
+    #[specta(skip)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedFolder {
+    pub path: String,
+    pub name: String,
+    #[serde(flatten)]
+    #[specta(skip)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+// With `same_login` the gateway gets the RDP user name and password, and `username` and
+// `secret_id` are not used.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RdpGateway {
+    pub host: String,
+    pub port: u16,
+    pub same_login: bool,
+    pub username: String,
+    pub secret_id: Option<String>,
     #[serde(flatten)]
     #[specta(skip)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -395,6 +426,20 @@ mod tests {
                 domain: None,
                 secret_id: Some("vault-1".into()),
                 keyboard_layout: Some(0x407),
+                audio: false,
+                shared_folder: Some(SharedFolder {
+                    path: "C:\\Users\\faye".into(),
+                    name: "faye".into(),
+                    extra: Default::default(),
+                }),
+                gateway: Some(RdpGateway {
+                    host: "gw.corp".into(),
+                    port: 443,
+                    same_login: false,
+                    username: "CORP\\gw".into(),
+                    secret_id: Some("vault-2".into()),
+                    extra: Default::default(),
+                }),
                 icon: IconRef::default(),
                 order: 0,
                 extra: Default::default(),
@@ -405,6 +450,10 @@ mod tests {
         assert_eq!(json["rdpProfiles"][0]["secretId"], "vault-1");
         assert_eq!(json["rdpProfiles"][0]["keyboardLayout"], 0x407);
         assert_eq!(json["rdpProfiles"][0]["domain"], serde_json::Value::Null);
+        assert_eq!(json["rdpProfiles"][0]["audio"], false);
+        assert_eq!(json["rdpProfiles"][0]["sharedFolder"]["path"], "C:\\Users\\faye");
+        assert_eq!(json["rdpProfiles"][0]["gateway"]["sameLogin"], false);
+        assert_eq!(json["rdpProfiles"][0]["gateway"]["secretId"], "vault-2");
         assert_eq!(serde_json::from_value::<ProfileStore>(json).unwrap(), store);
     }
 
@@ -415,5 +464,75 @@ mod tests {
         let p: RdpProfile = serde_json::from_str(minimal).unwrap();
         assert_eq!(p.icon, IconRef::default());
         assert_eq!(p.domain.as_deref(), Some("corp"));
+    }
+
+    const PHASE_3_RDP: &str = r#"{"id":"r1","name":"n","host":"h","port":3389,"username":"u",
+        "domain":null,"secretId":"vault-1","keyboardLayout":null,
+        "icon":{"kind":"builtin","name":"server"},"order":0}"#;
+
+    #[test]
+    fn an_rdp_profile_from_before_sound_plays_sound_and_has_no_share_or_gateway() {
+        let p: RdpProfile = serde_json::from_str(PHASE_3_RDP).unwrap();
+        assert!(p.audio);
+        assert_eq!(p.shared_folder, None);
+        assert_eq!(p.gateway, None);
+        assert!(p.extra.is_empty());
+    }
+
+    #[test]
+    fn sound_folder_and_gateway_round_trip() {
+        let mut json: serde_json::Value = serde_json::from_str(PHASE_3_RDP).unwrap();
+        json["audio"] = false.into();
+        json["sharedFolder"] = serde_json::json!({ "path": "/home/faye/share", "name": "faye" });
+        json["gateway"] = serde_json::json!({ "host": "gw.corp", "port": 8443, "sameLogin": true,
+            "username": "", "secretId": null });
+        let p: RdpProfile = serde_json::from_value(json.clone()).unwrap();
+        assert!(!p.audio);
+        let folder = SharedFolder {
+            path: "/home/faye/share".into(),
+            name: "faye".into(),
+            extra: Default::default(),
+        };
+        assert_eq!(p.shared_folder, Some(folder));
+        let gateway = RdpGateway {
+            host: "gw.corp".into(),
+            port: 8443,
+            same_login: true,
+            username: String::new(),
+            secret_id: None,
+            extra: Default::default(),
+        };
+        assert_eq!(p.gateway, Some(gateway));
+        assert!(p.extra.is_empty());
+        assert_eq!(serde_json::to_value(&p).unwrap(), json);
+    }
+
+    #[test]
+    fn fields_this_build_does_not_know_in_the_folder_and_the_gateway_are_written_back() {
+        let mut json: serde_json::Value = serde_json::from_str(PHASE_3_RDP).unwrap();
+        json["audio"] = true.into();
+        json["sharedFolder"] = serde_json::json!({ "path": "/s", "name": "s", "readOnly": true });
+        json["gateway"] = serde_json::json!({ "host": "gw", "port": 443, "sameLogin": false,
+            "username": "u", "secretId": null, "auth": { "scheme": "ntlm" } });
+        let p: RdpProfile = serde_json::from_value(json.clone()).unwrap();
+        assert!(p.extra.is_empty());
+        assert_eq!(p.shared_folder.as_ref().unwrap().extra["readOnly"], true);
+        assert_eq!(p.gateway.as_ref().unwrap().extra["auth"]["scheme"], "ntlm");
+        assert_eq!(serde_json::to_value(&p).unwrap(), json);
+    }
+
+    #[test]
+    fn fields_this_build_does_not_know_still_land_in_extra() {
+        let mut json: serde_json::Value = serde_json::from_str(PHASE_3_RDP).unwrap();
+        json["audio"] = false.into();
+        json["gateway"] = serde_json::json!({ "host": "gw", "port": 443, "sameLogin": true,
+            "username": "", "secretId": null });
+        json["scale"] = 1.5.into();
+        let p: RdpProfile = serde_json::from_value(json).unwrap();
+        assert_eq!(p.extra.keys().collect::<Vec<_>>(), ["scale"]);
+        assert_eq!(p.extra["scale"], 1.5);
+        let back = serde_json::to_value(&p).unwrap();
+        assert_eq!(back["scale"], 1.5);
+        assert_eq!(back["gateway"]["host"], "gw");
     }
 }

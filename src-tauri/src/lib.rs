@@ -37,8 +37,10 @@ pub mod live_ssh {
 pub mod live_rdp {
     pub use crate::commands::rdp_cmds::RdpSessions;
     pub use crate::rdp::connect::Target;
+    pub use crate::rdp::gateway::Gateway;
     pub use crate::rdp::input::Input;
     pub use crate::rdp::session::Session;
+    pub use crate::rdp::share::Share;
 }
 
 use std::sync::{Arc, Mutex};

@@ -32,6 +32,7 @@ export function HostKeyDialog({
   const lastRef = useRef(prompt)
   if (prompt) lastRef.current = prompt
   const shown = prompt ?? lastRef.current
+  const gateway = shown?.host.startsWith('rdg/') ?? false
 
   return (
     <Dialog open={prompt !== null} onOpenChange={(open) => !open && onReject()}>
@@ -39,12 +40,16 @@ export function HostKeyDialog({
         <DialogHeader>
           <DialogTitle>
             {shown?.kind === 'mismatch'
-              ? shown.certificate
-                ? 'Certificate CHANGED'
-                : 'Host key CHANGED'
-              : shown?.certificate
-                ? 'Unknown certificate'
-                : 'Unknown host key'}
+              ? gateway
+                ? 'Gateway certificate CHANGED'
+                : shown.certificate
+                  ? 'Certificate CHANGED'
+                  : 'Host key CHANGED'
+              : gateway
+                ? 'Unknown gateway certificate'
+                : shown?.certificate
+                  ? 'Unknown certificate'
+                  : 'Unknown host key'}
           </DialogTitle>
         </DialogHeader>
         {shown && (
@@ -56,9 +61,11 @@ export function HostKeyDialog({
             {shown.kind === 'unknown' ? (
               <>
                 <p>
-                  {shown.certificate
-                    ? 'First connection to this server. Trust this certificate?'
-                    : 'First connection to this host. Trust this key?'}
+                  {gateway
+                    ? 'First connection to this gateway. Trust this certificate?'
+                    : shown.certificate
+                      ? 'First connection to this server. Trust this certificate?'
+                      : 'First connection to this host. Trust this key?'}
                 </p>
                 <p className="break-all font-mono text-xs">{shown.fingerprint}</p>
               </>

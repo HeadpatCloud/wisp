@@ -112,6 +112,76 @@ test.each([
   expect(useRdpProfileStore.getState().profiles).toEqual([])
 })
 
+const gated: RdpProfile = {
+  ...desk,
+  gateway: { host: 'gw', port: 443, sameLogin: false, username: 'gw-faye', secretId: 'vault-gw' },
+}
+
+test('remove deletes the gateway password too, after the profile', async () => {
+  useRdpProfileStore.setState({ profiles: [gated], loaded: true })
+  const order: string[] = []
+  m.deleteSecret.mockImplementation(async (id: string) => {
+    order.push(`secret ${id}`)
+    return OK
+  })
+  m.deleteRdpProfile.mockImplementation(async (id: string) => {
+    order.push(`profile ${id}`)
+    return OK
+  })
+  m.listRdpProfiles.mockImplementation(async () => {
+    order.push('list')
+    return { status: 'ok', data: [] }
+  })
+  await useRdpProfileStore.getState().remove('rdp-1')
+  expect(order).toEqual(['profile rdp-1', 'secret vault-1', 'secret vault-gw', 'list'])
+  expect(useRdpProfileStore.getState().profiles).toEqual([])
+})
+
+test.each([
+  ['is already gone', () => ({ status: 'error', error: { kind: 'notFound', message: 'secret' } })],
+  [
+    'cannot be reached',
+    () => {
+      throw new Error('ipc')
+    },
+  ],
+])('a password that %s still lets the gateway password go', async (_how, outcome) => {
+  useRdpProfileStore.setState({ profiles: [gated], loaded: true })
+  m.deleteSecret.mockImplementation(async (id: string) => (id === 'vault-1' ? outcome() : OK))
+  await useRdpProfileStore.getState().remove('rdp-1')
+  expect(m.deleteSecret).toHaveBeenCalledWith('vault-gw')
+  expect(useRdpProfileStore.getState().profiles).toEqual([])
+})
+
+test('a gateway password that cannot be deleted does not fail the removal', async () => {
+  useRdpProfileStore.setState({ profiles: [gated], loaded: true })
+  m.deleteSecret.mockImplementation(async (id: string) => {
+    if (id === 'vault-gw') throw new Error('ipc')
+    return OK
+  })
+  await useRdpProfileStore.getState().remove('rdp-1')
+  expect(m.listRdpProfiles).toHaveBeenCalledTimes(1)
+  expect(useRdpProfileStore.getState().profiles).toEqual([])
+})
+
+test('a gateway with the same login touches only the RDP password', async () => {
+  const same: RdpProfile = {
+    ...desk,
+    gateway: { host: 'gw', port: 443, sameLogin: true, username: '', secretId: null },
+  }
+  useRdpProfileStore.setState({ profiles: [same], loaded: true })
+  await useRdpProfileStore.getState().remove('rdp-1')
+  expect(m.deleteSecret.mock.calls).toEqual([['vault-1']])
+})
+
+test('a profile that cannot be deleted keeps its gateway password', async () => {
+  useRdpProfileStore.setState({ profiles: [gated], loaded: true })
+  m.deleteRdpProfile.mockResolvedValue({ status: 'error', error: { kind: 'io', message: 'x' } })
+  await expect(useRdpProfileStore.getState().remove('rdp-1')).rejects.toThrow('io: x')
+  expect(m.deleteSecret).not.toHaveBeenCalled()
+  expect(useRdpProfileStore.getState().profiles).toEqual([gated])
+})
+
 test('removing a profile without a password touches no secret', async () => {
   useRdpProfileStore.setState({ profiles: [{ ...desk, secretId: null }], loaded: true })
   await useRdpProfileStore.getState().remove('rdp-1')

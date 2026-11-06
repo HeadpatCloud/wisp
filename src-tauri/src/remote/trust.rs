@@ -10,6 +10,7 @@ use crate::ssh::known_hosts::HostKeyVerdict;
 pub enum Scheme {
     Vnc,
     Rdp,
+    Rdg,
 }
 
 pub const UNENCRYPTED: &str = "no certificate (unencrypted login)";
@@ -28,6 +29,7 @@ fn lookup(
     let prefix = match scheme {
         Scheme::Vnc => "vnc/",
         Scheme::Rdp => "rdp/",
+        Scheme::Rdg => "rdg/",
     };
     // One key for every spelling of a host: a pin must not depend on how the host was typed.
     let host = crate::net::normalize_host(host);
@@ -66,6 +68,24 @@ pub fn check(
             Err(AppError::HostKeyMismatch { host, port, stored, offered })
         }
     }
+}
+
+// For a certificate the system trusts: kept as the pin, written only when it differs.
+pub fn remember(
+    known: &KnownHostsState,
+    scheme: Scheme,
+    host: &str,
+    port: u16,
+    cert_der: &[u8],
+) -> AppResult<()> {
+    let print = fingerprint(cert_der);
+    let (host, verdict) = lookup(known, scheme, host, port, &print)?;
+    if matches!(verdict, HostKeyVerdict::Trusted) {
+        return Ok(());
+    }
+    let mut kh =
+        known.0.lock().map_err(|_| AppError::Internal("known_hosts lock poisoned".into()))?;
+    kh.record(&host, port, &print)
 }
 
 // For a login that runs without a certificate. A host that never showed one is let through
@@ -319,6 +339,37 @@ mod tests {
         known.0.lock().unwrap().record("vnc/h", 5900, &fingerprint(b"cert")).unwrap();
         assert!(matches!(
             check(&known, Scheme::Rdp, "h", 5900, b"cert"),
+            Err(AppError::HostKeyUnknown { host, .. }) if host == "rdp/h"
+        ));
+    }
+
+    #[test]
+    fn a_gateway_certificate_is_stored_under_its_own_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let known = known(&dir);
+        match check(&known, Scheme::Rdg, "Gate.lan", 443, b"cert") {
+            Err(AppError::HostKeyUnknown { host, port, fingerprint }) => {
+                assert_eq!(host, "rdg/gate.lan");
+                assert_eq!(port, 443);
+                known.0.lock().unwrap().record(&host, port, &fingerprint).unwrap();
+            }
+            other => panic!("expected HostKeyUnknown, got {other:?}"),
+        }
+        assert!(check(&known, Scheme::Rdg, "gate.lan.", 443, b"cert").is_ok());
+    }
+
+    #[test]
+    fn a_gateway_pin_and_an_rdp_pin_for_the_same_host_and_port_are_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let known = known(&dir);
+        known.0.lock().unwrap().record("rdp/h", 443, &fingerprint(b"cert")).unwrap();
+        assert!(matches!(
+            check(&known, Scheme::Rdg, "h", 443, b"cert"),
+            Err(AppError::HostKeyUnknown { host, .. }) if host == "rdg/h"
+        ));
+        known.0.lock().unwrap().record("rdg/h", 3389, &fingerprint(b"cert")).unwrap();
+        assert!(matches!(
+            check(&known, Scheme::Rdp, "h", 3389, b"cert"),
             Err(AppError::HostKeyUnknown { host, .. }) if host == "rdp/h"
         ));
     }

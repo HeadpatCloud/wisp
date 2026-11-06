@@ -226,10 +226,18 @@ impl Store {
     }
 
     // Written before it is swapped in, like the VNC ones: a failed write leaves memory as it was.
-    pub fn upsert_rdp_profile(&mut self, profile: RdpProfile) -> AppResult<()> {
+    pub fn upsert_rdp_profile(&mut self, mut profile: RdpProfile) -> AppResult<()> {
         let mut data = self.data.clone();
         match data.rdp_profiles.iter_mut().find(|p| p.id == profile.id) {
             Some(existing) => {
+                let folders = profile.shared_folder.as_mut().zip(existing.shared_folder.as_mut());
+                if let Some((folder, kept)) = folders {
+                    folder.extra = mem::take(&mut kept.extra);
+                }
+                let gateways = profile.gateway.as_mut().zip(existing.gateway.as_mut());
+                if let Some((gateway, kept)) = gateways {
+                    gateway.extra = mem::take(&mut kept.extra);
+                }
                 *existing = RdpProfile { extra: mem::take(&mut existing.extra), ..profile }
             }
             None => data.rdp_profiles.push(RdpProfile { extra: Default::default(), ..profile }),
@@ -494,6 +502,9 @@ mod tests {
             domain: Some("corp".into()),
             secret_id: Some("vault-1".into()),
             keyboard_layout: Some(0x407),
+            audio: true,
+            shared_folder: None,
+            gateway: None,
             icon: IconRef::default(),
             order: 0,
             extra: Default::default(),
@@ -563,6 +574,29 @@ mod tests {
         // A file that does not parse loads as an empty store, so the group shows it was read.
         assert_eq!(store.groups(), [group("g1")]);
         assert!(store.rdp_profiles().is_empty());
+    }
+
+    #[test]
+    fn an_rdp_profile_from_before_sound_is_written_back_with_sound_and_no_share_or_gateway() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"groups":[],"profiles":[],"rdpProfiles":[{"id":"r1","name":"r1",
+                "host":"h","port":3389,"username":"faye","domain":"corp","secretId":"vault-1",
+                "keyboardLayout":1031,"icon":{"kind":"builtin","name":"server"},"order":0}]}"#,
+        )
+        .unwrap();
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        assert_eq!(store.rdp_profiles(), [rdp("r1")]);
+
+        store.upsert_group(group("g1")).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["rdpProfiles"][0]["audio"], true);
+        assert_eq!(saved["rdpProfiles"][0]["sharedFolder"], serde_json::Value::Null);
+        assert_eq!(saved["rdpProfiles"][0]["gateway"], serde_json::Value::Null);
+        assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().rdp_profiles(), [rdp("r1")]);
     }
 
     #[test]
@@ -696,6 +730,31 @@ mod tests {
             assert_eq!(saved()[kind][0]["name"], "renamed", "{kind}");
             assert_eq!(saved()[kind][0]["later"].to_string(), later.to_string(), "{kind}");
         }
+    }
+
+    #[test]
+    fn an_edit_from_the_dialog_keeps_what_a_later_version_added_to_the_folder_and_gateway() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let (mut file, later) = later_file();
+        let rdp = &mut file["rdpProfiles"][0];
+        rdp["sharedFolder"] = serde_json::json!({ "path": "/s", "name": "s", "later": later });
+        rdp["gateway"] = serde_json::json!({ "host": "gw", "port": 443, "sameLogin": true,
+            "username": "", "secretId": null, "later": later });
+        std::fs::write(&path, file.to_string()).unwrap();
+        let mut edited = file["rdpProfiles"][0].clone();
+        edited["name"] = "renamed".into();
+        for nested in ["sharedFolder", "gateway"] {
+            edited[nested].as_object_mut().unwrap().remove("later");
+        }
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        store.upsert_rdp_profile(serde_json::from_value(edited).unwrap()).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let rdp = &saved["rdpProfiles"][0];
+        assert_eq!(rdp["name"], "renamed");
+        assert_eq!(rdp["sharedFolder"]["later"].to_string(), later.to_string());
+        assert_eq!(rdp["gateway"]["later"].to_string(), later.to_string());
     }
 
     // A duplicate is sent as a copy of what the store gave, with a new id.

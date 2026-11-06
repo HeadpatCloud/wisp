@@ -17,7 +17,7 @@ use ironrdp_cliprdr::pdu::{
 use ironrdp_connector::sspi::credssp::EarlyUserAuthResult;
 use ironrdp_connector::sspi::generator::GeneratorState;
 use ironrdp_connector::sspi::{AuthIdentity, Username};
-use ironrdp_connector::ServerName;
+use ironrdp_connector::{Sequence as _, ServerName};
 use ironrdp_core::{encode_vec, WriteBuf};
 use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
 use ironrdp_pdu::fast_path::{
@@ -26,11 +26,13 @@ use ironrdp_pdu::fast_path::{
 use ironrdp_pdu::geometry::ExclusiveRectangle;
 use ironrdp_pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
 use ironrdp_pdu::mcs::{
-    DisconnectProviderUltimatum, DisconnectReason, McsMessage, SendDataIndication,
+    ConnectInitial, DisconnectProviderUltimatum, DisconnectReason, McsMessage, SendDataIndication,
+    SendDataRequest,
 };
 use ironrdp_pdu::nego::{ConnectionConfirm, FailureCode, ResponseFlags, SecurityProtocol};
 use ironrdp_pdu::rdp::capability_sets::{self, BitmapCodecs, CapabilitySet};
-use ironrdp_pdu::rdp::client_info::CompressionType;
+use ironrdp_pdu::rdp::client_info::{ClientInfoFlags, CompressionType};
+use ironrdp_pdu::rdp::ClientInfoPdu;
 use ironrdp_pdu::rdp::finalization_messages::MonitorLayoutPdu;
 use ironrdp_pdu::rdp::headers::{
     CompressionFlags, ServerDeactivateAll, ShareControlHeader, ShareControlPdu, ShareDataHeader,
@@ -44,8 +46,12 @@ use ironrdp_dvc::pdu::{DrdynvcClientPdu, DrdynvcDataPdu};
 use ironrdp_pdu::surface_commands::{
     ExtendedBitmapDataPdu, FrameAction, FrameMarkerPdu, SurfaceBitsPdu, SurfaceCommand,
 };
-use ironrdp_pdu::x224::X224;
+use ironrdp_pdu::x224::{X224Data, X224};
 use ironrdp_pdu::Action;
+use ironrdp_rdpsnd::pdu::{
+    AudioFormat, ServerAudioFormatPdu, ServerAudioOutputPdu, TrainingPdu, Version, Wave2Pdu,
+    WaveFormat, WaveInfoPdu,
+};
 use ironrdp_server::{
     BitmapUpdate, CliprdrServerFactory, ConnectionHandler, Credentials, DesktopSize, DisplayUpdate,
     KeyboardEvent, MouseEvent, PixelFormat, PostConnectionAction, RdpServer, RdpServerDisplay,
@@ -687,6 +693,60 @@ pub async fn accept_scripted_keeping<S>(
 where
     S: AsyncRead + AsyncWrite + Send + Sync + Unpin,
 {
+    let (framed, channels, acceptor, _) = accept(stream, size, max_request_size).await;
+    (framed, channels, acceptor)
+}
+
+// What the client asked for: the static channels it listed, in its order, and the flags of its
+// Client Info PDU.
+pub struct Asked {
+    pub channels: Vec<String>,
+    pub flags: ClientInfoFlags,
+}
+
+impl Asked {
+    // The number `channel_chunk` takes for the sound channel.
+    pub fn sound(&self) -> Option<u16> {
+        let at = self.channels.iter().position(|name| name == "rdpsnd")?;
+        Some(u16::try_from(at).unwrap())
+    }
+
+    fn note(&mut self, frame: &[u8]) {
+        if let Ok(data) = ironrdp_core::decode::<X224<X224Data<'_>>>(frame) {
+            if let Ok(initial) = ironrdp_core::decode::<ConnectInitial>(&data.0.data) {
+                let blocks = initial.conference_create_request.into_gcc_blocks();
+                let listed = blocks.network.map(|network| network.channels).unwrap_or_default();
+                let names = listed.iter().filter_map(|channel| channel.name.as_str());
+                self.channels = names.map(str::to_owned).collect();
+            }
+        }
+        if let Ok(request) = ironrdp_core::decode::<X224<SendDataRequest<'_>>>(frame) {
+            if let Ok(info) = ironrdp_core::decode::<ClientInfoPdu>(&request.0.user_data) {
+                self.flags = info.client_info.flags;
+            }
+        }
+    }
+}
+
+pub async fn accept_scripted_asking<S>(
+    stream: S,
+    size: (u16, u16),
+) -> (ScriptedFramed<S>, Channels, Asked)
+where
+    S: AsyncRead + AsyncWrite + Send + Sync + Unpin,
+{
+    let (framed, channels, _, asked) = accept(stream, size, 8 * 1024 * 1024).await;
+    (framed, channels, asked)
+}
+
+async fn accept<S>(
+    stream: S,
+    size: (u16, u16),
+    max_request_size: u32,
+) -> (ScriptedFramed<S>, Channels, Acceptor, Asked)
+where
+    S: AsyncRead + AsyncWrite + Send + Sync + Unpin,
+{
     let size = DesktopSize { width: size.0, height: size.1 };
     let capabilities = capabilities(size, max_request_size);
     let mut acceptor = Acceptor::new(SecurityProtocol::SSL, size, capabilities, None);
@@ -696,9 +756,29 @@ where
     };
     let stream = tls().0.accept(stream).await.unwrap();
     acceptor.mark_security_upgrade_as_done();
-    let (framed, result) =
-        ironrdp_acceptor::accept_finalize(TokioFramed::new(stream), &mut acceptor).await.unwrap();
-    (framed, Channels { io: result.io_channel_id, user: result.user_channel_id }, acceptor)
+    // What ironrdp_acceptor::accept_finalize does, with every frame of the client read here.
+    let mut framed = TokioFramed::new(stream);
+    let mut asked = Asked { channels: Vec::new(), flags: ClientInfoFlags::empty() };
+    let mut buf = WriteBuf::new();
+    let result = loop {
+        if let Some(result) = acceptor.get_result() {
+            break result;
+        }
+        buf.clear();
+        let written = match acceptor.next_pdu_hint() {
+            Some(hint) => {
+                let frame = framed.read_by_hint(hint).await.unwrap();
+                asked.note(&frame);
+                acceptor.step(&frame, &mut buf)
+            }
+            None => acceptor.step_no_input(&mut buf),
+        };
+        if let Some(length) = written.unwrap().size() {
+            framed.write_all(&buf[..length]).await.unwrap();
+        }
+    };
+    let channels = Channels { io: result.io_channel_id, user: result.user_channel_id };
+    (framed, channels, acceptor, asked)
 }
 
 // An NLA (HYBRID_EX) server that holds back its Early User Authorization Result: `heard` fires once
@@ -856,6 +936,108 @@ pub fn play_sound(channels: &Channels) -> Vec<u8> {
     data[TOTAL_LENGTH..TOTAL_LENGTH + 2].copy_from_slice(&total.to_le_bytes());
     data.extend(body);
     io_channel(data, channels)
+}
+
+fn audio_format(
+    format: WaveFormat,
+    (n_channels, n_samples_per_sec, bits_per_sample): (u16, u32, u16),
+    n_block_align: u16,
+    n_avg_bytes_per_sec: u32,
+    extra: usize,
+) -> AudioFormat {
+    AudioFormat {
+        format,
+        n_channels,
+        n_samples_per_sec,
+        n_avg_bytes_per_sec,
+        n_block_align,
+        bits_per_sample,
+        data: (extra > 0).then(|| vec![0; extra]),
+    }
+}
+
+pub fn pcm(n_channels: u16, rate: u32) -> AudioFormat {
+    let align = n_channels * 2;
+    audio_format(WaveFormat::PCM, (n_channels, rate, 16), align, rate * u32::from(align), 0)
+}
+
+// What Windows Server 2025 offers, in its order.
+pub fn windows_formats() -> Vec<AudioFormat> {
+    use WaveFormat as W;
+
+    let aac = [24000, 20000, 16000, 12000, 8000, 6000, 4000, 2000];
+    let aac = aac.map(|avg| audio_format(W::AAC_MS, (2, 44100, 16), 4, avg, 0));
+    let rest = [
+        (W::ADPCM, (2, 44100, 4), 2048, 44359, 32),
+        (W::DVI_ADPCM, (2, 44100, 4), 2048, 44251, 2),
+        (W::ALAW, (2, 22050, 8), 2, 44100, 0),
+        (W::ADPCM, (2, 22050, 4), 1024, 22311, 32),
+        (W::DVI_ADPCM, (2, 22050, 4), 1024, 22201, 2),
+        (W::ADPCM, (1, 44100, 4), 1024, 22179, 32),
+        (W::DVI_ADPCM, (1, 44100, 4), 1024, 22125, 2),
+        (W::ADPCM, (2, 11025, 4), 512, 11289, 32),
+        (W::DVI_ADPCM, (2, 11025, 4), 512, 11177, 2),
+        (W::ADPCM, (1, 22050, 4), 512, 11155, 32),
+        (W::DVI_ADPCM, (1, 22050, 4), 512, 11100, 2),
+        (W::GSM610, (1, 44100, 0), 65, 8957, 2),
+        (W::ADPCM, (2, 8000, 4), 512, 8192, 32),
+        (W::DVI_ADPCM, (2, 8000, 4), 512, 8110, 2),
+        (W::ADPCM, (1, 11025, 4), 256, 5644, 32),
+        (W::DVI_ADPCM, (1, 11025, 4), 256, 5588, 2),
+        (W::GSM610, (1, 22050, 0), 65, 4478, 2),
+        (W::ADPCM, (1, 8000, 4), 256, 4096, 32),
+        (W::DVI_ADPCM, (1, 8000, 4), 256, 4055, 2),
+        (W::GSM610, (1, 11025, 0), 65, 2239, 2),
+        (W::GSM610, (1, 8000, 0), 65, 1625, 2),
+    ];
+    let rest =
+        rest.map(|(tag, shape, align, avg, extra)| audio_format(tag, shape, align, avg, extra));
+    [&aac[..], &[pcm(2, 44100)][..], &rest[..]].concat()
+}
+
+// What xrdp 0.10.1 with pipewire-module-xrdp offers.
+pub fn xrdp_formats() -> Vec<AudioFormat> {
+    let voxware = audio_format(WaveFormat::VOXWARE_BYTE_ALIGNED, (2, 44100, 16), 4, 176400, 0);
+    vec![pcm(2, 44100), pcm(2, 22050), voxware]
+}
+
+pub fn sound_formats(version: Version, formats: Vec<AudioFormat>) -> Vec<u8> {
+    let pdu = ServerAudioFormatPdu { version, formats };
+    encode_vec(&ServerAudioOutputPdu::AudioFormat(pdu)).unwrap()
+}
+
+pub fn sound_training() -> Vec<u8> {
+    let pdu = TrainingPdu { timestamp: 35090, data: vec![0; 1016] };
+    encode_vec(&ServerAudioOutputPdu::Training(pdu)).unwrap()
+}
+
+pub fn wave2(timestamp: u16, block: u8, data: &[u8]) -> Vec<u8> {
+    let pdu = Wave2Pdu {
+        timestamp,
+        format_no: 0,
+        block_no: block,
+        audio_timestamp: u32::from(timestamp),
+        data: data.into(),
+    };
+    encode_vec(&ServerAudioOutputPdu::Wave2(pdu)).unwrap()
+}
+
+// A WaveInfo PDU on its own, as xrdp sends it: the first 4 bytes of the block, and a body size
+// that also counts the rest of the block, which comes in the Wave PDU after it.
+pub fn wave_info(timestamp: u16, block: u8, data: &[u8]) -> Vec<u8> {
+    let info = WaveInfoPdu {
+        timestamp,
+        format_no: 0,
+        block_no: block,
+        data: data[..4].try_into().unwrap(),
+    };
+    let body = u16::try_from(data.len() + 8).unwrap();
+    [&[0x02, 0][..], &body.to_le_bytes()[..], &encode_vec(&info).unwrap()[..]].concat()
+}
+
+// The Wave PDU has no header: 4 bytes of padding, then the block from its fifth byte on.
+pub fn wave(data: &[u8]) -> Vec<u8> {
+    [&[0; 4][..], &data[4..]].concat()
 }
 
 pub fn monitor_layout(channels: &Channels) -> Vec<u8> {

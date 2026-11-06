@@ -179,6 +179,111 @@ Invoke-Command -VMName wisp-test-rdp -Credential $credential { Get-Content C:\wi
 - In the first session after setup `dwm.exe` crashed once in `dwmredir.dll` (Application log,
   0x80070490); nothing was seen of it from the client.
 
+## RD Gateway
+
+`Add-Gateway.ps1` makes the VM an RD Gateway for the gateway tests. From PowerShell on the host,
+in this folder, with the VM running:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Add-Gateway.ps1
+```
+
+Inside the VM through PowerShell Direct, each part only when it is not there yet:
+
+- the role `RDS-Gateway` with its management tools (`Install-WindowsFeature RDS-Gateway
+  -IncludeManagementTools`, about 4 minutes; it brings NPAS, IIS with Basic and Windows
+  authentication, the RPC-over-HTTP proxy and the RSAT parts along);
+- a self-signed certificate `CN=WISP-TEST-RDP` for the computer name and the VM's address, valid
+  for 2 years, in `Cert:\LocalMachine\My`, bound to the gateway
+  (`RDS:\GatewayServer\SSLCertificate\Thumbprint`); a bound certificate that has not expired is
+  kept;
+- the gateway-managed computer group `WispTestComputers`: the computer name, the VM's address,
+  `localhost`, `127.0.0.1`;
+- the CAP `WispCAP` (`Administrators@BUILTIN`, password logon) and the RAP `WispRAP`
+  (`Administrators@BUILTIN` to `WispTestComputers`, port 3389);
+- a restart of the `TSGateway` service when anything changed, as the gateway takes a new
+  certificate only then.
+
+The gateway listens on port 443 of the VM only, so a gateway on another port cannot be tried
+here. The role's firewall rule `Remote Desktop Gateway HTTP Listener` stays off, and 443 is
+reachable from the host anyway. It takes HTTP Basic as it is installed.
+
+The computer group holds the address the VM had when the script made it, and the Default Switch
+hands out another one after the host restarts (172.23.107.46 when the group was made on
+2026-10-28, 172.23.80.222 on 2026-11-06). The tests therefore reach the RDP server through the
+gateway by the computer name, which does not change. The certificate keeps the old address too;
+the client pins it (`rdg/<address>` at port 443), so that does not matter to the tests.
+
+On 2026-11-06 the script found everything in place and changed nothing:
+
+```
+role: in place
+certificate: in place, BB64D137FDD4AA27B704F52677E0093DD92C8E8E, CN=WISP-TEST-RDP, until 2028-10-28
+computer group: in place, 127.0.0.1, 172.23.107.46, localhost, WISP-TEST-RDP
+CAP: in place
+RAP: in place
+RAP port: in place, 3389
+gateway: not restarted, Running
+```
+
+To undo it, inside the VM (PowerShell Direct, as `wisp`):
+
+```powershell
+Import-Module RemoteDesktopServices
+Remove-Item RDS:\GatewayServer\RAP\WispRAP -Recurse
+Remove-Item RDS:\GatewayServer\CAP\WispCAP -Recurse
+Remove-Item RDS:\GatewayServer\GatewayManagedComputerGroups\WispTestComputers -Recurse
+Uninstall-WindowsFeature RDS-Gateway,NPAS,Web-Server,RPC-over-HTTP-Proxy -IncludeManagementTools
+Remove-Item Cert:\LocalMachine\My\<thumbprint>     # restart first if the uninstall asks for it
+```
+
+## Scripts in the session
+
+`\\tsclient` and the session's sound exist only inside the RDP session; PowerShell Direct runs in
+a session of its own. `Invoke-InSession.ps1` runs a script inside `wisp`'s logged-on session and
+prints what it printed:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Invoke-InSession.ps1 -Script 'Get-ChildItem C:\'
+```
+
+It writes the script to `C:\wisp\insession\`, registers the scheduled task `WispInSession` when
+it is missing (`wisp`, interactive, not elevated, at most one at a time), starts it and waits
+for `C:\wisp\insession\out.txt`, which the task writes once the script is done (`-Wait`, 60 s
+unless given). It fails when `wisp` has no session. The live tests pass their PowerShell Direct
+session with `-Session`. To remove the task and the folder:
+
+```powershell
+Unregister-ScheduledTask -TaskName WispInSession -Confirm:$false
+Remove-Item -Recurse C:\wisp\insession
+```
+
+## What was measured for sound, the shared folder and the gateway (2026-11-06)
+
+- Sound: nothing in the VM had to change (the Windows Audio service runs, redirection is on).
+  Windows sends rdpsnd only to a client that also has an rdpdr channel: without one the session's
+  `Remote Audio` device takes 5.4 s to open (`waveOutOpen`), a 2 s sound takes 7.5 s to play, and
+  nothing comes; the client therefore always attaches rdpdr with sound on, without drives when no
+  folder is shared. With it, 2 s of silence at 44100 Hz, 2 channels, 16 bit arrive as 11 Wave2
+  blocks of 32768 bytes (360,448 bytes), directly and through the gateway.
+- The shared folder: patterns reach the client as typed (`\a?c.txt`, `\*.txt`, `\a??.txt`,
+  `\*.t?t`, `\*.`), never with the DOS wildcards `<`, `>` or `"`; `*.*` arrives as `*`. The client
+  matches them as FindFirstFile does in a local NTFS folder, so `dir *.` lists the names without a
+  dot there too.
+- `..\..\Windows\win.ini` arrives as `\Windows\win.ini`; `readme.txt:ads` and every path through a
+  junction to a folder beside the share are refused with STATUS_ACCESS_DENIED, which PowerShell
+  shows as `Access is denied`.
+- `FileStream.Flush($true)`, `Get-Acl` and `icacls` never reach the client: Windows answers them
+  itself (owner `Everyone`, `No permissions are set. All users have full control.`).
+  `FileStream.Lock()` does, gets STATUS_NOT_SUPPORTED and fails with `The request is not
+  supported.`; a second open of a file that is open reads it.
+- Gateway: a wrong gateway password gets a 401 that offers Basic; a server outside the RAP's
+  computer group (192.0.2.1) is refused with 0x800759da (E_PROXY_RAP_ACCESSDENIED), event 301 in
+  the gateway's log. A copy of 100,000 bytes from the share is one read of 100,000 bytes, written
+  back through the tunnel in packets of at most 8 KB. In a session of 5 minutes through it (2.5
+  minutes without input, then a key every 30 s) the gateway sent no WebSocket ping or pong and no
+  MS-TSGU keepalive.
+
 ## Live tests
 
 With the VM running (and the xrdp container up for the xrdp tests):
@@ -187,14 +292,17 @@ With the VM running (and the xrdp container up for the xrdp tests):
 cargo test --manifest-path src-tauri/Cargo.toml --test live_rdp -- --ignored --test-threads=1
 ```
 
-A Windows test that does not find the VM running prints why and passes. The tests keep one
+A Windows test that does not find the VM running prints why and passes. The two gateway tests,
+`windows_through_the_gateway` and `windows_gateway_names_each_refusal`, also need
+`Add-Gateway.ps1` run once on a VM that `New-TestVm.ps1` made. The tests keep one
 PowerShell process with one PowerShell Direct session for the whole run. One test turns the VM
 off and starts it again; one logs the session off; the German layout test logs the session off
 first when the probe reports another layout, and the next test that wants the US layout does
 the same. The VM is left running.
 
-The last test, `windows_turned_off_ends_the_session`, also ends the session `wisp` was left in.
-A filtered run that skips it leaves a disconnected `wisp` session in the VM; to log it off:
+The last test, `windows_what_applications_do_on_the_share_works`, logs off the session `wisp`
+was left in. A filtered run that skips it leaves a disconnected `wisp` session in the VM; to log
+it off:
 
 ```powershell
 $credential = Get-Credential wisp     # Wisp-Test-2026

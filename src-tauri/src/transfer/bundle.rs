@@ -146,7 +146,11 @@ fn known_fields(payload: &Payload) -> AppResult<()> {
         && payload.sftp_profiles.iter().all(|p| p.extra.is_empty())
         && payload.s3_profiles.iter().all(|p| p.extra.is_empty())
         && payload.vnc_profiles.iter().all(|p| p.extra.is_empty())
-        && payload.rdp_profiles.iter().all(|p| p.extra.is_empty());
+        && payload.rdp_profiles.iter().all(|p| {
+            p.extra.is_empty()
+                && p.shared_folder.as_ref().is_none_or(|f| f.extra.is_empty())
+                && p.gateway.as_ref().is_none_or(|g| g.extra.is_empty())
+        });
     if known {
         Ok(())
     } else {
@@ -210,7 +214,7 @@ pub fn read(bytes: &[u8], password: Option<&str>) -> AppResult<Opened> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::model::{AuthMethod, IconRef, Profile, S3Profile};
+    use crate::store::model::{AuthMethod, IconRef, Profile, RdpGateway, S3Profile, SharedFolder};
 
     fn profile(id: &str) -> Profile {
         Profile {
@@ -257,6 +261,9 @@ mod tests {
             domain: Some("CORP".into()),
             secret_id: Some("rdp-1".into()),
             keyboard_layout: Some(0x407),
+            audio: true,
+            shared_folder: None,
+            gateway: None,
             icon: IconRef::default(),
             order: 0,
             extra: Default::default(),
@@ -440,6 +447,66 @@ mod tests {
     }
 
     #[test]
+    fn version_two_files_from_before_sound_folder_and_gateway_read_with_sound_and_neither() {
+        let mut old = serde_json::to_value(rdp("r1")).unwrap();
+        for field in ["audio", "sharedFolder", "gateway"] {
+            assert!(old.as_object_mut().unwrap().remove(field).is_some());
+        }
+        let payload = serde_json::json!({
+            "groups": [], "profiles": [], "sftpProfiles": [], "s3Profiles": [],
+            "vncProfiles": [], "rdpProfiles": [old], "secrets": {}, "keyFiles": {}
+        });
+        for (file, password) in version_two_files(&payload) {
+            let Opened::Payload(p) = read(file.to_string().as_bytes(), password).unwrap() else {
+                panic!()
+            };
+            let r = &p.rdp_profiles[0];
+            assert!(r.audio, "{password:?}");
+            assert_eq!((&r.shared_folder, &r.gateway), (&None, &None));
+            assert!(r.extra.is_empty());
+            assert_eq!(p.rdp_profiles, [rdp("r1")]);
+        }
+    }
+
+    #[test]
+    fn rdp_sound_folder_and_gateway_round_trip_in_a_version_two_file() {
+        let office = RdpProfile {
+            audio: false,
+            shared_folder: Some(SharedFolder {
+                path: "C:\\Users\\faye".into(),
+                name: "faye".into(),
+                extra: Default::default(),
+            }),
+            gateway: Some(RdpGateway {
+                host: "gw.corp".into(),
+                port: 8443,
+                same_login: false,
+                username: "CORP\\gw".into(),
+                secret_id: Some("rdp-gw".into()),
+                extra: Default::default(),
+            }),
+            ..rdp("r1")
+        };
+        let plain = Payload { rdp_profiles: vec![office], ..Default::default() };
+        let mut sealed = plain.clone();
+        sealed.secrets.insert("rdp-1".into(), Zeroizing::new("hunter2".into()));
+        sealed.secrets.insert("rdp-gw".into(), Zeroizing::new("gateway".into()));
+        for (payload, password) in [(&plain, None), (&sealed, Some("pw"))] {
+            let bytes = write(payload, password).unwrap();
+            assert!(matches!(
+                read(&bytes, password).unwrap(),
+                Opened::Payload(back) if &back == payload
+            ));
+        }
+        let value: serde_json::Value =
+            serde_json::from_slice(&write(&plain, None).unwrap()).unwrap();
+        let written = &value["payload"]["rdpProfiles"][0];
+        assert_eq!(written["audio"], false);
+        assert_eq!(written["sharedFolder"]["name"], "faye");
+        assert_eq!(written["gateway"]["secretId"], "rdp-gw");
+    }
+
+    #[test]
     fn version_two_files_from_before_rdp_profiles_still_read() {
         let old = serde_json::json!({
             "groups": [], "profiles": [profile("p1")], "sftpProfiles": [], "s3Profiles": [],
@@ -560,7 +627,7 @@ mod tests {
         let kinds = ["groups", "profiles", "sftpProfiles", "s3Profiles", "vncProfiles"];
         for kind in ["rdpProfiles"].into_iter().chain(kinds) {
             let mut newer = known.clone();
-            newer[kind][0]["gateway"] = serde_json::json!({ "host": "gw.lan", "port": 443 });
+            newer[kind][0]["later"] = serde_json::json!({ "host": "gw.lan", "port": 443 });
             for (file, password) in version_two_files(&newer) {
                 assert!(
                     matches!(
@@ -569,6 +636,32 @@ mod tests {
                             if told == "this file was made by a newer version of Wisp"
                     ),
                     "{kind} {password:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_folder_or_gateway_with_fields_this_build_does_not_know_is_refused() {
+        let mut rdp = serde_json::to_value(rdp("r1")).unwrap();
+        rdp["sharedFolder"] = serde_json::json!({ "path": "/s", "name": "s" });
+        rdp["gateway"] = serde_json::json!({ "host": "gw", "port": 443, "sameLogin": true,
+            "username": "", "secretId": null });
+        let known = serde_json::json!({ "rdpProfiles": [rdp], "secrets": {}, "keyFiles": {} });
+        for (file, password) in version_two_files(&known) {
+            assert!(read(file.to_string().as_bytes(), password).is_ok(), "{password:?}");
+        }
+        for nested in ["sharedFolder", "gateway"] {
+            let mut newer = known.clone();
+            newer["rdpProfiles"][0][nested]["later"] = serde_json::json!({ "auth": "ntlm" });
+            for (file, password) in version_two_files(&newer) {
+                assert!(
+                    matches!(
+                        read(file.to_string().as_bytes(), password),
+                        Err(AppError::Import(told))
+                            if told == "this file was made by a newer version of Wisp"
+                    ),
+                    "{nested} {password:?}"
                 );
             }
         }

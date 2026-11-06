@@ -156,3 +156,82 @@ test('changed certificate prompt warns and shows stored vs offered', () => {
   expect(screen.getByText(/stored: old/)).toBeInTheDocument()
   expect(screen.getByText(/offered: new/)).toBeInTheDocument()
 })
+
+test('a gateway certificate prompt names the gateway', () => {
+  const { rerender } = render(
+    <HostKeyDialog
+      prompt={{
+        kind: 'unknown',
+        host: 'rdg/gate.lan',
+        port: 443,
+        fingerprint: 'SHA256:abc',
+        certificate: true,
+      }}
+      onAccept={vi.fn()}
+      onReject={vi.fn()}
+    />,
+  )
+  expect(screen.getByRole('heading', { name: 'Unknown gateway certificate' })).toBeInTheDocument()
+  expect(screen.getByText('gate.lan:443')).toBeInTheDocument()
+  expect(
+    screen.getByText('First connection to this gateway. Trust this certificate?'),
+  ).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Trust' })).toBeInTheDocument()
+
+  rerender(
+    <HostKeyDialog
+      prompt={{
+        kind: 'mismatch',
+        host: 'rdg/gate.lan',
+        port: 443,
+        stored: 'old',
+        offered: 'new',
+        certificate: true,
+      }}
+      onAccept={vi.fn()}
+      onReject={vi.fn()}
+    />,
+  )
+  expect(screen.getByRole('heading', { name: 'Gateway certificate CHANGED' })).toBeInTheDocument()
+  expect(screen.getByText('gate.lan:443')).toBeInTheDocument()
+  expect(
+    screen.getByText(
+      'The certificate has changed - this may indicate a man-in-the-middle attack. Only accept if you know it was replaced.',
+    ),
+  ).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Accept changed certificate' })).toBeInTheDocument()
+})
+
+test('vnc and rdp certificate prompts keep their wording next to gateway ones', () => {
+  for (const host of ['vnc/desk', 'rdp/desk']) {
+    const { unmount } = render(
+      <HostKeyDialog
+        prompt={{ kind: 'unknown', host, port: 3389, fingerprint: 'SHA256:abc', certificate: true }}
+        onAccept={vi.fn()}
+        onReject={vi.fn()}
+      />,
+    )
+    expect(screen.getByRole('heading', { name: 'Unknown certificate' })).toBeInTheDocument()
+    expect(
+      screen.getByText('First connection to this server. Trust this certificate?'),
+    ).toBeInTheDocument()
+    unmount()
+
+    const changed = render(
+      <HostKeyDialog
+        prompt={{
+          kind: 'mismatch',
+          host,
+          port: 3389,
+          stored: 'old',
+          offered: 'new',
+          certificate: true,
+        }}
+        onAccept={vi.fn()}
+        onReject={vi.fn()}
+      />,
+    )
+    expect(screen.getByRole('heading', { name: 'Certificate CHANGED' })).toBeInTheDocument()
+    changed.unmount()
+  }
+})

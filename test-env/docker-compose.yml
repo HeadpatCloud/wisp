@@ -87,5 +87,10 @@ services:
       dockerfile: xrdp/Dockerfile
     container_name: wisp-test-xrdp
     init: true
+    # The shared folder of a session is a FUSE mount
+    devices:
+      - /dev/fuse
+    cap_add:
+      - SYS_ADMIN
     ports:
       - "127.0.0.1:3391:3389"

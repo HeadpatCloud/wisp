@@ -3,8 +3,10 @@
 //   cargo test --manifest-path src-tauri/Cargo.toml --test live_rdp -- --ignored --test-threads=1
 
 use std::collections::HashSet;
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::path::Path;
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -13,9 +15,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout, timeout_at};
-use wisp_lib::live_rdp::{Input, RdpSessions, Session, Target};
+use wisp_lib::live_rdp::{Gateway, Input, RdpSessions, Session, Share, Target};
 use wisp_lib::{AppError, FrameOp, KnownHosts, KnownHostsState};
 
 const CONTAINER: &str = "wisp-test-xrdp";
@@ -170,6 +173,17 @@ fn log_since(from: usize) -> String {
     text(&root(&format!("tail -n +{} /var/log/xrdp.log", from + 1)))
 }
 
+// The channel server's logs, one for each display, which outlive restarts too.
+const CHANSRV_LOGS: &str = "cat ~/.local/share/xrdp/xrdp-chansrv.*.log";
+
+fn chansrv_lines() -> usize {
+    text(&inside(&format!("{CHANSRV_LOGS} | wc -l"))).parse().unwrap()
+}
+
+fn chansrv_since(from: usize) -> String {
+    text(&inside(&format!("{CHANSRV_LOGS} | tail -n +{}", from + 1)))
+}
+
 // As the session reports a certificate: SHA256 and the digest in lower-case hex.
 fn fingerprint() -> String {
     let printed = text(&root("openssl x509 -in /etc/xrdp/cert.pem -noout -fingerprint -sha256"));
@@ -238,6 +252,9 @@ async fn connect(
         height: size.1,
         scale: 100,
         keyboard_layout: 0x409,
+        audio: false,
+        share: None,
+        gateway: None,
     };
     connect_to(&target, known).await
 }
@@ -621,6 +638,236 @@ async fn close_ends_within_a_second_and_xrdp_logs_the_disconnect() {
     assert!(!logged.contains("SSL_read"), "{logged}");
 }
 
+async fn open_extras(audio: bool, share: Option<Share<'_>>) -> View {
+    let (_dir, known) = known(Some(&fingerprint()));
+    let target = Target {
+        host: HOST,
+        port: PORT,
+        username: USER,
+        domain: None,
+        password: PASSWORD,
+        width: SIZE.0,
+        height: SIZE.1,
+        scale: 100,
+        keyboard_layout: 0x409,
+        audio,
+        share,
+        gateway: None,
+    };
+    let (session, ops) = connect_to(&target, &known).await;
+    View::new(session.unwrap_or_else(|e| panic!("{e}")), ops)
+}
+
+// pipewire's socket is in the runtime folder startwm.sh makes.
+const PIPEWIRE: &str = "XDG_RUNTIME_DIR=/tmp/xdg-$(id -u)";
+
+fn has_sink() -> bool {
+    let nodes = text(&inside(&format!("{PIPEWIRE} pw-cli ls Node")));
+    nodes.contains("node.name = \"xrdp-sink\"")
+}
+
+// Two seconds of silence, so that nothing is heard here. The view goes on taking what the session
+// sends meanwhile.
+async fn play_silence(view: &mut View) {
+    let pw_cat = "pw-cat -p -a --target xrdp-sink --rate 44100 --channels 2 --format s16 -";
+    let play = format!("head -c 352800 /dev/zero | {PIPEWIRE} {pw_cat}");
+    let playing = tokio::task::spawn_blocking(move || inside(&play));
+    while !playing.is_finished() {
+        view.idle(Duration::from_millis(50)).await;
+    }
+    playing.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn xrdp_plays_sound() {
+    let from = chansrv_lines();
+    let mut view = open_extras(true, None).await;
+    view.until("whole screen", View::whole).await;
+    settles("xrdp's sink", true, has_sink).await;
+    let started = Instant::now();
+    hears_silence(&mut view).await;
+    println!("{} bytes played after {:?}", view.session.played(), started.elapsed());
+    // What xrdp_with_sound_off_gets_none finds missing.
+    let logged = chansrv_since(from);
+    assert!(logged.contains("sound_process_output_format"), "{logged}");
+
+    // The session still shows what happens inside.
+    let _root = Restore("xsetroot -solid black".into());
+    inside("xsetroot -solid '#306090'");
+    let shown = |view: &View| near(view.pixel(1200, 780), [0x30, 0x60, 0x90]);
+    view.until("the root window's new colour", shown).await;
+    // `close` also finds that no PDU was skipped as unhandled, rdpsnd's included.
+    view.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn xrdp_with_sound_off_gets_none() {
+    let from = chansrv_lines();
+    let mut view = open_extras(false, None).await;
+    view.until("whole screen", View::whole).await;
+    settles("xrdp's sink", true, has_sink).await;
+    play_silence(&mut view).await;
+    view.idle(Duration::from_secs(2)).await;
+    view.close().await;
+    // The silent player counts nothing, so only xrdp can tell: it logs each format the client
+    // takes, and without one it sends no sound.
+    let logged = chansrv_since(from);
+    assert!(logged.contains("connection accepted"), "not this session's log: {logged}");
+    assert!(!logged.contains("sound_process_output_format"), "{logged}");
+}
+
+async fn hears_silence(view: &mut View) {
+    let before = view.session.played();
+    let started = Instant::now();
+    play_silence(view).await;
+    while view.session.played() - before < 300_000 {
+        let played = view.session.played() - before;
+        assert!(started.elapsed() < WAIT, "{played} bytes played");
+        view.idle(Duration::from_millis(100)).await;
+    }
+}
+
+// xrdp 0.10.1's channel server ends when a connection without the sound channel closes after one
+// with it in the same session, which then has no sound, clipboard or shared folder.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn xrdp_keeps_its_channel_server_after_a_connection_with_sound_off() {
+    let mut view = open_extras(true, None).await;
+    view.until("whole screen", View::whole).await;
+    settles("xrdp's sink", true, has_sink).await;
+    hears_silence(&mut view).await;
+    view.close().await;
+
+    let mut view = open_extras(false, None).await;
+    view.until("whole screen", View::whole).await;
+    view.close().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("readme.txt"), "hello\n").unwrap();
+    let mut view = open_extras(true, Some(Share { root: dir.path(), name: "wisp" })).await;
+    view.until("whole screen", View::whole).await;
+    drive_shown().await;
+    assert_eq!(inside(&format!("cat {DRIVE}/readme.txt")), b"hello\n");
+    settles("xrdp's sink", true, has_sink).await;
+    hears_silence(&mut view).await;
+    view.close().await;
+}
+
+const DRIVE: &str = "~/thinclient_drives/wisp";
+
+async fn drive_shown() {
+    let shown = || text(&inside(&format!("test -d {DRIVE} && echo shown; true"))) == "shown";
+    settles("the shared folder inside", true, shown).await;
+}
+
+// As `inside`, for a command that has to fail. What it printed is its error.
+fn fails_inside(script: &str) -> String {
+    let ran = docker(&[&AS_USER[..], &["sh", "-c", script]].concat());
+    assert!(!ran.ok, "`{script}` worked: {}", text(&ran.out));
+    text(&ran.err)
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn xrdp_shared_folder_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("readme.txt"), "hello\n").unwrap();
+    fs::write(root.join("move.txt"), "moved\n").unwrap();
+    fs::write(root.join("gone.txt"), "gone\n").unwrap();
+    fs::write(root.join("cut.txt"), "abcdef\n").unwrap();
+    fs::create_dir(root.join("empty")).unwrap();
+    let out: Vec<u8> = (0..102_400u32).map(|n| (n * 7 + n / 251) as u8).collect();
+    fs::write(root.join("out.bin"), &out).unwrap();
+
+    let mut view = open_extras(false, Some(Share { root, name: "wisp" })).await;
+    view.until("whole screen", View::whole).await;
+    drive_shown().await;
+    let _copies = Restore("rm -f /tmp/out.bin /tmp/in.bin".into());
+
+    let listed = text(&inside(&format!("ls -A {DRIVE}")));
+    assert_eq!(listed, "cut.txt\nempty\ngone.txt\nmove.txt\nout.bin\nreadme.txt");
+    assert_eq!(inside(&format!("cat {DRIVE}/readme.txt")), b"hello\n");
+
+    inside(&format!("echo written > {DRIVE}/new.txt"));
+    assert_eq!(fs::read(root.join("new.txt")).unwrap(), b"written\n");
+    inside(&format!("mv {DRIVE}/move.txt {DRIVE}/moved.txt"));
+    assert!(!root.join("move.txt").exists());
+    assert_eq!(fs::read(root.join("moved.txt")).unwrap(), b"moved\n");
+    inside(&format!("rm {DRIVE}/gone.txt"));
+    assert!(!root.join("gone.txt").exists());
+    inside(&format!("mkdir {DRIVE}/newdir"));
+    assert!(root.join("newdir").is_dir());
+    inside(&format!("rmdir {DRIVE}/empty"));
+    assert!(!root.join("empty").exists());
+    inside(&format!("truncate -s 3 {DRIVE}/cut.txt"));
+    assert_eq!(fs::read(root.join("cut.txt")).unwrap(), b"abc");
+
+    let copy = format!("cp {DRIVE}/out.bin /tmp/out.bin && sha256sum /tmp/out.bin");
+    let copied = text(&inside(&copy));
+    assert_eq!(copied, format!("{}  /tmp/out.bin", sha256(&out)));
+    let made = "head -c 307200 /dev/urandom > /tmp/in.bin";
+    let copied = format!("{made}; cp /tmp/in.bin {DRIVE}/in.bin; sha256sum /tmp/in.bin");
+    let copied = text(&inside(&copied));
+    let arrived = fs::read(root.join("in.bin")).unwrap();
+    assert_eq!(arrived.len(), 307_200);
+    assert_eq!(copied, format!("{}  /tmp/in.bin", sha256(&arrived)));
+    view.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn xrdp_cannot_leave_the_shared_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("share");
+    let beside = dir.path().join("beside");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&beside).unwrap();
+    fs::write(root.join("readme.txt"), "hello\n").unwrap();
+    fs::write(root.join("later.txt"), "still here\n").unwrap();
+    fs::write(beside.join("secret.txt"), "secret\n").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&beside, root.join("out")).unwrap();
+    // A junction, unlike a symbolic link, needs no privilege.
+    #[cfg(windows)]
+    {
+        let junction = Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(root.join("out"))
+            .arg(&beside)
+            .output()
+            .unwrap();
+        assert!(junction.status.success(), "mklink: {}", text(&junction.stdout));
+    }
+
+    let mut view = open_extras(false, Some(Share { root: &root, name: "wisp" })).await;
+    view.until("whole screen", View::whole).await;
+    drive_shown().await;
+    assert_eq!(inside(&format!("cat {DRIVE}/readme.txt")), b"hello\n");
+
+    // The client's refusal, ACCESS_DENIED, shows as "Permission denied". A path that is merely not
+    // there fails too, with "No such file or directory".
+    for script in [
+        format!("cat {DRIVE}/out/secret.txt"),
+        format!("echo changed > {DRIVE}/out/secret.txt"),
+        format!("cat {DRIVE}/readme.txt:ads"),
+    ] {
+        let refused = fails_inside(&script);
+        println!("{refused}");
+        assert!(refused.ends_with("Permission denied"), "`{script}`: {refused}");
+    }
+    assert_eq!(fs::read(beside.join("secret.txt")).unwrap(), b"secret\n");
+    // A file not read before, so that only the client can answer: the share still works.
+    assert_eq!(inside(&format!("cat {DRIVE}/later.txt")), b"still here\n");
+    view.close().await;
+}
+
 // The Windows Server VM of test-env/windows, which has to be running in Hyper-V.
 
 const VM: &str = "wisp-test-rdp";
@@ -798,6 +1045,9 @@ fn windows<'a>(
         height: SIZE.1,
         scale: 100,
         keyboard_layout,
+        audio: false,
+        share: None,
+        gateway: None,
     }
 }
 
@@ -820,11 +1070,14 @@ impl View {
 }
 
 async fn open_windows(address: &str, keyboard_layout: u32) -> View {
-    if probe_text("layout.txt") != format!("{keyboard_layout:04x}") {
+    open_windows_to(windows(address, "wisp", None, WINDOWS_PASSWORD, keyboard_layout)).await
+}
+
+async fn open_windows_to(target: Target<'_>) -> View {
+    if probe_text("layout.txt") != format!("{:04x}", target.keyboard_layout) {
         log_off().await;
     }
-    let (_dir, known) = known_at(address, WINDOWS_PORT, Some(&windows_fingerprint()));
-    let target = windows(address, "wisp", None, WINDOWS_PASSWORD, keyboard_layout);
+    let (_dir, known) = known_at(target.host, WINDOWS_PORT, Some(&windows_fingerprint()));
     let (session, ops) = connect_to(&target, &known).await;
     let mut view = View::new(session.unwrap_or_else(|e| panic!("{e}")), ops);
     // As the app does before the first key: the session keeps them from the last connection.
@@ -1363,5 +1616,480 @@ async fn windows_closing_every_session_at_the_exit_leaves_the_disconnected_sessi
             }
         }
         view.close().await;
+    }
+}
+
+// Sound, the shared folder and the RD Gateway that test-env/windows/Add-Gateway.ps1 sets up.
+
+const TSCLIENT: &str = "\\\\tsclient\\wisp";
+const GATEWAY_PORT: u16 = 443;
+
+// Inside wisp's session, where \\tsclient and the session's sound are, on the PowerShell Direct
+// session of `in_guest`.
+fn in_session(script: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = path.join("../test-env/windows/Invoke-InSession.ps1");
+    let code = BASE64.encode(script);
+    let printed = on_host(&format!(
+        "InGuest '' | Out-Null; & '{}' -Script (Decode '{code}') -Session $guest",
+        path.display()
+    ));
+    printed.replace("\r\n", "\n")
+}
+
+impl View {
+    // The view goes on taking what the session sends while the script runs.
+    async fn in_session(&mut self, script: &str) -> String {
+        let script = script.to_owned();
+        let running = tokio::task::spawn_blocking(move || in_session(&script));
+        while !running.is_finished() {
+            self.idle(Duration::from_millis(50)).await;
+        }
+        running.await.unwrap()
+    }
+
+    async fn drive_shown(&mut self) {
+        let started = Instant::now();
+        while self.in_session(&format!("Test-Path {TSCLIENT}")).await != "True" {
+            assert!(started.elapsed() < WAIT, "no {TSCLIENT} inside");
+        }
+    }
+
+    // The session still shows what happens inside.
+    async fn shows_a_new_colour(&mut self) {
+        let _colour = Undo("[IO.File]::WriteAllText('C:\\wisp\\colour.txt', '306090')".into());
+        set_probe_file("colour.txt", "a05030");
+        let (x, y) = (self.size.0 - 100, self.size.1 - 100);
+        let shown = |view: &View| near(view.pixel(x, y), [0xa0, 0x50, 0x30]);
+        self.until("the probe's new colour", shown).await;
+    }
+
+    async fn types_into_the_probe(&self) {
+        self.click_box().await;
+        self.keys(&[CONTROL, A]).await;
+        self.keys(&[BACKSPACE]).await;
+        settles("an empty text box", String::new(), typed).await;
+        for keys in [&[A][..], &[SHIFT, B], &[ONE], &[SHIFT, ONE]] {
+            self.keys(keys).await;
+        }
+        settles("the typed text", "aB1!".to_owned(), typed).await;
+    }
+}
+
+async fn open_windows_with(address: &str, audio: bool, share: Option<Share<'_>>) -> View {
+    let target = windows(address, "wisp", None, WINDOWS_PASSWORD, US);
+    open_windows_to(Target { audio, share, ..target }).await
+}
+
+// Two seconds of silence at 44100 Hz, 2 channels and 16 bit, so that nothing is heard here.
+const PLAY_SILENCE: &str = r"$path = Join-Path $env:TEMP 'wisp-silence.wav'
+$data = 2 * 44100 * 2 * 2
+$out = New-Object IO.BinaryWriter([IO.File]::Create($path))
+$out.Write([Text.Encoding]::ASCII.GetBytes('RIFF')); $out.Write([int](36 + $data))
+$out.Write([Text.Encoding]::ASCII.GetBytes('WAVEfmt ')); $out.Write([int]16)
+$out.Write([int16]1); $out.Write([int16]2); $out.Write([int]44100); $out.Write([int](44100 * 4))
+$out.Write([int16]4); $out.Write([int16]16)
+$out.Write([Text.Encoding]::ASCII.GetBytes('data')); $out.Write([int]$data)
+$out.Write((New-Object byte[] $data))
+$out.Close()
+(New-Object System.Media.SoundPlayer $path).PlaySync()
+Remove-Item $path
+'played'";
+
+impl View {
+    async fn plays_silence(&mut self) {
+        let before = self.session.played();
+        let started = Instant::now();
+        assert_eq!(self.in_session(PLAY_SILENCE).await, "played");
+        while self.session.played() - before < 300_000 {
+            let played = self.session.played() - before;
+            assert!(started.elapsed() < WAIT, "{played} bytes played");
+            self.idle(Duration::from_millis(100)).await;
+        }
+        // Until half a second passes without a block (Windows sends one every 186 ms), so that the
+        // count printed is the whole sound.
+        let mut played = self.session.played();
+        loop {
+            self.idle(Duration::from_millis(500)).await;
+            if self.session.played() == played {
+                break;
+            }
+            played = self.session.played();
+            assert!(started.elapsed() < WAIT, "{} bytes and more played", played - before);
+        }
+        println!("{} bytes played after {:?}", played - before, started.elapsed());
+    }
+}
+
+fn hundred_kb() -> Vec<u8> {
+    (0..100_000u32).map(|n| (n * 7 + n / 251) as u8).collect()
+}
+
+// A file of the share copied into the session: its SHA-256 and its length there.
+fn copy_out(name: &str) -> String {
+    format!(
+        "$copy = Join-Path $env:TEMP 'wisp-{name}'; Copy-Item {TSCLIENT}\\{name} $copy; \
+         (Get-FileHash $copy -Algorithm SHA256).Hash.ToLower(); (Get-Item $copy).Length; \
+         Remove-Item $copy"
+    )
+}
+
+// Each attempt prints `<what>: done <output>` or `<what>: <the error>`.
+const ATTEMPT: &str = r#"function Attempt($what, $action) {
+    $ErrorActionPreference = 'Stop'
+    try { "${what}: done $(& $action)" } catch {
+        # A .NET method's error comes wrapped, its own message inside.
+        $e = $_.Exception; if ($e.InnerException) { $e = $e.InnerException }
+        "${what}: $($e.Message.Trim())"
+    }
+}
+"#;
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn windows_plays_sound() {
+    let Some(address) = vm() else { return };
+    let mut view = open_windows_with(&address, true, None).await;
+    view.plays_silence().await;
+    view.shows_a_new_colour().await;
+    // `close` also finds that no PDU was skipped as unhandled, rdpsnd's included.
+    view.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn windows_shared_folder_works() {
+    let Some(address) = vm() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for name in ["abc.txt", "abd.txt", "axc.txt", "noext"] {
+        fs::write(root.join(name), name).unwrap();
+    }
+    fs::write(root.join("readme.txt"), "hello\r\n").unwrap();
+    fs::write(root.join("move.txt"), "moved\r\n").unwrap();
+    fs::write(root.join("gone.txt"), "gone\r\n").unwrap();
+    fs::create_dir(root.join("empty")).unwrap();
+    let out = hundred_kb();
+    fs::write(root.join("out.bin"), &out).unwrap();
+
+    let mut view = open_windows_with(&address, false, Some(Share { root, name: "wisp" })).await;
+    view.drive_shown().await;
+    let listed = format!("Get-ChildItem {TSCLIENT} | Sort-Object Name | ForEach-Object Name");
+    assert_eq!(
+        view.in_session(&listed).await,
+        "abc.txt\nabd.txt\naxc.txt\nempty\ngone.txt\nmove.txt\nnoext\nout.bin\nreadme.txt"
+    );
+    // What `dir` lists of the same names in a local folder.
+    let matching = |pattern: &str| format!("cmd /c dir /b /on {TSCLIENT}\\{pattern}");
+    assert_eq!(view.in_session(&matching("a?c.txt")).await, "abc.txt\naxc.txt");
+    assert_eq!(
+        view.in_session(&matching("*.txt")).await,
+        "abc.txt\nabd.txt\naxc.txt\ngone.txt\nmove.txt\nreadme.txt"
+    );
+    assert_eq!(view.in_session(&matching("*.")).await, "empty\nnoext");
+    assert_eq!(view.in_session(&format!("Get-Content {TSCLIENT}\\readme.txt")).await, "hello");
+
+    let write = format!("Set-Content {TSCLIENT}\\written.txt 'written by the server'");
+    assert_eq!(view.in_session(&write).await, "");
+    assert_eq!(fs::read(root.join("written.txt")).unwrap(), b"written by the server\r\n");
+    assert_eq!(view.in_session(&format!("Rename-Item {TSCLIENT}\\move.txt moved.txt")).await, "");
+    assert!(!root.join("move.txt").exists());
+    assert_eq!(fs::read(root.join("moved.txt")).unwrap(), b"moved\r\n");
+    assert_eq!(view.in_session(&format!("Remove-Item {TSCLIENT}\\gone.txt")).await, "");
+    assert!(!root.join("gone.txt").exists());
+    let mkdir = format!("New-Item -ItemType Directory {TSCLIENT}\\newdir | Out-Null");
+    assert_eq!(view.in_session(&mkdir).await, "");
+    assert!(root.join("newdir").is_dir());
+    assert_eq!(view.in_session(&format!("Remove-Item {TSCLIENT}\\empty")).await, "");
+    assert!(!root.join("empty").exists());
+
+    assert_eq!(view.in_session(&copy_out("out.bin")).await, format!("{}\n100000", sha256(&out)));
+    let copy_in = format!(
+        "$made = Join-Path $env:TEMP 'wisp-in.bin'; $bytes = New-Object byte[] 300000; \
+         (New-Object Random).NextBytes($bytes); [IO.File]::WriteAllBytes($made, $bytes); \
+         Copy-Item $made {TSCLIENT}\\in.bin; \
+         (Get-FileHash $made -Algorithm SHA256).Hash.ToLower(); Remove-Item $made"
+    );
+    let copied = view.in_session(&copy_in).await;
+    let arrived = fs::read(root.join("in.bin")).unwrap();
+    assert_eq!(arrived.len(), 300_000);
+    assert_eq!(copied, sha256(&arrived));
+    view.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn windows_cannot_leave_the_shared_folder() {
+    let Some(address) = vm() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    // Two levels down, so that ..\..\Windows\win.ini of the share would be the one made here.
+    let root = dir.path().join("a").join("share");
+    let beside = dir.path().join("a").join("beside");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir(&beside).unwrap();
+    fs::create_dir(dir.path().join("Windows")).unwrap();
+    fs::write(dir.path().join("Windows").join("win.ini"), "outside\r\n").unwrap();
+    fs::write(root.join("readme.txt"), "hello\r\n").unwrap();
+    fs::write(root.join("later.txt"), "still here\r\n").unwrap();
+    fs::write(beside.join("secret.txt"), "secret\r\n").unwrap();
+    // A junction, unlike a symbolic link, needs no privilege.
+    let junction = Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(root.join("out"))
+        .arg(&beside)
+        .output()
+        .unwrap();
+    assert!(junction.status.success(), "mklink: {}", text(&junction.stdout));
+
+    let share = Share { root: &root, name: "wisp" };
+    let mut view = open_windows_with(&address, false, Some(share)).await;
+    view.drive_shown().await;
+    assert_eq!(view.in_session(&format!("Get-Content {TSCLIENT}\\readme.txt")).await, "hello");
+    let attempts = [
+        format!("Attempt up {{ Get-Content {TSCLIENT}\\..\\..\\Windows\\win.ini }}"),
+        format!("Attempt stream {{ Get-Content {TSCLIENT}\\readme.txt:ads }}"),
+        format!("Attempt new-stream {{ Set-Content {TSCLIENT}\\readme.txt:ads hidden }}"),
+        format!("Attempt junction {{ Get-ChildItem {TSCLIENT}\\out | ForEach-Object Name }}"),
+        format!("Attempt through {{ Get-Content {TSCLIENT}\\out\\secret.txt }}"),
+        format!("Attempt write-through {{ Set-Content {TSCLIENT}\\out\\secret.txt changed }}"),
+        format!("Attempt new-through {{ Set-Content {TSCLIENT}\\out\\new.txt new }}"),
+    ];
+    let printed = view.in_session(&format!("{ATTEMPT}{}", attempts.join("\n"))).await;
+    println!("{printed}");
+    // Windows takes the .. off before it asks, so only a path inside the share arrives.
+    let mut wanted = vec![format!(
+        "up: Cannot find path '{TSCLIENT}\\..\\..\\Windows\\win.ini' because it does not exist."
+    )];
+    let refused = ["stream", "new-stream", "junction", "through", "write-through", "new-through"];
+    wanted.extend(refused.map(|what| format!("{what}: Access is denied")));
+    assert_eq!(printed, wanted.join("\n"));
+    assert_eq!(fs::read(beside.join("secret.txt")).unwrap(), b"secret\r\n");
+    assert!(!beside.join("new.txt").exists());
+    assert_eq!(fs::read(root.join("readme.txt")).unwrap(), b"hello\r\n");
+    assert!(fs::metadata(root.join("readme.txt:ads")).is_err(), "a stream was made");
+    // A file not read before, so that only the client can answer: the share still works.
+    let later = view.in_session(&format!("Get-Content {TSCLIENT}\\later.txt")).await;
+    assert_eq!(later, "still here");
+    view.close().await;
+}
+
+// What applications do with an open file on the share beyond reading and writing: flush it, ask
+// for its security, lock a range and open it a second time; the session has to go on.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn windows_what_applications_do_on_the_share_works() {
+    let Some(address) = vm() else { return };
+    // The last test of a whole run, so it leaves the VM with no session.
+    let _logged_off = Undo(
+        "Get-Process explorer -ErrorAction SilentlyContinue | \
+         ForEach-Object { logoff $_.SessionId }"
+            .into(),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut view = open_windows_with(&address, false, Some(Share { root, name: "wisp" })).await;
+    view.drive_shown().await;
+    let script = format!(
+        "{ATTEMPT}\
+         $path = '{TSCLIENT}\\app.txt'
+         $stream = [IO.File]::Open($path, 'Create', 'ReadWrite', 'ReadWrite')
+         $bytes = [Text.Encoding]::ASCII.GetBytes('written by an application')
+         $stream.Write($bytes, 0, $bytes.Length)
+         Attempt flush {{ $stream.Flush($true) }}
+         Attempt get-acl {{ (Get-Acl $path).Owner }}
+         Attempt icacls {{
+             $printed = cmd /c \"icacls $path 2>&1\"; \"exit $LASTEXITCODE $printed\" }}
+         Attempt lock {{ $stream.Lock(0, 4) }}
+         Attempt second-open {{
+             $again = [IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
+             $reader = New-Object IO.StreamReader($again); $reader.ReadToEnd(); $reader.Close() }}
+         $stream.Close()"
+    );
+    let printed = view.in_session(&script).await;
+    println!("{printed}");
+    let results: Vec<&str> = printed.lines().collect();
+    assert_eq!(results.len(), 5, "{printed}");
+    // Windows answers flushes and security queries itself; only the lock reaches the client,
+    // which does not support it.
+    assert_eq!(results[0], "flush: done ");
+    assert_eq!(results[1], "get-acl: done Everyone");
+    assert!(results[2].starts_with("icacls: done exit 0 "), "{}", results[2]);
+    assert!(results[2].contains("No permissions are set."), "{}", results[2]);
+    assert_eq!(results[3], "lock: The request is not supported.");
+    assert_eq!(results[4], "second-open: done written by an application");
+    assert_eq!(fs::read(root.join("app.txt")).unwrap(), b"written by an application");
+    assert!(view.closed.is_none(), "the session ended: {:?}", view.closed);
+    view.shows_a_new_colour().await;
+    view.close().await;
+}
+
+fn gateway_fingerprint() -> String {
+    let script = "Import-Module RemoteDesktopServices; \
+        $thumbprint = (Get-Item RDS:\\GatewayServer\\SSLCertificate\\Thumbprint).CurrentValue; \
+        $der = (Get-Item \"Cert:\\LocalMachine\\My\\$thumbprint\").RawData; \
+        -join ([Security.Cryptography.SHA256]::Create().ComputeHash($der) | \
+        ForEach-Object { $_.ToString('x2') })";
+    format!("SHA256:{}", in_guest(script))
+}
+
+// The RDP server behind the gateway is the VM itself, by its name: the gateway's computer group
+// holds the address the VM had when Add-Gateway.ps1 made it, and the Default Switch hands out
+// another one after this computer restarts.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn windows_through_the_gateway() {
+    let Some(address) = vm() else { return };
+    let computer = in_guest("$env:COMPUTERNAME");
+    let dir = tempfile::tempdir().unwrap();
+    let out = hundred_kb();
+    fs::write(dir.path().join("out.bin"), &out).unwrap();
+    if probe_text("layout.txt") != format!("{US:04x}") {
+        log_off().await;
+    }
+    let gateway = Gateway {
+        host: &address,
+        port: GATEWAY_PORT,
+        username: "wisp",
+        password: WINDOWS_PASSWORD,
+    };
+    let target = Target {
+        audio: true,
+        share: Some(Share { root: dir.path(), name: "wisp" }),
+        gateway: Some(gateway),
+        ..windows(&computer, "wisp", None, WINDOWS_PASSWORD, US)
+    };
+    let (_dir, known) = known_at(&address, GATEWAY_PORT, None);
+    match connect_to(&target, &known).await.0 {
+        Err(AppError::HostKeyUnknown { host, port, fingerprint }) => {
+            assert_eq!((host.clone(), port), (format!("rdg/{address}"), GATEWAY_PORT));
+            assert_eq!(fingerprint, gateway_fingerprint());
+            known.0.lock().unwrap().record(&host, port, &fingerprint).unwrap();
+        }
+        other => panic!("expected HostKeyUnknown for the gateway, got {:?}", other.err()),
+    }
+    // The RDP server's certificate has a pin of its own.
+    match connect_to(&target, &known).await.0 {
+        Err(AppError::HostKeyUnknown { host, port, fingerprint }) => {
+            let server = format!("rdp/{}", computer.to_ascii_lowercase());
+            assert_eq!((host.clone(), port), (server, WINDOWS_PORT));
+            assert_eq!(fingerprint, windows_fingerprint());
+            known.0.lock().unwrap().record(&host, port, &fingerprint).unwrap();
+        }
+        other => panic!("expected HostKeyUnknown for the server, got {:?}", other.err()),
+    }
+    let (session, ops) = connect_to(&target, &known).await;
+    let mut view = View::new(session.unwrap_or_else(|e| panic!("{e}")), ops);
+    view.locks(false).await;
+    view.within(LOGON, "the probe's window", View::probe_shown).await;
+    view.types_into_the_probe().await;
+    view.drive_shown().await;
+    // One read of 100,000 bytes, and its answer goes out in packets of at most 8 KB.
+    assert_eq!(view.in_session(&copy_out("out.bin")).await, format!("{}\n100000", sha256(&out)));
+    view.plays_silence().await;
+    view.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn windows_gateway_names_each_refusal() {
+    let Some(address) = vm() else { return };
+    let computer = in_guest("$env:COMPUTERNAME");
+    let (_dir, known) = known_at(&address, GATEWAY_PORT, None);
+    let pin = format!("rdg/{address}");
+    known.0.lock().unwrap().record(&pin, GATEWAY_PORT, &gateway_fingerprint()).unwrap();
+    let through = |password| Gateway {
+        host: &address,
+        port: GATEWAY_PORT,
+        username: "wisp",
+        password,
+    };
+    let wrong = Target {
+        gateway: Some(through("Wisp-Test-2025")),
+        ..windows(&computer, "wisp", None, WINDOWS_PASSWORD, US)
+    };
+    match connect_to(&wrong, &known).await.0 {
+        Err(AppError::Internal(message)) => {
+            assert_eq!(message, "rdp: wrong gateway user name or password");
+        }
+        other => panic!("expected a refusal, got {:?}", other.err()),
+    }
+    // A documentation address, which is not in the RAP's computer group.
+    let outside = Target {
+        gateway: Some(through(WINDOWS_PASSWORD)),
+        ..windows("192.0.2.1", "wisp", None, WINDOWS_PASSWORD, US)
+    };
+    // E_PROXY_RAP_ACCESSDENIED; the gateway logs it as event 301. It resets the connection right
+    // after, and that reset can come before its answer is read.
+    let refused = [
+        "rdp: the gateway refused the connection to 192.0.2.1:3389 (0x800759da)",
+        "rdp: the gateway closed the connection before connecting to 192.0.2.1:3389",
+    ];
+    match connect_to(&outside, &known).await.0 {
+        Err(AppError::Internal(message)) if refused.contains(&message.as_str()) => {
+            println!("refused: {message}");
+        }
+        other => panic!("expected a refusal, got {:?}", other.err()),
+    }
+}
+
+// A session through the gateway to the VM by its name, with both certificates pinned.
+async fn open_through_the_gateway(address: &str) -> View {
+    let computer = in_guest("$env:COMPUTERNAME").to_ascii_lowercase();
+    if probe_text("layout.txt") != format!("{US:04x}") {
+        log_off().await;
+    }
+    let gateway = Gateway {
+        host: address,
+        port: GATEWAY_PORT,
+        username: "wisp",
+        password: WINDOWS_PASSWORD,
+    };
+    let target = Target {
+        gateway: Some(gateway),
+        ..windows(&computer, "wisp", None, WINDOWS_PASSWORD, US)
+    };
+    let (_dir, known) = known_at(&computer, WINDOWS_PORT, Some(&windows_fingerprint()));
+    let pin = format!("rdg/{address}");
+    known.0.lock().unwrap().record(&pin, GATEWAY_PORT, &gateway_fingerprint()).unwrap();
+    let (session, ops) = connect_to(&target, &known).await;
+    let mut view = View::new(session.unwrap_or_else(|e| panic!("{e}")), ops);
+    view.locks(false).await;
+    view.within(LOGON, "the probe's window", View::probe_shown).await;
+    view
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn windows_logoff_inside_through_the_gateway_ends_the_session() {
+    let Some(address) = vm() else { return };
+    let mut view = open_through_the_gateway(&address).await;
+    set_probe_file("logoff.txt", "");
+    view.within(Duration::from_secs(60), "the end", |view| view.closed.is_some()).await;
+    assert_eq!(view.closed.as_deref(), Some("logged off"));
+    let skipped = view.session.skipped();
+    assert!(skipped.is_empty(), "PDUs skipped as unhandled: {skipped:?}");
+    timeout(WAIT, view.session.close()).await.expect("close hung");
+}
+
+// The MCS Disconnect Provider Ultimatum of a closed tab has to reach the server through the
+// gateway too; the server logs it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn windows_close_through_the_gateway_reaches_the_server() {
+    let Some(address) = vm() else { return };
+    let view = open_through_the_gateway(&address).await;
+    let since = in_guest("(Get-Date).ToString('o')");
+    view.close().await;
+    let script = format!(
+        "$filter = @{{ LogName = 'Microsoft-Windows-RemoteDesktopServices-RdpCoreTS/Operational'; \
+         StartTime = [datetime]::Parse('{since}') }}; \
+         @(Get-WinEvent -FilterHashtable $filter -ErrorAction SilentlyContinue | \
+         Where-Object {{ $_.Message -like '*Disconnect Provider Indication*' }}).Count"
+    );
+    let logged = || in_guest(&script) != "0";
+    let waiting = Instant::now();
+    while !logged() {
+        assert!(waiting.elapsed() < WAIT, "the server logged no Disconnect Provider Indication");
+        sleep(Duration::from_millis(500)).await;
     }
 }

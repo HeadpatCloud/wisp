@@ -217,6 +217,87 @@ test('an RDP profile is labelled RDP in the list and in its details', async () =
   expect(screen.getByText('New RDP')).toBeInTheDocument()
 })
 
+test('RDP sound, shared folder and gateway rows show with the shared folder notes', async () => {
+  const kept = 'Kept your local shared folder; not on this machine: /home/faye/share'
+  const leftOut = 'Shared folder left out; not on this machine: /home/faye/share'
+  vi.mocked(readBundle).mockResolvedValue({
+    kind: 'review',
+    review: {
+      ...review,
+      items: [
+        {
+          key: 'rdp:m',
+          kind: 'rdp',
+          name: 'office',
+          status: 'conflict',
+          matched: { id: 'pc', name: 'office' },
+          fields: [
+            { field: 'audio', label: 'Sound', local: 'On', incoming: 'Off' },
+            {
+              field: 'gateway',
+              label: 'RD Gateway',
+              local: 'gw.corp:443, same login',
+              incoming: 'gw.corp:443, CORP\\gw',
+            },
+            {
+              field: 'gatewayPassword',
+              label: 'Gateway password',
+              local: '(none)',
+              incoming: '••••',
+            },
+          ],
+          notes: [kept],
+          notesAsNew: [leftOut],
+        },
+        {
+          key: 'rdp:t',
+          kind: 'rdp',
+          name: 'tower',
+          status: 'conflict',
+          matched: { id: 't', name: 'tower' },
+          fields: [
+            {
+              field: 'sharedFolder',
+              label: 'Shared folder',
+              local: 'None',
+              incoming: 'C:\\Users\\faye as faye',
+            },
+          ],
+          notes: [],
+          notesAsNew: [],
+        },
+      ],
+    },
+  })
+  const user = userEvent.setup()
+  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  expect(await screen.findByText('Sound')).toBeInTheDocument()
+  expect(screen.getByText('On')).toBeInTheDocument()
+  expect(screen.getByText('Off')).toBeInTheDocument()
+  expect(screen.getByText('RD Gateway')).toBeInTheDocument()
+  expect(screen.getByText('gw.corp:443, same login')).toBeInTheDocument()
+  expect(screen.getByText('gw.corp:443, CORP\\gw')).toBeInTheDocument()
+  expect(screen.getByText('Gateway password')).toBeInTheDocument()
+  expect(screen.getByText('••••')).toBeInTheDocument()
+  expect(screen.getByText(kept)).toBeInTheDocument()
+  expect(screen.queryByText(leftOut)).not.toBeInTheDocument()
+
+  await user.click(screen.getByLabelText('Add as new instead'))
+  expect(screen.getByText(leftOut)).toBeInTheDocument()
+  expect(screen.queryByText(kept)).not.toBeInTheDocument()
+  await user.click(screen.getByLabelText('Add as new instead'))
+  await user.click(screen.getByLabelText('Accept Gateway password'))
+
+  await user.click(screen.getByRole('button', { name: 'tower' }))
+  expect(screen.getByText('Shared folder')).toBeInTheDocument()
+  expect(screen.getByText('C:\\Users\\faye as faye')).toBeInTheDocument()
+  await user.click(screen.getByRole('button', { name: 'Apply' }))
+  expect(applyImport).toHaveBeenCalledWith('r1', [
+    { key: 'rdp:m', accept: true, asNew: false, fields: ['audio', 'gateway'] },
+    { key: 'rdp:t', accept: true, asNew: false, fields: ['sharedFolder'] },
+  ])
+})
+
 test('an imported RDP profile is in the RDP store once the import is applied', async () => {
   const office: RdpProfile = {
     id: 'r',

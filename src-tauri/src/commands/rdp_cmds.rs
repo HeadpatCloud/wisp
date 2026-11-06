@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,10 +17,12 @@ use zeroize::Zeroizing;
 use crate::commands::ssh_cmds::KnownHostsState;
 use crate::error::{AppError, AppResult};
 use crate::rdp::connect::{size_supported, Target, LOGIN_LIMIT, MAX_PIXELS};
+use crate::rdp::gateway::Gateway;
 use crate::rdp::input::Input;
 use crate::rdp::session::{Session, CLOSE_LIMIT, CONNECT_LIMIT};
+use crate::rdp::share::Share;
 use crate::remote::{FrameBytes, FrameOp};
-use crate::store::model::RdpProfile;
+use crate::store::model::{RdpGateway, RdpProfile, SharedFolder};
 use crate::store::Store;
 
 #[derive(Clone, Serialize, Deserialize, Type)]
@@ -71,8 +74,17 @@ enum Entry {
     Closed { at: Instant },
 }
 
-// A close marker waits this long for its open, the longest a login can take.
-const CLOSED_LIMIT: Duration = CONNECT_LIMIT.saturating_add(LOGIN_LIMIT);
+// A close marker waits this long for its open, the longest a login can take. Through a gateway
+// its open and the login each get LOGIN_LIMIT.
+const CLOSED_LIMIT: Duration = {
+    let direct = CONNECT_LIMIT.saturating_add(LOGIN_LIMIT);
+    let through_gateway = LOGIN_LIMIT.saturating_mul(2);
+    if through_gateway.as_nanos() > direct.as_nanos() {
+        through_gateway
+    } else {
+        direct
+    }
+};
 
 // Ended within moments of its login, a reconnect on Windows leaves the user's disconnected session
 // blocked ("blocked by Remote Desktop Configuration") for a minute or more, whether the connection
@@ -234,23 +246,71 @@ fn local_layout() -> u32 {
     DEFAULT_LAYOUT
 }
 
-// Host, port, user name, domain, the vault id of the password and the keyboard layout.
-type Dialed = (String, u16, String, Option<String>, Option<String>, Option<u32>);
+#[derive(Debug, PartialEq)]
+struct Dialed {
+    host: String,
+    port: u16,
+    username: String,
+    domain: Option<String>,
+    secret_id: Option<String>,
+    keyboard_layout: Option<u32>,
+    audio: bool,
+    shared_folder: Option<SharedFolder>,
+    gateway: Option<RdpGateway>,
+}
 
 // A saved profile is read at every connect and never copied into the tab: saving a new password
 // gives the profile another vault id, and a copy in an open or restored tab would be a dead one.
 // The store is read only for a profile, so a quick connect does not wait on its lock.
 fn resolve_target(
     saved: impl FnOnce() -> AppResult<Vec<RdpProfile>>,
-    profile_id: Option<&str>,
-    given: Dialed,
+    given: RdpTarget,
 ) -> AppResult<Dialed> {
-    let Some(id) = profile_id else { return Ok(given) };
+    let Some(id) = given.profile_id else {
+        return Ok(Dialed {
+            host: given.host,
+            port: given.port,
+            username: given.username,
+            domain: given.domain,
+            secret_id: given.secret_id,
+            keyboard_layout: given.keyboard_layout,
+            audio: true,
+            shared_folder: None,
+            gateway: None,
+        });
+    };
     let p = saved()?
         .into_iter()
         .find(|p| p.id == id)
         .ok_or_else(|| AppError::NotFound("rdp: this profile no longer exists".into()))?;
-    Ok((p.host, p.port, p.username, p.domain, p.secret_id, p.keyboard_layout))
+    Ok(Dialed {
+        host: p.host,
+        port: p.port,
+        username: p.username,
+        domain: p.domain,
+        secret_id: p.secret_id,
+        keyboard_layout: p.keyboard_layout,
+        audio: p.audio,
+        shared_folder: p.shared_folder,
+        gateway: p.gateway,
+    })
+}
+
+// The user name and the vault id of the password the gateway gets. Basic has no domain field, so
+// the Domain field goes in front of a user name that has no domain of its own.
+fn gateway_login(dialed: &Dialed) -> Option<(String, Option<&str>)> {
+    let gateway = dialed.gateway.as_ref()?;
+    if !gateway.same_login {
+        return Some((gateway.username.clone(), gateway.secret_id.as_deref()));
+    }
+    let username = dialed.username.trim();
+    let login = match dialed.domain.as_deref().filter(|domain| !domain.is_empty()) {
+        Some(domain) if !username.is_empty() && !username.contains(['\\', '@']) => {
+            format!("{domain}\\{username}")
+        }
+        _ => username.to_owned(),
+    };
+    Some((login, dialed.secret_id.as_deref()))
 }
 
 #[tauri::command]
@@ -262,7 +322,6 @@ pub async fn rdp_open(
     viewport: RdpViewport,
     on_frame: Channel<FrameBytes>,
 ) -> AppResult<RdpOpened> {
-    let RdpTarget { host, port, username, domain, secret_id, profile_id, keyboard_layout } = target;
     let vault = app.state::<std::sync::Mutex<crate::vault::Vault>>();
     let known = app.state::<KnownHostsState>();
     let rdps = app.state::<RdpSessions>();
@@ -271,28 +330,42 @@ pub async fn rdp_open(
         let store = store.lock().map_err(|_| AppError::Internal("store lock poisoned".into()))?;
         Ok(store.rdp_profiles())
     };
-    let (host, port, username, domain, secret_id, keyboard_layout) = resolve_target(
-        saved,
-        profile_id.as_deref(),
-        (host, port, username, domain, secret_id, keyboard_layout),
-    )?;
+    let dialed = resolve_target(saved, target)?;
     // The password lives in the vault; the caller only ever holds a reference to it.
-    let password = match &secret_id {
+    let password = match &dialed.secret_id {
+        Some(id) => crate::commands::ssh_cmds::secret_string(&vault, id)?,
+        None => Zeroizing::new(String::new()),
+    };
+    let login = gateway_login(&dialed);
+    let gateway_password = match login.as_ref().and_then(|(_, secret_id)| *secret_id) {
         Some(id) => crate::commands::ssh_cmds::secret_string(&vault, id)?,
         None => Zeroizing::new(String::new()),
     };
     let RdpViewport { width, height, scale } = viewport;
     let (width, height) = fit(width, height);
     let target = Target {
-        host: host.trim(),
-        port,
-        username: username.trim(),
-        domain: domain.as_deref(),
+        host: dialed.host.trim(),
+        port: dialed.port,
+        username: dialed.username.trim(),
+        domain: dialed.domain.as_deref(),
         password: &password,
         width,
         height,
         scale,
-        keyboard_layout: keyboard_layout.unwrap_or_else(local_layout),
+        keyboard_layout: dialed.keyboard_layout.unwrap_or_else(local_layout),
+        audio: dialed.audio,
+        share: dialed
+            .shared_folder
+            .as_ref()
+            .map(|folder| Share { root: Path::new(&folder.path), name: &folder.name }),
+        gateway: dialed.gateway.as_ref().zip(login.as_ref()).map(|(gateway, (username, _))| {
+            Gateway {
+                host: gateway.host.trim(),
+                port: gateway.port,
+                username,
+                password: &gateway_password,
+            }
+        }),
     };
     // A send fails only once the webview itself is gone, and then nobody is left to tell.
     let sink = move |op: FrameOp| {
@@ -417,6 +490,9 @@ mod tests {
             height: 768,
             scale: 100,
             keyboard_layout: 0x409,
+            audio: false,
+            share: None,
+            gateway: None,
         }
     }
 
@@ -630,6 +706,28 @@ mod tests {
         let sent = AtomicBool::default();
         let opened = rdps.open("tab-1", &sent, async { panic!("the login was started") }).await;
         assert!(matches!(opened, Err(AppError::Cancelled)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_close_during_a_slow_gateway_open_still_cancels_it() {
+        let rdps = RdpSessions::default();
+        let sent = AtomicBool::default();
+        let slow = CONNECT_LIMIT + LOGIN_LIMIT + Duration::from_secs(5);
+        assert!(slow <= LOGIN_LIMIT * 2);
+        // Stands for a login that has sent the credentials, which a close lets finish.
+        let connecting = async {
+            sent.store(true, Ordering::SeqCst);
+            tokio::time::sleep(slow).await;
+            Err(AppError::Internal("rdp: the open went on".into()))
+        };
+        let closing = async {
+            rdps.close("tab-1").await;
+            tokio::time::sleep(slow - Duration::from_secs(1)).await;
+            // Drops the close markers older than CLOSED_LIMIT.
+            rdps.close("tab-2").await;
+        };
+        let (opened, ()) = tokio::join!(rdps.open("tab-1", &sent, connecting), closing);
+        assert!(matches!(opened, Err(AppError::Cancelled)), "{:?}", opened.map(|o| o.id));
     }
 
     #[tokio::test]
@@ -894,21 +992,54 @@ mod tests {
             domain: Some("corp".into()),
             secret_id: Some("vault-new".into()),
             keyboard_layout: Some(0x407),
+            audio: false,
+            shared_folder: Some(SharedFolder {
+                path: "C:\\Users\\faye\\share".into(),
+                name: "share".into(),
+                extra: Default::default(),
+            }),
+            gateway: Some(gateway(false)),
             icon: Default::default(),
             order: 0,
             extra: Default::default(),
         }
     }
 
-    fn given() -> Dialed {
-        (
-            "shown".into(),
-            3389,
-            "old".into(),
-            Some("olddom".into()),
-            Some("vault-old".into()),
-            Some(0x409),
-        )
+    fn gateway(same_login: bool) -> RdpGateway {
+        RdpGateway {
+            host: "gw.corp".into(),
+            port: 8443,
+            same_login,
+            username: "gw-faye".into(),
+            secret_id: Some("vault-gw".into()),
+            extra: Default::default(),
+        }
+    }
+
+    fn given(profile_id: Option<&str>) -> RdpTarget {
+        RdpTarget {
+            host: "shown".into(),
+            port: 3389,
+            username: "old".into(),
+            domain: Some("olddom".into()),
+            secret_id: Some("vault-old".into()),
+            profile_id: profile_id.map(Into::into),
+            keyboard_layout: Some(0x409),
+        }
+    }
+
+    fn quick() -> Dialed {
+        Dialed {
+            host: "shown".into(),
+            port: 3389,
+            username: "old".into(),
+            domain: Some("olddom".into()),
+            secret_id: Some("vault-old".into()),
+            keyboard_layout: Some(0x409),
+            audio: true,
+            shared_folder: None,
+            gateway: None,
+        }
     }
 
     fn unreadable() -> AppResult<Vec<RdpProfile>> {
@@ -917,25 +1048,56 @@ mod tests {
 
     #[test]
     fn a_profile_id_connects_with_what_the_profile_holds_now() {
-        let target = resolve_target(|| Ok(vec![office()]), Some("r1"), given()).unwrap();
-        let held = (
-            "10.0.0.9".into(),
-            3390,
-            "CORP\\faye".into(),
-            Some("corp".into()),
-            Some("vault-new".into()),
-            Some(0x407),
-        );
+        let target = resolve_target(|| Ok(vec![office()]), given(Some("r1"))).unwrap();
+        let held = Dialed {
+            host: "10.0.0.9".into(),
+            port: 3390,
+            username: "CORP\\faye".into(),
+            domain: Some("corp".into()),
+            secret_id: Some("vault-new".into()),
+            keyboard_layout: Some(0x407),
+            audio: false,
+            shared_folder: Some(SharedFolder {
+                path: "C:\\Users\\faye\\share".into(),
+                name: "share".into(),
+                extra: Default::default(),
+            }),
+            gateway: Some(RdpGateway {
+                host: "gw.corp".into(),
+                port: 8443,
+                same_login: false,
+                username: "gw-faye".into(),
+                secret_id: Some("vault-gw".into()),
+                extra: Default::default(),
+            }),
+        };
         assert_eq!(target, held);
 
-        let bare = RdpProfile { domain: None, secret_id: None, keyboard_layout: None, ..office() };
-        let target = resolve_target(|| Ok(vec![bare]), Some("r1"), given()).unwrap();
-        assert_eq!(target, ("10.0.0.9".into(), 3390, "CORP\\faye".into(), None, None, None));
+        let bare = RdpProfile {
+            domain: None,
+            secret_id: None,
+            keyboard_layout: None,
+            audio: true,
+            shared_folder: None,
+            gateway: None,
+            ..office()
+        };
+        let target = resolve_target(|| Ok(vec![bare]), given(Some("r1"))).unwrap();
+        let bare = Dialed {
+            domain: None,
+            secret_id: None,
+            keyboard_layout: None,
+            audio: true,
+            shared_folder: None,
+            gateway: None,
+            ..held
+        };
+        assert_eq!(target, bare);
     }
 
     #[test]
     fn a_profile_id_that_is_gone_is_not_found() {
-        let missing = resolve_target(|| Ok(vec![office()]), Some("gone"), given());
+        let missing = resolve_target(|| Ok(vec![office()]), given(Some("gone")));
         assert!(matches!(
             missing,
             Err(AppError::NotFound(m)) if m == "rdp: this profile no longer exists"
@@ -944,19 +1106,138 @@ mod tests {
 
     #[test]
     fn a_profile_id_reports_a_store_that_cannot_be_read() {
-        let failed = resolve_target(unreadable, Some("r1"), given());
+        let failed = resolve_target(unreadable, given(Some("r1")));
         assert!(matches!(failed, Err(AppError::Internal(m)) if m == "store lock poisoned"));
     }
 
     #[test]
     fn without_a_profile_id_the_arguments_are_used() {
-        assert_eq!(resolve_target(|| Ok(vec![office()]), None, given()).unwrap(), given());
+        assert_eq!(resolve_target(|| Ok(vec![office()]), given(None)).unwrap(), quick());
     }
 
     #[test]
     fn without_a_profile_id_the_store_is_not_read() {
-        let target = resolve_target(|| panic!("the store was read"), None, given());
-        assert_eq!(target.unwrap(), given());
+        let target = resolve_target(|| panic!("the store was read"), given(None));
+        assert_eq!(target.unwrap(), quick());
+    }
+
+    #[test]
+    fn a_quick_connect_plays_sound_without_a_share_or_a_gateway() {
+        let target = resolve_target(|| Ok(vec![office()]), given(None)).unwrap();
+        assert!(target.audio);
+        assert_eq!(target.shared_folder, None);
+        assert_eq!(target.gateway, None);
+    }
+
+    const LOGINS: [(&str, Option<&str>); 7] = [
+        ("alice", None),
+        ("alice", Some("CORP")),
+        ("alice", Some("")),
+        ("CORP\\alice", None),
+        ("CORP\\alice", Some("OTHER")),
+        ("alice@corp", None),
+        ("alice@corp", Some("CORP")),
+    ];
+
+    #[test]
+    fn the_same_login_puts_the_domain_in_front_of_a_bare_user_name() {
+        let sent = [
+            "alice",
+            "CORP\\alice",
+            "alice",
+            "CORP\\alice",
+            "CORP\\alice",
+            "alice@corp",
+            "alice@corp",
+        ];
+        for ((username, domain), sent) in LOGINS.into_iter().zip(sent) {
+            let dialed = Dialed {
+                username: username.into(),
+                domain: domain.map(Into::into),
+                gateway: Some(gateway(true)),
+                ..quick()
+            };
+            let login = gateway_login(&dialed);
+            assert_eq!(login, Some((sent.to_owned(), Some("vault-old"))), "{username} {domain:?}");
+        }
+    }
+
+    #[test]
+    fn the_same_login_is_the_user_name_the_server_gets() {
+        let dialed = Dialed {
+            username: " alice ".into(),
+            domain: Some("CORP".into()),
+            gateway: Some(gateway(true)),
+            ..quick()
+        };
+        assert_eq!(gateway_login(&dialed), Some(("CORP\\alice".to_owned(), Some("vault-old"))));
+    }
+
+    #[test]
+    fn a_separate_gateway_login_is_used_as_saved() {
+        for (username, domain) in LOGINS {
+            let dialed = Dialed {
+                username: username.into(),
+                domain: domain.map(Into::into),
+                gateway: Some(gateway(false)),
+                ..quick()
+            };
+            let login = gateway_login(&dialed);
+            let saved = Some(("gw-faye".to_owned(), Some("vault-gw")));
+            assert_eq!(login, saved, "{username} {domain:?}");
+        }
+        let without_password =
+            Dialed { gateway: Some(RdpGateway { secret_id: None, ..gateway(false) }), ..quick() };
+        assert_eq!(gateway_login(&without_password), Some(("gw-faye".to_owned(), None)));
+    }
+
+    #[test]
+    fn without_a_gateway_there_is_no_gateway_login() {
+        assert_eq!(gateway_login(&quick()), None);
+    }
+
+    const NO_GATEWAY_LOGIN: &str = "rdp: the gateway needs a user name and password";
+
+    // What a connect fails with when the gateway on a port that listens gets this login. Nothing
+    // may reach it: a Basic login with an empty password counts toward a lockout.
+    async fn refused_before_the_gateway(username: &str, password: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let gateway = Gateway { host: "127.0.0.1", port, username, password };
+        let target = Target { gateway: Some(gateway), ..target(port) };
+        let (known, sent) = (known(port), AtomicBool::default());
+        let connecting = Session::connect(&target, &known, |_| {}, &sent);
+        let failed = timeout(WAIT, connecting).await.expect("connect hung");
+        let asked = timeout(Duration::from_millis(200), listener.accept()).await;
+        assert!(asked.is_err(), "the gateway was asked");
+        match failed {
+            Err(AppError::Internal(message)) => message,
+            other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_separate_gateway_login_without_a_user_name_or_password_stays_here() {
+        // No saved gateway password: the vault is not asked and the password is empty.
+        let saved = RdpGateway { secret_id: None, ..gateway(false) };
+        let dialed = Dialed { gateway: Some(saved), ..quick() };
+        assert_eq!(gateway_login(&dialed), Some(("gw-faye".to_owned(), None)));
+        assert_eq!(refused_before_the_gateway("gw-faye", "").await, NO_GATEWAY_LOGIN);
+        let saved = RdpGateway { username: String::new(), ..gateway(false) };
+        let dialed = Dialed { gateway: Some(saved), ..quick() };
+        assert_eq!(gateway_login(&dialed), Some((String::new(), Some("vault-gw"))));
+        assert_eq!(refused_before_the_gateway("", "gw-secret").await, NO_GATEWAY_LOGIN);
+    }
+
+    #[tokio::test]
+    async fn the_same_login_without_a_user_name_or_password_stays_here() {
+        let dialed = Dialed { secret_id: None, gateway: Some(gateway(true)), ..quick() };
+        assert_eq!(gateway_login(&dialed), Some(("olddom\\old".to_owned(), None)));
+        assert_eq!(refused_before_the_gateway("olddom\\old", "").await, NO_GATEWAY_LOGIN);
+        // The domain alone is no user name.
+        let dialed = Dialed { username: " ".into(), gateway: Some(gateway(true)), ..quick() };
+        assert_eq!(gateway_login(&dialed), Some((String::new(), Some("vault-old"))));
+        assert_eq!(refused_before_the_gateway("", "secret").await, NO_GATEWAY_LOGIN);
     }
 
     #[test]

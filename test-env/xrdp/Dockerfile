@@ -6,6 +6,8 @@ RUN apt-get update \
         twm xterm xfonts-base \
         xdotool xclip x11-utils x11-xserver-utils x11-apps imagemagick \
         openssl \
+        pipewire pipewire-bin wireplumber pipewire-pulse pipewire-module-xrdp \
+        fuse3 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN rm /etc/xrdp/cert.pem /etc/xrdp/key.pem \

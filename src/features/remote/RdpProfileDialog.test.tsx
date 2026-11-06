@@ -8,7 +8,11 @@ vi.mock('@/lib/vault', () => ({
   setSecret: vi.fn(),
   deleteSecret: vi.fn(),
 }))
+vi.mock('@tauri-apps/plugin-dialog', () => ({
+  open: vi.fn(),
+}))
 
+import { open as pickFolder } from '@tauri-apps/plugin-dialog'
 import { deleteSecret, setSecret } from '@/lib/vault'
 import { useRdpProfileStore } from '@/stores/rdpProfileStore'
 import { RdpProfileDialog } from './RdpProfileDialog'
@@ -22,9 +26,26 @@ const desk: RdpProfile = {
   domain: 'CORP',
   secretId: 'vault-old',
   keyboardLayout: 0x407,
+  audio: true,
+  sharedFolder: null,
+  gateway: null,
   icon: { kind: 'builtin', name: 'cloud' },
   order: 4,
 }
+
+// A profile that reaches its server through a gateway with a login of its own.
+const gated: RdpProfile = {
+  ...desk,
+  gateway: {
+    host: 'gw.corp',
+    port: 8443,
+    sameLogin: false,
+    username: 'gw-faye',
+    secretId: 'gw-old',
+  },
+}
+
+const GATEWAY_PASSWORD = 'opensesame'
 
 const save = vi.fn()
 // Every vault and store call in the order it was made. The new id never embeds the password.
@@ -33,15 +54,17 @@ let calls: string[] = []
 beforeEach(() => {
   vi.resetAllMocks()
   calls = []
-  vi.mocked(setSecret).mockImplementation(async () => {
+  vi.mocked(setSecret).mockImplementation(async (secret) => {
     calls.push('setSecret')
-    return 'vault-new'
+    return secret === GATEWAY_PASSWORD ? 'gw-new' : 'vault-new'
   })
   vi.mocked(deleteSecret).mockImplementation(async (id) => {
     calls.push(`deleteSecret ${id}`)
   })
   save.mockImplementation(async (p: RdpProfile) => {
-    calls.push(`save ${p.secretId}`)
+    calls.push(
+      p.gateway ? `save ${p.secretId} gateway ${p.gateway.secretId}` : `save ${p.secretId}`,
+    )
   })
   useRdpProfileStore.setState({ profiles: [], loaded: true, save } as never)
 })
@@ -68,6 +91,9 @@ function Reopenable({ editing }: { editing: RdpProfile | null }) {
       </button>
       <button type="button" onClick={() => reopen(desk)}>
         Edit desk
+      </button>
+      <button type="button" onClick={() => reopen(gated)}>
+        Edit gated
       </button>
       <RdpProfileDialog open={open} onOpenChange={setOpen} editing={target} />
     </>
@@ -117,6 +143,9 @@ test('creating stores the password in the vault and saves the profile', async ()
     domain: 'CORP',
     secretId: 'vault-new',
     keyboardLayout: null,
+    audio: true,
+    sharedFolder: null,
+    gateway: null,
     icon: { kind: 'builtin', name: 'server' },
     order: 0,
   })
@@ -662,4 +691,625 @@ test('a second click on Save while the dialog closes leaves an edited profile it
 
   expect(calls).toEqual(['setSecret', 'save vault-new', 'deleteSecret vault-old'])
   expect(saved()).toEqual({ ...desk, secretId: 'vault-new' })
+})
+
+const sound = () => field('Play sound from the remote computer')
+const shareBox = () => field('Share a folder')
+const gatewayBox = () => field('Connect through an RD Gateway')
+const sameLogin = () => field('Use the same login for the gateway')
+const browse = () => screen.getByRole('button', { name: 'Browse…' })
+const SHARE_RULE = 'A share name has 1 to 7 letters, digits, - or _.'
+
+async function pick(user: UserEvent, folder: string | null) {
+  vi.mocked(pickFolder).mockResolvedValue(folder)
+  await user.click(browse())
+  await waitFor(() => expect(pickFolder).toHaveBeenCalledWith({ directory: true }))
+}
+
+test('a new profile plays sound, shares no folder and uses no gateway', async () => {
+  const onOpenChange = vi.fn()
+  render(<RdpProfileDialog open onOpenChange={onOpenChange} editing={null} />)
+  expect(sound()).toBeChecked()
+  expect(shareBox()).not.toBeChecked()
+  expect(gatewayBox()).not.toBeChecked()
+  expect(screen.queryByLabelText('Folder')).not.toBeInTheDocument()
+  expect(screen.queryByLabelText('Share name')).not.toBeInTheDocument()
+  expect(screen.queryByLabelText('Gateway host')).not.toBeInTheDocument()
+  fireEvent.change(field('Host'), { target: { value: 'mac' } })
+  fireEvent.click(saveButton())
+  await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false))
+  expect(saved()).toMatchObject({ audio: true, sharedFolder: null, gateway: null })
+})
+
+test('a profile without sound is saved without it and shown so', async () => {
+  const onOpenChange = vi.fn()
+  const user = userEvent.setup()
+  const { unmount } = render(<RdpProfileDialog open onOpenChange={onOpenChange} editing={desk} />)
+  await user.click(sound())
+  expect(sound()).not.toBeChecked()
+  await user.click(saveButton())
+  await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false))
+  expect(saved()).toEqual({ ...desk, audio: false })
+  unmount()
+  render(<RdpProfileDialog open onOpenChange={vi.fn()} editing={{ ...desk, audio: false }} />)
+  expect(sound()).not.toBeChecked()
+})
+
+test('sound, folder and gateway come below the keyboard layout, in this order', async () => {
+  const user = userEvent.setup()
+  render(<RdpProfileDialog open onOpenChange={vi.fn()} editing={null} />)
+  await user.click(shareBox())
+  await user.click(gatewayBox())
+  await user.click(sameLogin())
+  const shown = [
+    layoutTrigger(),
+    sound(),
+    shareBox(),
+    field('Folder'),
+    browse(),
+    field('Share name'),
+    screen.getByText(/^Shows up as/),
+    gatewayBox(),
+    field('Gateway host'),
+    field('Gateway port'),
+    sameLogin(),
+    field('Gateway username'),
+    field('Gateway password'),
+  ]
+  for (let i = 1; i < shown.length; i++) {
+    const position = shown[i - 1].compareDocumentPosition(shown[i])
+    expect(position & Node.DOCUMENT_POSITION_FOLLOWING, `${i}`).toBeTruthy()
+  }
+})
+
+test('sharing a folder shows a read-only folder field, a share name and where it shows up', async () => {
+  const user = userEvent.setup()
+  render(<RdpProfileDialog open onOpenChange={vi.fn()} editing={null} />)
+  await user.click(shareBox())
+  expect(field('Folder')).toHaveValue('')
+  expect(field('Folder')).toHaveAttribute('readonly')
+  expect(field('Share name')).toHaveValue('')
+  await user.type(field('Share name'), 'docs')
+  expect(screen.getByText('Shows up as \\\\tsclient\\docs')).toBeInTheDocument()
+  expect(field('Share name')).toHaveAccessibleDescription('Shows up as \\\\tsclient\\docs')
+})
+
+test.each([
+  ['C:\\Users\\me\\My Documents', 'MyDocum'],
+  ['/home/me/ü', 'share'],
+  ['/srv/my-share_2024', 'my-shar'],
+  ['D:\\', 'D'],
+])('picking %s fills an empty share name with %s', async (folder, name) => {
+  const user = userEvent.setup()
+  render(<RdpProfileDialog open onOpenChange={vi.fn()} editing={null} />)
+  await user.click(shareBox())
+  await pick(user, folder)
+  await waitFor(() => expect(field('Folder')).toHaveValue(folder))
+  expect(field('Share name')).toHaveValue(name)
+})
+
+test('picking a folder keeps a share name that is already there', async () => {
+  const user = userEvent.setup()
+  render(<RdpProfileDialog open onOpenChange={vi.fn()} editing={null} />)
+  await user.click(shareBox())
+  await user.type(field('Share name'), 'mine')
+  await pick(user, 'C:\\Users\\me\\My Documents')
+  await waitFor(() => expect(field('Folder')).toHaveValue('C:\\Users\\me\\My Documents'))
+  expect(field('Share name')).toHaveValue('mine')
+})
+
+test('a folder picker that is cancelled changes nothing', async () => {
+  const user = userEvent.setup()
+  render(<RdpProfileDialog open onOpenChange={vi.fn()} editing={null} />)
+  await user.click(shareBox())
+  await pick(user, '/home/me/docs')
+  await waitFor(() => expect(field('Folder')).toHaveValue('/home/me/docs'))
+  fireEvent.change(field('Share name'), { target: { value: '' } })
+  vi.mocked(pickFolder).mockClear()
+  await pick(user, null)
+  expect(field('Folder')).toHaveValue('/home/me/docs')
+  expect(field('Share name')).toHaveValue('')
+})
+
+test.each(['toolong8', 'wi sp', 'dö', 'a.b', 'a\\b'])(
+  'the share name "%s" is refused',
+  async (typed) => {
+    const user = userEvent.setup()
+    render(<RdpProfileDialog open onOpenChange={vi.fn()} editing={null} />)
+    await user.click(shareBox())
+    fireEvent.change(field('Share name'), { target: { value: typed } })
+    expect(screen.getByText(SHARE_RULE)).toBeInTheDocument()
+    expect(field('Share name')).toHaveAttribute('aria-invalid', 'true')
+    expect(field('Share name')).toHaveAccessibleDescription(
+      `Shows up as \\\\tsclient\\${typed} ${SHARE_RULE}`,
+    )
+  },
+)
+
+test.each(['', '  '])(
+  'an empty share name shows no rule but keeps Save disabled',
+  async (typed) => {
+    const user = userEvent.setup()
+    render(<RdpProfileDialog open onOpenChange={vi.fn()} editing={null} />)
+    fireEvent.change(field('Host'), { target: { value: 'mac' } })
+    await user.click(shareBox())
+    await pick(user, '/home/me/docs')
+    await waitFor(() => expect(field('Share name')).toHaveValue('docs'))
+    fireEvent.change(field('Share name'), { target: { value: typed } })
+    expect(screen.queryByText(SHARE_RULE)).not.toBeInTheDocument()
+    expect(field('Share name')).not.toHaveAttribute('aria-invalid', 'true')
+    expect(field('Share name')).toHaveAccessibleDescription('Shows up as \\\\tsclient\\')
+    expect(saveButton()).toBeDisabled()
+  },
+)
+
+test.each(['a', 'Docs-_1', '1234567', ' docs '])('the share name "%s" is taken', async (typed) => {
+  const user = userEvent.setup()
+  render(<RdpProfileDialog open onOpenChange={vi.fn()} editing={null} />)
+  await user.click(shareBox())
+  fireEvent.change(field('Share name'), { target: { value: typed } })
+  expect(screen.queryByText(SHARE_RULE)).not.toBeInTheDocument()
+  expect(field('Share name')).not.toHaveAttribute('aria-invalid', 'true')
+})
+
+test('Save needs a folder and a valid share name while a folder is shared', async () => {
+  const user = userEvent.setup()
+  render(<RdpProfileDialog open onOpenChange={vi.fn()} editing={null} />)
+  fireEvent.change(field('Host'), { target: { value: 'mac' } })
+  expect(saveButton()).toBeEnabled()
+  await user.click(shareBox())
+  expect(saveButton()).toBeDisabled()
+  fireEvent.change(field('Share name'), { target: { value: 'docs' } })
+  expect(saveButton()).toBeDisabled()
+  await pick(user, '/home/me/docs')
+  await waitFor(() => expect(saveButton()).toBeEnabled())
+  for (const name of ['', 'toolong8', 'my docs']) {
+    fireEvent.change(field('Share name'), { target: { value: name } })
+    expect(saveButton(), name).toBeDisabled()
+  }
+  await user.click(shareBox())
+  expect(saveButton()).toBeEnabled()
+})
+
+test('a shared folder is saved with its path and its name', async () => {
+  const onOpenChange = vi.fn()
+  const user = userEvent.setup()
+  render(<RdpProfileDialog open onOpenChange={onOpenChange} editing={null} />)
+  fireEvent.change(field('Host'), { target: { value: 'mac' } })
+  await user.click(shareBox())
+  await pick(user, 'C:\\Users\\me\\My Documents')
+  await waitFor(() => expect(saveButton()).toBeEnabled())
+  fireEvent.change(field('Share name'), { target: { value: ' docs ' } })
+  await user.click(saveButton())
+  await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false))
+  expect(saved().sharedFolder).toEqual({ path: 'C:\\Users\\me\\My Documents', name: 'docs' })
+})
+
+test('a shared folder is shown when editing, and unticking it saves no folder', async () => {
+  const shared = { ...desk, sharedFolder: { path: '/home/faye/docs', name: 'docs' } }
+  const onOpenChange = vi.fn()
+  const user = userEvent.setup()
+  render(<RdpProfileDialog open onOpenChange={onOpenChange} editing={shared} />)
+  expect(shareBox()).toBeChecked()
+  expect(field('Folder')).toHaveValue('/home/faye/docs')
+  expect(field('Share name')).toHaveValue('docs')
+  await user.click(shareBox())
+  await user.click(saveButton())
+  await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false))
+  expect(saved()).toEqual({ ...shared, sharedFolder: null })
+})
+
+test('a gateway starts on port 443 with the same login', async () => {
+  const onOpenChange = vi.fn()
+  const user = userEvent.setup()
+  render(<RdpProfileDialog open onOpenChange={onOpenChange} editing={null} />)
+  fireEvent.change(field('Host'), { target: { value: 'mac' } })
+  await user.click(gatewayBox())
+  expect(field('Gateway host')).toHaveValue('')
+  expect(field('Gateway port')).toHaveValue(443)
+  expect(sameLogin()).toBeChecked()
+  expect(screen.queryByLabelText('Gateway username')).not.toBeInTheDocument()
+  expect(screen.queryByLabelText('Gateway password')).not.toBeInTheDocument()
+  fireEvent.change(field('Gateway host'), { target: { value: ' gw.corp ' } })
+  await user.click(saveButton())
+  await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false))
+  expect(saved().gateway).toEqual({
+    host: 'gw.corp',
+    port: 443,
+    sameLogin: true,
+    username: '',
+    secretId: null,
+  })
+  expect(calls).toEqual(['save null gateway null'])
+})
+
+test('Save needs a gateway host and a gateway port from 1 to 65535', async () => {
+  const user = userEvent.setup()
+  render(<RdpProfileDialog open onOpenChange={vi.fn()} editing={null} />)
+  fireEvent.change(field('Host'), { target: { value: 'mac' } })
+  await user.click(gatewayBox())
+  expect(saveButton()).toBeDisabled()
+  fireEvent.change(field('Gateway host'), { target: { value: '   ' } })
+  expect(saveButton()).toBeDisabled()
+  fireEvent.change(field('Gateway host'), { target: { value: 'gw' } })
+  expect(saveButton()).toBeEnabled()
+  for (const port of ['', '0', '65536', '-1', '443.5']) {
+    fireEvent.change(field('Gateway port'), { target: { value: port } })
+    expect(saveButton(), port).toBeDisabled()
+  }
+  for (const port of ['1', '65535']) {
+    fireEvent.change(field('Gateway port'), { target: { value: port } })
+    expect(saveButton(), port).toBeEnabled()
+  }
+  fireEvent.change(field('Gateway host'), { target: { value: '' } })
+  await user.click(gatewayBox())
+  expect(saveButton()).toBeEnabled()
+})
+
+test('Save needs a gateway user name for a login of its own', async () => {
+  const user = userEvent.setup()
+  render(<RdpProfileDialog open onOpenChange={vi.fn()} editing={null} />)
+  fireEvent.change(field('Host'), { target: { value: 'mac' } })
+  await user.click(gatewayBox())
+  fireEvent.change(field('Gateway host'), { target: { value: 'gw' } })
+  await user.click(sameLogin())
+  expect(saveButton()).toBeDisabled()
+  fireEvent.change(field('Gateway username'), { target: { value: '  ' } })
+  expect(saveButton()).toBeDisabled()
+  fireEvent.change(field('Gateway username'), { target: { value: 'gw-faye' } })
+  expect(saveButton()).toBeEnabled()
+  fireEvent.change(field('Gateway username'), { target: { value: '' } })
+  await user.click(sameLogin())
+  expect(saveButton()).toBeEnabled()
+})
+
+test('a gateway login of its own stores its password in the vault', async () => {
+  const onOpenChange = vi.fn()
+  const user = userEvent.setup()
+  render(<RdpProfileDialog open onOpenChange={onOpenChange} editing={null} />)
+  fireEvent.change(field('Host'), { target: { value: 'mac' } })
+  await user.click(gatewayBox())
+  fireEvent.change(field('Gateway host'), { target: { value: 'gw.corp' } })
+  fireEvent.change(field('Gateway port'), { target: { value: '8443' } })
+  await user.click(sameLogin())
+  fireEvent.change(field('Gateway username'), { target: { value: ' gw-faye ' } })
+  expect(field('Gateway password')).toHaveAttribute('placeholder', '')
+  await user.type(field('Gateway password'), GATEWAY_PASSWORD)
+  await user.click(saveButton())
+  await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false))
+  expect(setSecret).toHaveBeenCalledWith(GATEWAY_PASSWORD)
+  expect(saved().gateway).toEqual({
+    host: 'gw.corp',
+    port: 8443,
+    sameLogin: false,
+    username: 'gw-faye',
+    secretId: 'gw-new',
+  })
+  expect(JSON.stringify(saved())).not.toContain(GATEWAY_PASSWORD)
+  expect(calls).toEqual(['setSecret', 'save null gateway gw-new'])
+})
+
+test('both passwords are stored before the save', async () => {
+  const onOpenChange = vi.fn()
+  const user = userEvent.setup()
+  render(<RdpProfileDialog open onOpenChange={onOpenChange} editing={null} />)
+  fireEvent.change(field('Host'), { target: { value: 'mac' } })
+  await user.type(field('Password'), 'hunter2')
+  await user.click(gatewayBox())
+  fireEvent.change(field('Gateway host'), { target: { value: 'gw.corp' } })
+  await user.click(sameLogin())
+  fireEvent.change(field('Gateway username'), { target: { value: 'gw-faye' } })
+  await user.type(field('Gateway password'), GATEWAY_PASSWORD)
+  await user.click(saveButton())
+  await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false))
+  expect(calls).toEqual(['setSecret', 'setSecret', 'save vault-new gateway gw-new'])
+})
+
+test('a gateway password typed before the same login was chosen is not stored', async () => {
+  const onOpenChange = vi.fn()
+  const user = userEvent.setup()
+  render(<RdpProfileDialog open onOpenChange={onOpenChange} editing={null} />)
+  fireEvent.change(field('Host'), { target: { value: 'mac' } })
+  await user.click(gatewayBox())
+  fireEvent.change(field('Gateway host'), { target: { value: 'gw.corp' } })
+  await user.click(sameLogin())
+  fireEvent.change(field('Gateway username'), { target: { value: 'gw-faye' } })
+  await user.type(field('Gateway password'), GATEWAY_PASSWORD)
+  await user.click(sameLogin())
+  await user.click(saveButton())
+  await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false))
+  expect(setSecret).not.toHaveBeenCalled()
+  expect(saved().gateway).toMatchObject({ sameLogin: true, username: '', secretId: null })
+})
+
+test('editing shows the gateway with an empty gateway password field', () => {
+  render(<RdpProfileDialog open onOpenChange={vi.fn()} editing={gated} />)
+  expect(gatewayBox()).toBeChecked()
+  expect(field('Gateway host')).toHaveValue('gw.corp')
+  expect(field('Gateway port')).toHaveValue(8443)
+  expect(sameLogin()).not.toBeChecked()
+  expect(field('Gateway username')).toHaveValue('gw-faye')
+  expect(field('Gateway password')).toHaveValue('')
+  expect(field('Gateway password')).toHaveAttribute('placeholder', 'unchanged')
+  expect(field('Remove saved gateway password')).not.toBeChecked()
+})
+
+test('editing with an empty gateway password keeps the saved one', async () => {
+  const onOpenChange = vi.fn()
+  const user = userEvent.setup()
+  render(<RdpProfileDialog open onOpenChange={onOpenChange} editing={gated} />)
+  await user.click(saveButton())
+  await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false))
+  expect(saved()).toEqual(gated)
+  expect(calls).toEqual(['save vault-old gateway gw-old'])
+})
+
+test('a new gateway password replaces the saved one and leaves no vault entry behind', async () => {
+  const onOpenChange = vi.fn()
+  const user = userEvent.setup()
+  render(<RdpProfileDialog open onOpenChange={onOpenChange} editing={gated} />)
+  await user.type(field('Gateway password'), GATEWAY_PASSWORD)
+  await user.click(saveButton())
+  await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false))
+  expect(calls).toEqual(['setSecret', 'save vault-old gateway gw-new', 'deleteSecret gw-old'])
+})
+
+test('two new passwords replace both saved ones after the save', async () => {
+  const onOpenChange = vi.fn()
+  const user = userEvent.setup()
+  render(<RdpProfileDialog open onOpenChange={onOpenChange} editing={gated} />)
+  await user.type(field('Password'), 'hunter3')
+  await user.type(field('Gateway password'), GATEWAY_PASSWORD)
+  await user.click(saveButton())
+  await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false))
+  expect(calls).toEqual([
+    'setSecret',
+    'setSecret',
+    'save vault-new gateway gw-new',
+    'deleteSecret vault-old',
+    'deleteSecret gw-old',
+  ])
+})
+
+test('an old gateway password that is already gone does not keep the dialog open', async () => {
+  vi.mocked(deleteSecret).mockRejectedValue(new Error('notFound: secret gw-old'))
+  const onOpenChange = vi.fn()
+  const user = userEvent.setup()
+  render(<RdpProfileDialog open onOpenChange={onOpenChange} editing={gated} />)
+  await user.type(field('Gateway password'), GATEWAY_PASSWORD)
+  await user.click(saveButton())
+  await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false))
+  expect(deleteSecret).toHaveBeenCalledWith('gw-old')
+})
+
+test('Remove saved gateway password empties and disables the field, and saving deletes the secret', async () => {
+  const onOpenChange = vi.fn()
+  const user = userEvent.setup()
+  render(<RdpProfileDialog open onOpenChange={onOpenChange} editing={gated} />)
+  await user.type(field('Gateway password'), 'typed')
+  await user.click(field('Remove saved gateway password'))
+  expect(field('Gateway password')).toBeDisabled()
+  expect(field('Gateway password')).toHaveValue('')
+  expect(field('Gateway password')).toHaveAttribute('placeholder', '')
+  await user.click(saveButton())
+  await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false))
+  expect(saved().gateway?.secretId).toBeNull()
+  expect(calls).toEqual(['save vault-old gateway null', 'deleteSecret gw-old'])
+})
+
+test('unticking Remove saved gateway password gives the field back', async () => {
+  const onOpenChange = vi.fn()
+  const user = userEvent.setup()
+  render(<RdpProfileDialog open onOpenChange={onOpenChange} editing={gated} />)
+  await user.click(field('Remove saved gateway password'))
+  await user.click(field('Remove saved gateway password'))
+  expect(field('Gateway password')).toBeEnabled()
+  await user.click(saveButton())
+  await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false))
+  expect(calls).toEqual(['save vault-old gateway gw-old'])
+})
+
+test('Remove saved gateway password is only offered for a gateway that has one', async () => {
+  const user = userEvent.setup()
+  const { unmount } = render(<RdpProfileDialog open onOpenChange={vi.fn()} editing={null} />)
+  await user.click(gatewayBox())
+  await user.click(sameLogin())
+  expect(screen.queryByLabelText('Remove saved gateway password')).not.toBeInTheDocument()
+  unmount()
+  const bare: RdpProfile = {
+    ...desk,
+    gateway: { host: 'gw.corp', port: 443, sameLogin: false, username: 'gw', secretId: null },
+  }
+  render(<RdpProfileDialog open onOpenChange={vi.fn()} editing={bare} />)
+  expect(screen.queryByLabelText('Remove saved gateway password')).not.toBeInTheDocument()
+  expect(field('Gateway password')).toHaveAttribute('placeholder', '')
+})
+
+test('a failed save removes the new gateway password and keeps the old one', async () => {
+  save.mockRejectedValueOnce(new Error('io: disk full'))
+  const onOpenChange = vi.fn()
+  const user = userEvent.setup()
+  render(<RdpProfileDialog open onOpenChange={onOpenChange} editing={gated} />)
+  await user.type(field('Gateway password'), GATEWAY_PASSWORD)
+  await user.click(saveButton())
+
+  expect(await screen.findByText('io: disk full')).toBeInTheDocument()
+  expect(onOpenChange).not.toHaveBeenCalled()
+  expect(calls).toEqual(['setSecret', 'deleteSecret gw-new'])
+  expect(field('Gateway password')).toHaveValue(GATEWAY_PASSWORD)
+
+  await user.click(saveButton())
+  await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false))
+  expect(calls).toEqual([
+    'setSecret',
+    'deleteSecret gw-new',
+    'setSecret',
+    'save vault-old gateway gw-new',
+    'deleteSecret gw-old',
+  ])
+})
+
+test('a failed save removes both new passwords', async () => {
+  save.mockRejectedValue(new Error('io: disk full'))
+  const user = userEvent.setup()
+  render(<RdpProfileDialog open onOpenChange={vi.fn()} editing={gated} />)
+  await user.type(field('Password'), 'hunter3')
+  await user.type(field('Gateway password'), GATEWAY_PASSWORD)
+  await user.click(saveButton())
+  expect(await screen.findByText('io: disk full')).toBeInTheDocument()
+  expect(calls).toEqual(['setSecret', 'setSecret', 'deleteSecret vault-new', 'deleteSecret gw-new'])
+})
+
+test('a gateway password the vault refuses removes the new RDP password and saves nothing', async () => {
+  vi.mocked(setSecret).mockImplementation(async (secret) => {
+    calls.push('setSecret')
+    if (secret === GATEWAY_PASSWORD) throw new Error('vault: locked')
+    return 'vault-new'
+  })
+  const onOpenChange = vi.fn()
+  const user = userEvent.setup()
+  render(<RdpProfileDialog open onOpenChange={onOpenChange} editing={gated} />)
+  await user.type(field('Password'), 'hunter3')
+  await user.type(field('Gateway password'), GATEWAY_PASSWORD)
+  await user.click(saveButton())
+  expect(await screen.findByText('vault: locked')).toBeInTheDocument()
+  expect(onOpenChange).not.toHaveBeenCalled()
+  expect(save).not.toHaveBeenCalled()
+  expect(calls).toEqual(['setSecret', 'setSecret', 'deleteSecret vault-new'])
+})
+
+test.each<[string, (user: UserEvent) => Promise<void>]>([
+  [
+    'removing the saved gateway password',
+    (user) => user.click(field('Remove saved gateway password')),
+  ],
+  ['turning the gateway off', (user) => user.click(gatewayBox())],
+  ['choosing the same login', (user) => user.click(sameLogin())],
+])('a failed save while %s deletes nothing', async (_how, change) => {
+  save.mockRejectedValue(new Error('io: disk full'))
+  const onOpenChange = vi.fn()
+  const user = userEvent.setup()
+  render(<RdpProfileDialog open onOpenChange={onOpenChange} editing={gated} />)
+  await change(user)
+  await user.click(saveButton())
+  expect(await screen.findByText('io: disk full')).toBeInTheDocument()
+  expect(onOpenChange).not.toHaveBeenCalled()
+  expect(deleteSecret).not.toHaveBeenCalled()
+})
+
+test('turning the gateway off deletes its password after the save', async () => {
+  const onOpenChange = vi.fn()
+  const user = userEvent.setup()
+  render(<RdpProfileDialog open onOpenChange={onOpenChange} editing={gated} />)
+  await user.click(gatewayBox())
+  await user.click(saveButton())
+  await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false))
+  expect(saved()).toEqual({ ...gated, gateway: null })
+  expect(calls).toEqual(['save vault-old', 'deleteSecret gw-old'])
+})
+
+test('choosing the same login deletes the gateway password after the save', async () => {
+  const onOpenChange = vi.fn()
+  const user = userEvent.setup()
+  render(<RdpProfileDialog open onOpenChange={onOpenChange} editing={gated} />)
+  await user.click(sameLogin())
+  await user.click(saveButton())
+  await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false))
+  expect(saved().gateway).toEqual({
+    host: 'gw.corp',
+    port: 8443,
+    sameLogin: true,
+    username: '',
+    secretId: null,
+  })
+  expect(calls).toEqual(['save vault-old gateway null', 'deleteSecret gw-old'])
+})
+
+test('a profile saved before sound, folders and gateways opens with sound on and is saved with all three', async () => {
+  const older: RdpProfile = {
+    id: 'rdp-1',
+    name: 'desk',
+    host: '10.0.0.5',
+    port: 3390,
+    username: 'faye',
+    domain: 'CORP',
+    secretId: 'vault-old',
+    keyboardLayout: 0x407,
+    icon: { kind: 'builtin', name: 'cloud' },
+    order: 4,
+  }
+  const onOpenChange = vi.fn()
+  const user = userEvent.setup()
+  render(<RdpProfileDialog open onOpenChange={onOpenChange} editing={older} />)
+  expect(sound()).toBeChecked()
+  expect(shareBox()).not.toBeChecked()
+  expect(gatewayBox()).not.toBeChecked()
+  await user.click(saveButton())
+  await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false))
+  expect(saved()).toEqual({ ...older, audio: true, sharedFolder: null, gateway: null })
+  expect(calls).toEqual(['save vault-old'])
+})
+
+test('closing forgets the sound, folder and gateway settings that were changed', async () => {
+  const user = userEvent.setup()
+  render(<Reopenable editing={null} />)
+  await user.click(sound())
+  await user.click(shareBox())
+  await pick(user, '/home/me/docs')
+  await waitFor(() => expect(field('Share name')).toHaveValue('docs'))
+  await user.click(gatewayBox())
+  fireEvent.change(field('Gateway host'), { target: { value: 'gw' } })
+  fireEvent.change(field('Gateway port'), { target: { value: '8443' } })
+  await user.click(sameLogin())
+  fireEvent.change(field('Gateway username'), { target: { value: 'gw-faye' } })
+  await user.click(screen.getByRole('button', { name: 'Cancel' }))
+  await waitFor(() => expect(screen.queryByLabelText('Host')).not.toBeInTheDocument())
+
+  await user.click(screen.getByRole('button', { name: 'New profile' }))
+  expect(sound()).toBeChecked()
+  expect(shareBox()).not.toBeChecked()
+  expect(gatewayBox()).not.toBeChecked()
+  await user.click(shareBox())
+  await user.click(gatewayBox())
+  expect(field('Folder')).toHaveValue('')
+  expect(field('Share name')).toHaveValue('')
+  expect(field('Gateway host')).toHaveValue('')
+  expect(field('Gateway port')).toHaveValue(443)
+  expect(sameLogin()).toBeChecked()
+})
+
+test('what was typed for the gateway password is gone when the dialog opens again', async () => {
+  const user = userEvent.setup()
+  render(<Reopenable editing={gated} />)
+  await user.type(field('Gateway password'), GATEWAY_PASSWORD)
+  await user.click(field('Remove saved gateway password'))
+  await user.click(screen.getByRole('button', { name: 'Cancel' }))
+
+  await user.click(screen.getByRole('button', { name: 'Edit gated' }))
+  expect(field('Gateway password')).toHaveValue('')
+  expect(field('Gateway password')).toBeEnabled()
+  expect(field('Remove saved gateway password')).not.toBeChecked()
+  await user.type(field('Gateway password'), GATEWAY_PASSWORD)
+  await user.click(screen.getByRole('button', { name: 'Cancel' }))
+
+  await user.click(screen.getByRole('button', { name: 'New profile' }))
+  await user.click(gatewayBox())
+  await user.click(sameLogin())
+  expect(field('Gateway password')).toHaveValue('')
+})
+
+test('the gateway password is gone while the closed dialog is still fading out', async () => {
+  keepClosingDialog()
+  const user = userEvent.setup()
+  render(<Reopenable editing={gated} />)
+  await user.type(field('Gateway password'), GATEWAY_PASSWORD)
+  await user.click(field('Remove saved gateway password'))
+  await user.click(screen.getByRole('button', { name: 'Cancel' }))
+  expect(document.querySelector('[data-slot="dialog-content"]')).toHaveAttribute(
+    'data-state',
+    'closed',
+  )
+  expect(field('Gateway password')).toHaveValue('')
+  expect(field('Remove saved gateway password')).not.toBeChecked()
+  expect(field('Gateway host')).toHaveValue('gw.corp')
 })

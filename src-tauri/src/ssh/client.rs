@@ -451,7 +451,7 @@ mod tests {
     use russh::server::Msg;
     use russh::{Channel, ChannelMsg};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::net::{TcpListener, TcpSocket, TcpStream};
     use tokio::time::timeout;
 
     const LIMIT: Duration = Duration::from_secs(10);
@@ -588,6 +588,15 @@ mod tests {
         matches!(opened, Err(russh::Error::ChannelOpenFailure(AdministrativelyProhibited)))
     }
 
+    // A freed port can be handed to a test running alongside that listens on it. A socket that
+    // is bound but never listens refuses connections and keeps the port for as long as it lives.
+    fn refusing_port() -> (TcpSocket, u16) {
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.bind(([127, 0, 0, 1], 0).into()).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        (socket, port)
+    }
+
     #[tokio::test]
     async fn a_forwarded_channel_no_forward_matches_is_refused() {
         let (_handle, _forwards, server, _opened) = super::testing::session().await;
@@ -599,9 +608,7 @@ mod tests {
     #[tokio::test]
     async fn a_forwarded_channel_whose_target_refuses_the_connection_is_refused() {
         let (_handle, forwards, server, _opened) = super::testing::session().await;
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let closed_port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let (_refusing, closed_port) = refusing_port();
         forwards.lock().unwrap().insert(
             ("127.0.0.1".to_string(), 7100),
             super::RemoteTarget {
@@ -650,9 +657,7 @@ mod tests {
         let connect_limit = Duration::from_millis(300);
         let (handle, forwards, server, mut opened) =
             super::testing::session_within(connect_limit).await;
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let closed_port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let (_refusing, closed_port) = refusing_port();
         forward_to(&forwards, 7200, "127.0.0.1", closed_port);
         forward_to(&forwards, 7300, BLACK_HOLE, 9);
         tokio::spawn(async move {

@@ -339,6 +339,22 @@ mod tests {
         }
     }
 
+    // cpal keeps the first device enumerator it makes for the rest of the process. Made by a
+    // thread that was the last one using COM, it went with that thread's end, and the next
+    // stream crashed the process (cpal issue #1302). Seen on a host without a sound device.
+    #[test]
+    fn a_stream_after_the_thread_of_the_one_before_has_ended_is_built_or_refused() {
+        for _ in 0..2 {
+            let built = std::thread::spawn(|| {
+                let (_blocks, rx) = std::sync::mpsc::channel();
+                DecodeStream::new(&pcm(2, 44100), rx, Arc::new(Progress::new())).map(drop)
+            });
+            if let Err(e) = built.join().unwrap() {
+                assert!(matches!(e.kind(), RdpsndNativeErrorKind::AudioDevice), "{e}");
+            }
+        }
+    }
+
     fn until(backend: &RdpsndBackend, playing: bool, within: Duration) -> Instant {
         let started = Instant::now();
         while backend.playing() != playing {

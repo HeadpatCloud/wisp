@@ -59,6 +59,15 @@ headphones plugged in later, and once its device is gone it stays silent.
   next sound tries again. In 0.7.0 the one stream lived for the session.
   `RdpsndBackend::playing` and `RdpsndBackend::builds` and `Progress` are
   public but hidden from the docs, for the app's tests in `src/rdp/sound.rs`.
+- On Windows, the first `DecodeStream::new` starts a thread that makes cpal's
+  device enumerator and stays parked for the rest of the process. cpal 0.17
+  keeps the first enumerator for the process, in the COM apartment of the
+  thread that made it (cpal issue #1302). That was a stream's thread: when it
+  ended as the last thread using COM, as on a host without a sound device,
+  `MMDevApi.dll` was unloaded and the next stream crashed the process with an
+  access violation. The app's window keeps COM going on its main thread; the
+  test binary has no window. `a_stream_after_the_thread_of_the_one_before_has_ended_is_built_or_refused`
+  in `src/rdp/sound.rs` crashed on Windows Server 2025 without a sound device.
 - `DecodeStream::new` allows `unused_mut` without the `opus` feature: its
   receiver and decoder thread change only with Opus, and as a path dependency
   the crate's warnings are no longer capped, so the app's build printed them.
@@ -80,7 +89,7 @@ Drop the directory and the `[patch.crates-io]` entry once a release whose
 `RdpsndBackend` starts its stream, fills underruns with silence at once, ends
 the stream a second after the last sound played and builds the next one on the
 device that is the default then, is used, together with the rest of the
-IronRDP set. `the_output_stream_runs_once_it_is_made` in `src/rdp/sound.rs`
+IronRDP set, and with a cpal that keeps its enumerator alive on its own. `the_output_stream_runs_once_it_is_made` in `src/rdp/sound.rs`
 then checks the first; the others need a listen or the audio session's state
 and peak meter, as `RxBuffer`, `Progress`, `playing` and `builds` do not exist
 upstream.

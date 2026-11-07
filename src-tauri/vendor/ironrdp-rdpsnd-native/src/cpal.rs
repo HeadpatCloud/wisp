@@ -324,6 +324,8 @@ impl DecodeStream {
             ),
         };
 
+        #[cfg(windows)]
+        hold_the_enumerator();
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -373,6 +375,26 @@ impl DecodeStream {
     pub fn stream(&self) -> &Stream {
         &self.stream
     }
+}
+
+// cpal keeps the device enumerator it makes first for the rest of the process, in the COM
+// apartment of the thread that made it. A stream's thread ends, and when it was the last one
+// using COM, its end unloaded the enumerator's library and the next stream crashed the process
+// (cpal issue #1302). This thread makes the enumerator first and keeps its apartment.
+#[cfg(windows)]
+fn hold_the_enumerator() {
+    static HELD: std::sync::Once = std::sync::Once::new();
+    HELD.call_once(|| {
+        let (made, wait) = mpsc::channel();
+        thread::spawn(move || {
+            drop(cpal::default_host().default_output_device());
+            made.send(()).expect("the first stream waits for the enumerator");
+            loop {
+                thread::park();
+            }
+        });
+        wait.recv().expect("the thread holding cpal's enumerator ended before making it");
+    });
 }
 
 #[doc(hidden)]

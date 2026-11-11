@@ -5,10 +5,11 @@ use base64::Engine as _;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use super::bundle::{KeyFile, Payload};
-use super::plan::gateway_secret;
+use super::bundle::{KeyFile, PayloadV3};
 use super::{Env, ExportOptions, ExportSelection};
-use crate::store::model::{ProfileKey, ProfileStore};
+use crate::store::hosts::{
+    ConnectionKind, HostsFile, Login, OwnLogin, S3Conn, VncConn, THIS_COMPUTER,
+};
 
 fn file_name(path: &str) -> String {
     let name = path.rsplit(['/', '\\']).next().filter(|s| !s.is_empty()).unwrap_or("key");
@@ -23,275 +24,322 @@ fn file_name(path: &str) -> String {
 }
 
 pub fn build(
-    data: &ProfileStore,
+    file: &HostsFile,
     env: &dyn Env,
     sel: &ExportSelection,
     opts: &ExportOptions,
-) -> (Payload, Vec<String>) {
+) -> (PayloadV3, Vec<String>) {
     let mut warnings = Vec::new();
 
-    let mut profile_ids: HashSet<&str> = sel.profile_ids.iter().map(String::as_str).collect();
-    // A profile is useless on the other machine without its jump chain.
+    let mut picked_folders: HashSet<&str> = sel.folder_ids.iter().map(String::as_str).collect();
     loop {
-        let missing: Vec<&str> = data
-            .profiles
+        let children: Vec<&str> = file
+            .folders
             .iter()
-            .filter(|p| profile_ids.contains(p.id.as_str()))
-            .filter_map(|p| p.jump_host_id.as_deref())
-            .filter(|j| !profile_ids.contains(j) && data.profiles.iter().any(|p| p.id == *j))
+            .filter(|f| f.parent_id.as_deref().is_some_and(|p| picked_folders.contains(p)))
+            .map(|f| f.id.as_str())
+            .filter(|id| !picked_folders.contains(id))
             .collect();
-        if missing.is_empty() {
+        if children.is_empty() {
             break;
         }
-        for id in missing {
-            if !profile_ids.insert(id) {
-                continue;
-            }
-            if let Some(p) = data.profiles.iter().find(|p| p.id == id) {
-                warnings.push(format!("Also exported jump host \"{}\"", p.name));
+        picked_folders.extend(children);
+    }
+
+    let mut host_ids: HashSet<&str> = sel.host_ids.iter().map(String::as_str).collect();
+    for h in &file.hosts {
+        if h.folder_id.as_deref().is_some_and(|f| picked_folders.contains(f)) {
+            host_ids.insert(&h.id);
+        }
+    }
+    host_ids.remove(THIS_COMPUTER);
+    // A connection is useless on the other machine without its jump chain.
+    loop {
+        let jumps: Vec<&str> = file
+            .hosts
+            .iter()
+            .filter(|h| host_ids.contains(h.id.as_str()))
+            .flat_map(|h| &h.connections)
+            .filter_map(|c| match &c.kind {
+                ConnectionKind::Ssh(s) => s.jump_host_id.as_deref(),
+                _ => None,
+            })
+            .filter_map(|j| file.hosts.iter().find(|h| h.connections.iter().any(|c| c.id == j)))
+            .filter(|h| h.id != THIS_COMPUTER && !host_ids.contains(h.id.as_str()))
+            .map(|h| h.id.as_str())
+            .collect();
+        if jumps.is_empty() {
+            break;
+        }
+        for id in jumps {
+            if host_ids.insert(id) {
+                let name = &file.hosts.iter().find(|h| h.id == id).expect("found above").name;
+                warnings.push(format!("Also exported jump host \"{name}\""));
             }
         }
     }
+    let hosts: Vec<_> = file.hosts.iter().filter(|h| host_ids.contains(h.id.as_str())).cloned().collect();
 
-    let mut group_ids: HashSet<&str> = sel.group_ids.iter().map(String::as_str).collect();
-    for p in data.profiles.iter().filter(|p| profile_ids.contains(p.id.as_str())) {
-        group_ids.extend(p.group_id.as_deref());
-    }
-    let mut frontier: Vec<&str> = group_ids.iter().copied().collect();
+    let mut folder_ids = picked_folders;
+    folder_ids.extend(hosts.iter().filter_map(|h| h.folder_id.as_deref()));
+    let mut frontier: Vec<&str> = folder_ids.iter().copied().collect();
     while let Some(id) = frontier.pop() {
-        if let Some(parent) =
-            data.groups.iter().find(|g| g.id == id).and_then(|g| g.parent_id.as_deref())
-        {
-            if group_ids.insert(parent) {
+        let parent = file.folders.iter().find(|f| f.id == id).and_then(|f| f.parent_id.as_deref());
+        if let Some(parent) = parent {
+            if folder_ids.insert(parent) {
                 frontier.push(parent);
             }
         }
     }
 
-    let sftp_ids: HashSet<&str> = sel.sftp_ids.iter().map(String::as_str).collect();
-    let s3_ids: HashSet<&str> = sel.s3_ids.iter().map(String::as_str).collect();
-    let vnc_ids: HashSet<&str> = sel.vnc_ids.iter().map(String::as_str).collect();
-    let rdp_ids: HashSet<&str> = sel.rdp_ids.iter().map(String::as_str).collect();
-    let mut payload = Payload {
-        groups: data.groups.iter().filter(|g| group_ids.contains(g.id.as_str())).cloned().collect(),
-        profiles: data
-            .profiles
-            .iter()
-            .filter(|p| profile_ids.contains(p.id.as_str()))
-            .cloned()
-            .collect(),
-        sftp_profiles: data
-            .sftp_profiles
-            .iter()
-            .filter(|p| sftp_ids.contains(p.id.as_str()))
-            .cloned()
-            .collect(),
-        s3_profiles: data
-            .s3_profiles
-            .iter()
-            .filter(|p| s3_ids.contains(p.id.as_str()))
-            .cloned()
-            .collect(),
-        vnc_profiles: data
-            .vnc_profiles
-            .iter()
-            .filter(|p| vnc_ids.contains(p.id.as_str()))
-            .cloned()
-            .collect(),
-        rdp_profiles: data
-            .rdp_profiles
-            .iter()
-            .filter(|p| rdp_ids.contains(p.id.as_str()))
-            .cloned()
-            .collect(),
+    let logins_used: HashSet<&str> = hosts
+        .iter()
+        .flat_map(|h| &h.connections)
+        .flat_map(|c| c.kind.logins())
+        .filter_map(|l| match l {
+            Login::Saved(s) => Some(s.login_id.as_str()),
+            Login::Own(_) => None,
+        })
+        .collect();
+    let logins: Vec<_> =
+        file.logins.iter().filter(|l| logins_used.contains(l.id.as_str())).cloned().collect();
+    let keys_used: HashSet<String> = hosts
+        .iter()
+        .flat_map(|h| &h.connections)
+        .flat_map(|c| c.kind.logins())
+        .filter_map(|l| match l {
+            Login::Own(o) => Some(&o.key_ids),
+            Login::Saved(_) => None,
+        })
+        .chain(logins.iter().map(|l| &l.key_ids))
+        .flatten()
+        .cloned()
+        .collect();
+    let tags_used: HashSet<&str> = hosts.iter().flat_map(|h| &h.tag_ids).map(String::as_str).collect();
+
+    let mut payload = PayloadV3 {
+        folders: file.folders.iter().filter(|f| folder_ids.contains(f.id.as_str())).cloned().collect(),
+        logins,
+        keys: file.keys.iter().filter(|k| keys_used.contains(&k.id)).cloned().collect(),
+        tags: file.tags.iter().filter(|t| tags_used.contains(t.id.as_str())).cloned().collect(),
+        hosts,
         ..Default::default()
     };
 
-    let mut owners: Vec<(&str, Option<&str>, &[ProfileKey])> = Vec::new();
-    for p in &payload.profiles {
-        owners.push((&p.name, p.secret_id.as_deref(), &p.keys));
-    }
-    for p in &payload.sftp_profiles {
-        owners.push((&p.name, p.secret_id.as_deref(), &p.keys));
-    }
-    for p in &payload.s3_profiles {
-        owners.push((&p.name, p.secret_id.as_deref(), &[]));
-    }
-    for p in &payload.vnc_profiles {
-        owners.push((&p.name, p.secret_id.as_deref(), &[]));
-    }
-    for p in &payload.rdp_profiles {
-        owners.push((&p.name, p.secret_id.as_deref(), &[]));
-        owners.push((&p.name, gateway_secret(p.gateway.as_ref()), &[]));
-    }
-
-    let mut secrets = Vec::new();
-    let mut key_files = Vec::new();
-    for (name, secret_id, keys) in owners {
-        if opts.include_secrets {
-            for id in
-                secret_id.into_iter().chain(keys.iter().filter_map(|k| k.secret_id.as_deref()))
-            {
-                match env.secret(id).and_then(|v| String::from_utf8(v.to_vec()).ok()) {
-                    Some(value) => secrets.push((id.to_string(), Zeroizing::new(value))),
-                    None => warnings.push(format!("Couldn't read a saved password for \"{name}\"")),
+    if opts.include_secrets {
+        let mut owners: Vec<(String, &str)> = Vec::new();
+        for h in &payload.hosts {
+            for c in &h.connections {
+                for login in c.kind.logins() {
+                    if let Login::Own(OwnLogin { secret_id: Some(id), .. }) = login {
+                        owners.push((h.name.clone(), id));
+                    }
+                }
+                match &c.kind {
+                    ConnectionKind::S3(S3Conn { secret_id: Some(id), .. })
+                    | ConnectionKind::Vnc(VncConn { secret_id: Some(id), .. }) => {
+                        owners.push((h.name.clone(), id))
+                    }
+                    _ => {}
                 }
             }
         }
-        if opts.include_keys {
-            for k in keys {
-                match env.read_file(&k.path) {
-                    Some(bytes) => key_files.push((
-                        k.path.clone(),
-                        KeyFile {
-                            file_name: file_name(&k.path),
-                            data: Zeroizing::new(STANDARD.encode(bytes)),
-                        },
-                    )),
-                    None => warnings.push(format!("Couldn't read key file {}", k.path)),
-                }
+        for l in &payload.logins {
+            owners.extend(l.secret_id.as_deref().map(|id| (l.name.clone(), id)));
+        }
+        for k in &payload.keys {
+            owners.extend(k.secret_id.as_deref().map(|id| (file_name(&k.path), id)));
+        }
+        let mut secrets = Vec::new();
+        for (name, id) in owners {
+            match env.secret(id).and_then(|v| String::from_utf8(v.to_vec()).ok()) {
+                Some(value) => secrets.push((id.to_string(), Zeroizing::new(value))),
+                None => warnings.push(format!("Couldn't read a saved password for \"{name}\"")),
             }
         }
+        payload.secrets.extend(secrets);
     }
-    payload.secrets.extend(secrets);
-    payload.key_files.extend(key_files);
+    if opts.include_keys {
+        let mut key_files = Vec::new();
+        for k in &payload.keys {
+            match env.read_file(&k.path) {
+                Some(bytes) => key_files.push((
+                    k.path.clone(),
+                    KeyFile {
+                        file_name: file_name(&k.path),
+                        data: Zeroizing::new(STANDARD.encode(bytes)),
+                    },
+                )),
+                None => warnings.push(format!("Couldn't read key file {}", k.path)),
+            }
+        }
+        payload.key_files.extend(key_files);
+    }
     (payload, warnings)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::model::{
-        AuthMethod, Group, IconRef, Profile, ProfileKey, RdpGateway, RdpProfile, VncProfile,
+    use crate::store::hosts::fixtures::{conn, file, folder, host, own, ssh, vnc};
+    use crate::store::hosts::{
+        ConnectionKind, Login, OwnLogin, RdpConn, RdpGatewayConn, SavedLogin, SavedLoginRef,
+        SshConn, SshKey, THIS_COMPUTER,
     };
+    use crate::store::model::AuthMethod;
     use crate::transfer::MapEnv;
 
-    fn group(id: &str, parent: Option<&str>) -> Group {
-        Group {
+    fn keyed(id: &str, key: &str) -> crate::store::hosts::Connection {
+        ssh(
+            id,
+            22,
+            Login::Own(OwnLogin {
+                username: "u".into(),
+                auth_method: AuthMethod::Key,
+                key_ids: vec![key.into()],
+                secret_id: None,
+                extra: Default::default(),
+            }),
+        )
+    }
+
+    fn jumping(id: &str, key: &str, jump: &str) -> crate::store::hosts::Connection {
+        let mut c = keyed(id, key);
+        if let ConnectionKind::Ssh(SshConn { jump_host_id, .. }) = &mut c.kind {
+            *jump_host_id = Some(jump.into());
+        }
+        c
+    }
+
+    fn key(id: &str) -> SshKey {
+        SshKey {
             id: id.into(),
-            name: id.into(),
-            parent_id: parent.map(Into::into),
-            icon: IconRef::default(),
-            order: 0,
+            path: format!("/keys/{id}"),
+            secret_id: Some(format!("pp-{id}")),
             extra: Default::default(),
         }
     }
 
-    fn profile(id: &str, group: Option<&str>, jump: Option<&str>) -> Profile {
-        Profile {
-            id: id.into(),
-            name: id.into(),
-            group_id: group.map(Into::into),
-            host: "h".into(),
-            port: 22,
-            username: "u".into(),
-            auth_method: AuthMethod::Key,
-            key_path: None,
-            keys: vec![ProfileKey {
-                path: format!("/keys/{id}"),
-                secret_id: Some(format!("pp-{id}")),
-            }],
-            secret_id: None,
-            icon: IconRef::default(),
-            order: 0,
-            jump_host_id: jump.map(Into::into),
-            tunnels: vec![],
-            appearance: None,
-            extra: Default::default(),
-        }
+    // root > child holds web (behind bastion); other is empty.
+    fn data() -> HostsFile {
+        let mut web = host("web", "web", "10.0.0.2", vec![jumping("web-ssh", "k-web", "b-ssh")]);
+        web.folder_id = Some("child".into());
+        let mut f = file(vec![
+            host(THIS_COMPUTER, "This computer", "", vec![]),
+            web,
+            host("bastion", "bastion", "bastion.corp", vec![keyed("b-ssh", "k-b")]),
+        ]);
+        f.folders = vec![folder("root", None), folder("child", Some("root")), folder("other", None)];
+        f.keys = vec![key("k-web"), key("k-b")];
+        f
     }
 
-    fn store() -> ProfileStore {
-        ProfileStore {
-            version: 1,
-            groups: vec![group("root", None), group("child", Some("root")), group("other", None)],
-            profiles: vec![
-                profile("web", Some("child"), Some("bastion")),
-                profile("bastion", None, None),
-            ],
-            sftp_profiles: vec![],
-            s3_profiles: vec![],
-            vnc_profiles: vec![],
-            rdp_profiles: vec![],
-            unknown: Default::default(),
-        }
+    fn hosts_only(ids: &[&str]) -> ExportSelection {
+        ExportSelection { host_ids: ids.iter().map(|s| s.to_string()).collect(), ..Default::default() }
     }
 
-    fn vnc(id: &str, secret: Option<&str>) -> VncProfile {
-        VncProfile {
-            id: id.into(),
-            name: id.into(),
-            host: "h".into(),
-            port: 5900,
-            username: None,
-            secret_id: secret.map(Into::into),
-            icon: IconRef::default(),
-            order: 0,
-            extra: Default::default(),
-        }
-    }
-
-    fn rdp(id: &str, secret: Option<&str>) -> RdpProfile {
-        RdpProfile {
-            id: id.into(),
-            name: id.into(),
-            host: "h".into(),
-            port: 3389,
-            username: "u".into(),
-            domain: Some("CORP".into()),
-            secret_id: secret.map(Into::into),
-            keyboard_layout: Some(0x407),
-            audio: true,
-            shared_folder: None,
-            gateway: None,
-            icon: IconRef::default(),
-            order: 0,
-            extra: Default::default(),
-        }
-    }
-
-    fn select(ids: &[&str]) -> ExportSelection {
-        ExportSelection {
-            profile_ids: ids.iter().map(|s| s.to_string()).collect(),
-            ..Default::default()
-        }
+    fn host_ids(p: &PayloadV3) -> Vec<&str> {
+        p.hosts.iter().map(|h| h.id.as_str()).collect()
     }
 
     #[test]
-    fn includes_ancestor_groups_and_jump_hosts() {
+    fn jump_host_hosts_come_along_with_ancestor_folders() {
         let (payload, warnings) =
-            build(&store(), &MapEnv::default(), &select(&["web"]), &ExportOptions::default());
-        let groups: Vec<_> = payload.groups.iter().map(|g| g.id.as_str()).collect();
-        assert_eq!(groups, ["root", "child"]);
-        let profiles: Vec<_> = payload.profiles.iter().map(|p| p.id.as_str()).collect();
-        assert_eq!(profiles, ["web", "bastion"]);
+            build(&data(), &MapEnv::default(), &hosts_only(&["web"]), &ExportOptions::default());
+        let folders: Vec<_> = payload.folders.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(folders, ["root", "child"]);
+        assert_eq!(host_ids(&payload), ["web", "bastion"]);
         assert!(warnings.iter().any(|w| w.contains("bastion")));
+        let keys: Vec<_> = payload.keys.iter().map(|k| k.id.as_str()).collect();
+        assert_eq!(keys, ["k-web", "k-b"]);
     }
 
     #[test]
-    fn shared_jump_host_is_warned_about_once() {
-        let mut data = store();
-        data.profiles.push(profile("db", None, Some("bastion")));
+    fn a_shared_jump_host_is_warned_about_once() {
+        let mut d = data();
+        d.hosts.push(host("db", "db", "10.0.0.3", vec![jumping("db-ssh", "k-b", "b-ssh")]));
         let (payload, warnings) =
-            build(&data, &MapEnv::default(), &select(&["web", "db"]), &ExportOptions::default());
-        assert_eq!(payload.profiles.len(), 3);
+            build(&d, &MapEnv::default(), &hosts_only(&["web", "db"]), &ExportOptions::default());
+        assert_eq!(payload.hosts.len(), 3);
         assert_eq!(warnings.iter().filter(|w| w.contains("bastion")).count(), 1);
+    }
+
+    #[test]
+    fn selecting_a_folder_exports_its_subfolders() {
+        let sel = ExportSelection { folder_ids: vec!["root".into()], ..Default::default() };
+        let (payload, _) = build(&data(), &MapEnv::default(), &sel, &ExportOptions::default());
+        assert_eq!(host_ids(&payload), ["web", "bastion"]);
+        let folders: Vec<_> = payload.folders.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(folders, ["root", "child"]);
+    }
+
+    #[test]
+    fn an_explicitly_selected_empty_folder_is_exported() {
+        let sel = ExportSelection { folder_ids: vec!["other".into()], ..Default::default() };
+        let (payload, _) = build(&data(), &MapEnv::default(), &sel, &ExportOptions::default());
+        assert_eq!(payload.folders.len(), 1);
+        assert!(payload.hosts.is_empty());
+    }
+
+    #[test]
+    fn this_computer_is_never_exported() {
+        let (payload, _) = build(
+            &data(),
+            &MapEnv::default(),
+            &hosts_only(&[THIS_COMPUTER]),
+            &ExportOptions::default(),
+        );
+        assert!(payload.hosts.is_empty());
+    }
+
+    #[test]
+    fn saved_logins_and_keys_in_use_come_along() {
+        let mut d = data();
+        d.logins.push(SavedLogin {
+            id: "l1".into(),
+            name: "homelab".into(),
+            username: "admin".into(),
+            auth_method: AuthMethod::Key,
+            key_ids: vec!["k-b".into()],
+            secret_id: None,
+            extra: Default::default(),
+        });
+        d.logins.push(SavedLogin {
+            id: "unused".into(),
+            name: "unused".into(),
+            username: "x".into(),
+            auth_method: AuthMethod::Password,
+            key_ids: vec![],
+            secret_id: None,
+            extra: Default::default(),
+        });
+        let saved = Login::Saved(SavedLoginRef { login_id: "l1".into(), extra: Default::default() });
+        d.hosts.push(host("nas", "nas", "nas.local", vec![ssh("nas-ssh", 22, saved)]));
+        let (payload, _) =
+            build(&d, &MapEnv::default(), &hosts_only(&["nas"]), &ExportOptions::default());
+        let logins: Vec<_> = payload.logins.iter().map(|l| l.id.as_str()).collect();
+        assert_eq!(logins, ["l1"]);
+        let keys: Vec<_> = payload.keys.iter().map(|k| k.id.as_str()).collect();
+        assert_eq!(keys, ["k-b"]);
     }
 
     #[test]
     fn secrets_and_keys_only_when_asked() {
         let mut env = MapEnv::default();
-        env.secrets.insert("pp-web".into(), b"pass".to_vec());
-        env.files.insert("/keys/web".into(), b"KEY".to_vec());
-        let (plain, _) = build(&store(), &env, &select(&["web"]), &ExportOptions::default());
+        env.secrets.insert("pp-k-web".into(), b"pass".to_vec());
+        env.secrets.insert("pp-k-b".into(), b"bpass".to_vec());
+        env.files.insert("/keys/k-web".into(), b"KEY".to_vec());
+        env.files.insert("/keys/k-b".into(), b"BKEY".to_vec());
+        let (plain, _) = build(&data(), &env, &hosts_only(&["web"]), &ExportOptions::default());
         assert!(plain.secrets.is_empty() && plain.key_files.is_empty());
 
         let opts = ExportOptions { include_secrets: true, include_keys: true };
-        let (full, _) = build(&store(), &env, &select(&["web"]), &opts);
-        assert_eq!(full.secrets.get("pp-web").map(|v| v.as_str()), Some("pass"));
-        let key = full.key_files.get("/keys/web").unwrap();
-        assert_eq!(key.file_name, "web");
+        let (full, warnings) = build(&data(), &env, &hosts_only(&["web"]), &opts);
+        assert_eq!(full.secrets.get("pp-k-web").map(|v| v.as_str()), Some("pass"));
+        let key = full.key_files.get("/keys/k-web").unwrap();
+        assert_eq!(key.file_name, "k-web");
         assert_eq!(STANDARD.decode(key.data.as_bytes()).unwrap(), b"KEY");
+        assert!(warnings.iter().all(|w| !w.starts_with("Couldn't")), "{warnings:?}");
     }
 
     #[test]
@@ -304,171 +352,72 @@ mod tests {
         assert_eq!(file_name("/home/me/.ssh/my-server-key"), "my-server-key");
         assert_eq!(file_name("/home/me/.ssh/"), "key");
 
-        let mut data = store();
-        data.profiles[0].keys[0].path = format!("/cfg/keys/{id}-id");
+        let mut d = data();
+        d.keys[0].path = format!("/cfg/keys/{id}-id");
         let mut env = MapEnv::default();
         env.files.insert(format!("/cfg/keys/{id}-id"), b"KEY".to_vec());
+        env.files.insert("/keys/k-b".into(), b"BKEY".to_vec());
         let opts = ExportOptions { include_secrets: false, include_keys: true };
-        let (payload, _) = build(&data, &env, &select(&["web"]), &opts);
+        let (payload, _) = build(&d, &env, &hosts_only(&["web"]), &opts);
         assert_eq!(payload.key_files[&format!("/cfg/keys/{id}-id")].file_name, "id");
     }
 
     #[test]
     fn unreadable_key_and_binary_secret_become_warnings() {
         let mut env = MapEnv::default();
-        env.secrets.insert("pp-web".into(), vec![0xff, 0xfe]);
+        env.secrets.insert("pp-k-web".into(), vec![0xff, 0xfe]);
         let opts = ExportOptions { include_secrets: true, include_keys: true };
-        let (payload, warnings) = build(&store(), &env, &select(&["web"]), &opts);
-        assert!(payload.secrets.get("pp-web").is_none());
+        let (payload, warnings) = build(&data(), &env, &hosts_only(&["web"]), &opts);
+        assert!(!payload.secrets.contains_key("pp-k-web"));
         assert!(payload.key_files.is_empty());
-        assert!(warnings.iter().any(|w| w.contains("/keys/web")));
-        assert!(warnings.iter().any(|w| w.contains("web") && w.contains("password")));
+        assert!(warnings.iter().any(|w| w.contains("/keys/k-web")));
+        assert!(warnings.iter().any(|w| w.contains("k-web") && w.contains("password")));
     }
 
     #[test]
-    fn explicitly_selected_empty_group_is_exported() {
-        let sel = ExportSelection { group_ids: vec!["other".into()], ..Default::default() };
-        let (payload, _) = build(&store(), &MapEnv::default(), &sel, &ExportOptions::default());
-        assert_eq!(payload.groups.len(), 1);
-        assert!(payload.profiles.is_empty());
-    }
-
-    #[test]
-    fn selected_vnc_profile_is_exported_with_its_password_only_when_asked() {
-        let mut data = store();
-        data.vnc_profiles = vec![vnc("desk", Some("vnc-pw")), vnc("lab", None)];
-        let sel = ExportSelection { vnc_ids: vec!["desk".into()], ..Default::default() };
+    fn vnc_and_rdp_gateway_passwords_are_exported_only_when_asked() {
+        let rdp = conn(
+            "office-rdp",
+            ConnectionKind::Rdp(RdpConn {
+                port: 3389,
+                login: own("faye", Some("rdp-pw")),
+                domain: None,
+                keyboard_layout: None,
+                audio: true,
+                shared_folder: None,
+                gateway: Some(RdpGatewayConn {
+                    host: "gw".into(),
+                    port: 443,
+                    login: Some(own("gw", Some("gw-pw"))),
+                    extra: Default::default(),
+                }),
+                extra: Default::default(),
+            }),
+        );
+        let mut d = data();
+        d.hosts.push(host("office", "office", "10.0.0.9", vec![rdp, vnc("desk", Some("vnc-pw"))]));
         let mut env = MapEnv::default();
-        env.secrets.insert("vnc-pw".into(), b"pass".to_vec());
+        env.secrets.insert("rdp-pw".into(), b"r".to_vec());
+        env.secrets.insert("gw-pw".into(), b"g".to_vec());
+        env.secrets.insert("vnc-pw".into(), b"v".to_vec());
 
-        let (plain, warnings) = build(&data, &env, &sel, &ExportOptions::default());
-        assert_eq!(plain.vnc_profiles, [data.vnc_profiles[0].clone()]);
-        assert!(plain.groups.is_empty() && plain.profiles.is_empty());
-        assert!(plain.secrets.is_empty() && warnings.is_empty());
-
-        let opts = ExportOptions { include_secrets: true, include_keys: true };
-        let (full, warnings) = build(&data, &env, &sel, &opts);
-        assert_eq!(full.vnc_profiles, plain.vnc_profiles);
-        assert_eq!(full.secrets.len(), 1);
-        assert_eq!(full.secrets.get("vnc-pw").map(|v| v.as_str()), Some("pass"));
-        assert!(full.key_files.is_empty() && warnings.is_empty());
-    }
-
-    #[test]
-    fn unreadable_vnc_password_becomes_a_warning() {
-        let mut data = store();
-        data.vnc_profiles = vec![vnc("desk", Some("vnc-pw")), vnc("lab", None)];
-        let sel =
-            ExportSelection { vnc_ids: vec!["desk".into(), "lab".into()], ..Default::default() };
-        let opts = ExportOptions { include_secrets: true, include_keys: false };
-        let (payload, warnings) = build(&data, &MapEnv::default(), &sel, &opts);
-        assert_eq!(payload.vnc_profiles.len(), 2);
-        assert!(payload.secrets.is_empty());
-        assert_eq!(warnings, ["Couldn't read a saved password for \"desk\""]);
-    }
-
-    #[test]
-    fn selected_rdp_profile_is_exported_with_its_password_only_when_asked() {
-        let mut data = store();
-        data.rdp_profiles = vec![rdp("office", Some("rdp-pw")), rdp("lab", None)];
-        let sel = ExportSelection { rdp_ids: vec!["office".into()], ..Default::default() };
-        let mut env = MapEnv::default();
-        env.secrets.insert("rdp-pw".into(), b"pass".to_vec());
-
-        let (plain, warnings) = build(&data, &env, &sel, &ExportOptions::default());
-        assert_eq!(plain.rdp_profiles, [data.rdp_profiles[0].clone()]);
-        assert!(plain.groups.is_empty() && plain.profiles.is_empty());
-        assert!(plain.secrets.is_empty() && warnings.is_empty());
-
-        let opts = ExportOptions { include_secrets: true, include_keys: true };
-        let (full, warnings) = build(&data, &env, &sel, &opts);
-        assert_eq!(full.rdp_profiles, plain.rdp_profiles);
-        assert_eq!(full.secrets.len(), 1);
-        assert_eq!(full.secrets.get("rdp-pw").map(|v| v.as_str()), Some("pass"));
-        assert!(full.key_files.is_empty() && warnings.is_empty());
-    }
-
-    #[test]
-    fn unreadable_rdp_password_becomes_a_warning() {
-        let mut data = store();
-        data.rdp_profiles = vec![rdp("office", Some("rdp-pw")), rdp("lab", None)];
-        let sel =
-            ExportSelection { rdp_ids: vec!["office".into(), "lab".into()], ..Default::default() };
-        let opts = ExportOptions { include_secrets: true, include_keys: false };
-        let (payload, warnings) = build(&data, &MapEnv::default(), &sel, &opts);
-        assert_eq!(payload.rdp_profiles.len(), 2);
-        assert!(payload.secrets.is_empty());
-        assert_eq!(warnings, ["Couldn't read a saved password for \"office\""]);
-    }
-
-    fn through(same_login: bool, secret: Option<&str>, p: RdpProfile) -> RdpProfile {
-        let gateway = RdpGateway {
-            host: "gw.corp".into(),
-            port: 443,
-            same_login,
-            username: if same_login { "" } else { "CORP\\gw" }.into(),
-            secret_id: secret.map(Into::into),
-            extra: Default::default(),
-        };
-        RdpProfile { gateway: Some(gateway), ..p }
-    }
-
-    #[test]
-    fn rdp_gateway_password_is_exported_under_its_secret_id_only_when_asked() {
-        let mut data = store();
-        data.rdp_profiles = vec![
-            through(false, Some("gw-pw"), rdp("office", Some("rdp-pw"))),
-            through(true, None, rdp("lab", None)),
-        ];
-        let sel =
-            ExportSelection { rdp_ids: vec!["office".into(), "lab".into()], ..Default::default() };
-        let mut env = MapEnv::default();
-        env.secrets.insert("rdp-pw".into(), b"pass".to_vec());
-        env.secrets.insert("gw-pw".into(), b"gateway pass".to_vec());
-
-        let (plain, warnings) = build(&data, &env, &sel, &ExportOptions::default());
-        assert_eq!(plain.rdp_profiles, data.rdp_profiles);
+        let (plain, warnings) = build(&d, &env, &hosts_only(&["office"]), &ExportOptions::default());
         assert!(plain.secrets.is_empty() && warnings.is_empty());
 
         let opts = ExportOptions { include_secrets: true, include_keys: false };
-        let (full, warnings) = build(&data, &env, &sel, &opts);
-        assert_eq!(full.rdp_profiles, data.rdp_profiles);
+        let (full, warnings) = build(&d, &env, &hosts_only(&["office"]), &opts);
         let secrets: Vec<_> = full.secrets.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        assert_eq!(secrets, [("gw-pw", "gateway pass"), ("rdp-pw", "pass")]);
-        assert!(warnings.is_empty());
-    }
-
-    // A gateway switched to the same login keeps the vault id of its own password, unused.
-    #[test]
-    fn a_same_login_gateway_exports_no_password_of_its_own() {
-        let mut data = store();
-        data.rdp_profiles = vec![
-            through(true, Some("gw-old"), rdp("office", Some("rdp-pw"))),
-            through(true, Some("gw-gone"), rdp("lab", None)),
-        ];
-        let sel =
-            ExportSelection { rdp_ids: vec!["office".into(), "lab".into()], ..Default::default() };
-        let mut env = MapEnv::default();
-        env.secrets.insert("rdp-pw".into(), b"pass".to_vec());
-        env.secrets.insert("gw-old".into(), b"old gateway pass".to_vec());
-        let opts = ExportOptions { include_secrets: true, include_keys: false };
-        let (payload, warnings) = build(&data, &env, &sel, &opts);
-        let secrets: Vec<_> = payload.secrets.keys().map(String::as_str).collect();
-        assert_eq!(secrets, ["rdp-pw"]);
+        assert_eq!(secrets, [("gw-pw", "g"), ("rdp-pw", "r"), ("vnc-pw", "v")]);
         assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]
-    fn unreadable_rdp_gateway_password_becomes_a_warning() {
-        let mut data = store();
-        data.rdp_profiles = vec![through(false, Some("gw-pw"), rdp("office", Some("rdp-pw")))];
-        let sel = ExportSelection { rdp_ids: vec!["office".into()], ..Default::default() };
-        let mut env = MapEnv::default();
-        env.secrets.insert("rdp-pw".into(), b"pass".to_vec());
+    fn an_unreadable_vnc_password_names_its_host() {
+        let mut d = data();
+        d.hosts.push(host("desk", "desk", "10.0.0.5", vec![vnc("desk-vnc", Some("vnc-pw"))]));
         let opts = ExportOptions { include_secrets: true, include_keys: false };
-        let (payload, warnings) = build(&data, &env, &sel, &opts);
-        let secrets: Vec<_> = payload.secrets.keys().map(String::as_str).collect();
-        assert_eq!(secrets, ["rdp-pw"]);
-        assert_eq!(warnings, ["Couldn't read a saved password for \"office\""]);
+        let (payload, warnings) = build(&d, &MapEnv::default(), &hosts_only(&["desk"]), &opts);
+        assert!(payload.secrets.is_empty());
+        assert_eq!(warnings, ["Couldn't read a saved password for \"desk\""]);
     }
 }

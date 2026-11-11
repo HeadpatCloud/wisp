@@ -10,13 +10,14 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { vaultStatus, vaultUnlock } from '@/lib/vault'
+import { vaultCanSkipPassword, vaultSkipPassword, vaultStatus, vaultUnlock } from '@/lib/vault'
 
 export function VaultGate({ onReady }: { onReady?: () => void } = {}) {
   const [needs, setNeeds] = useState(false)
   const [password, setPassword] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const [canSkip, setCanSkip] = useState(false)
   const readyRef = useRef(onReady)
   readyRef.current = onReady
 
@@ -26,6 +27,7 @@ export function VaultGate({ onReady }: { onReady?: () => void } = {}) {
         const locked = s === 'needsPassword'
         setNeeds(locked)
         if (!locked) readyRef.current?.()
+        else vaultCanSkipPassword().then(setCanSkip, () => setCanSkip(false))
       })
       .catch(() => {
         // A status probe failure leaves the app usable, so the app-ready path must still run.
@@ -53,6 +55,21 @@ export function VaultGate({ onReady }: { onReady?: () => void } = {}) {
     }
   }
 
+  async function skip() {
+    if (busy) return
+    setBusy(true)
+    setError(null)
+    try {
+      await vaultSkipPassword()
+      setNeeds(false)
+      readyRef.current?.()
+    } catch {
+      setError('Could not open the vault.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
   return (
     <Dialog open={needs}>
       <DialogContent>
@@ -73,7 +90,18 @@ export function VaultGate({ onReady }: { onReady?: () => void } = {}) {
           />
           {error && <p className="text-destructive text-xs">{error}</p>}
         </div>
+        {canSkip && (
+          <p className="text-muted-foreground text-sm">
+            Wisp 0.5.0 stopped asking for this password after it was set. Without it, the passwords
+            you saved since then still work and older ones stay locked, and Wisp won't ask again.
+          </p>
+        )}
         <DialogFooter>
+          {canSkip && (
+            <Button type="button" variant="ghost" disabled={busy} onClick={skip}>
+              Continue without it
+            </Button>
+          )}
           <Button type="button" disabled={!password || busy} onClick={submit}>
             Unlock
           </Button>

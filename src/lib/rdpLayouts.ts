@@ -1,0 +1,28 @@
+// The layouts an RDP connection can send at login. transfer/plan.rs keeps its own copy for the
+// import review, and a test there keeps the two equal.
+export const LAYOUTS: [number, string][] = [
+  [0x409, 'English (US)'],
+  [0x20409, 'English (US International)'],
+  [0x809, 'English (UK)'],
+  [0x407, 'German'],
+  [0x807, 'German (Switzerland)'],
+  [0x40c, 'French'],
+  [0x80c, 'French (Belgium)'],
+  [0x100c, 'French (Switzerland)'],
+  [0x413, 'Dutch'],
+  [0x813, 'Belgian (Period)'],
+  [0x40a, 'Spanish'],
+  [0x410, 'Italian'],
+  [0x816, 'Portuguese'],
+  [0x416, 'Portuguese (Brazil)'],
+  [0x406, 'Danish'],
+  [0x414, 'Norwegian'],
+  [0x41d, 'Swedish'],
+  [0x40b, 'Finnish'],
+  [0x415, 'Polish (Programmers)'],
+  [0x405, 'Czech'],
+  [0x40e, 'Hungarian'],
+  [0x41f, 'Turkish Q'],
+  [0x419, 'Russian'],
+  [0x411, 'Japanese'],
+]

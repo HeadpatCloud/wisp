@@ -10,7 +10,7 @@ vi.mock('@tauri-apps/plugin-process', () => ({ relaunch: m.relaunch }))
 vi.mock('@tauri-apps/plugin-updater', () => ({ check: vi.fn() }))
 
 import type { DownloadEvent, Update } from '@tauri-apps/plugin-updater'
-import { installUpdate } from './updater'
+import { downloadUpdate, installUpdate } from './updater'
 
 function update(download: (onEvent: (event: DownloadEvent) => void) => Promise<void>) {
   return {
@@ -43,16 +43,17 @@ test('the RDP sessions are closed after the download and before the install', as
     onEvent({ event: 'Progress', data: { chunkLength: 150 } })
     onEvent({ event: 'Finished' })
   })
-  await installUpdate(downloaded, (percent) => progress.push(percent))
+  await downloadUpdate(downloaded, (percent) => progress.push(percent))
+  await installUpdate(downloaded)
   expect(m.steps).toEqual(['download', 'close', 'install', 'relaunch'])
   expect(progress).toEqual([25, 100])
 })
 
-test('a failed download closes nothing and installs nothing', async () => {
+test('a failed download closes nothing', async () => {
   const failed = update(async () => {
     throw new Error('offline')
   })
-  await expect(installUpdate(failed)).rejects.toThrow('offline')
+  await expect(downloadUpdate(failed)).rejects.toThrow('offline')
   expect(m.steps).toEqual(['download'])
   expect(m.rdpCloseAll).not.toHaveBeenCalled()
 })

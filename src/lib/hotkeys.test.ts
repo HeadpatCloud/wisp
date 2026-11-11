@@ -131,10 +131,32 @@ test('leaves chords pressed inside a remote desktop to it', () => {
   outside.remove()
 })
 
+test('palette_short_is_skipped_in_a_terminal', () => {
+  const paletteShort = vi.fn()
+  renderHook(() => useHotkeys({ paletteShort }, {}))
+  const xterm = document.createElement('textarea')
+  xterm.className = 'xterm-helper-textarea'
+  const button = document.createElement('button')
+  document.body.append(xterm, button)
+
+  expect(press({ key: 'k', ctrlKey: true }, xterm).defaultPrevented).toBe(false)
+  expect(paletteShort).not.toHaveBeenCalled()
+  expect(press({ key: 'k', ctrlKey: true }, button).defaultPrevented).toBe(true)
+  expect(paletteShort).toHaveBeenCalledTimes(1)
+  // Rebound to a chord without Ctrl, it works in the terminal too (Cmd+K on macOS).
+  renderHook(() => useHotkeys({ paletteShort }, { paletteShort: 'alt+k' }))
+  press({ key: 'k', altKey: true }, xterm)
+  expect(paletteShort).toHaveBeenCalledTimes(2)
+
+  xterm.remove()
+  button.remove()
+})
+
 // Ctrl+W is readline's kill-word; stealing it would break the terminal.
 test('defaults leave bare Ctrl+letter chords to the terminal', () => {
   for (const a of HOTKEY_ACTIONS) {
     const parts = a.default.split('+')
+    if ('shellFirst' in a) continue
     if (parts.length === 2 && parts[0] === 'ctrl' && /^[a-z]$/.test(parts[1])) {
       throw new Error(`${a.id} claims bare ${a.default}`)
     }

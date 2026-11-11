@@ -1,5 +1,5 @@
 import { getCurrentWebview } from '@tauri-apps/api/webview'
-import { confirm as confirmDialog, message, open as openDialog } from '@tauri-apps/plugin-dialog'
+import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { openPath } from '@tauri-apps/plugin-opener'
 import { ChevronRight, ChevronUp, Eye, EyeOff, FolderPlus, RefreshCw, X } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
@@ -27,6 +27,8 @@ import { editTempPath, fileMtime } from '@/lib/local'
 import { basename } from '@/lib/sftp'
 import { runTransfer } from '@/lib/transferQueue'
 import { cn } from '@/lib/utils'
+import { confirm } from '@/stores/confirmStore'
+import { notify } from '@/stores/noticeStore'
 import { useTransferStore } from '@/stores/transferStore'
 import { FileList, type SortKey } from '../sftp/FileList'
 import { TransfersBar } from '../sftp/TransfersBar'
@@ -240,7 +242,7 @@ export function FileBrowser({
     try {
       setLink({ title: e.name, url: await gen(e, expires), entry: e, expires })
     } catch (err) {
-      await message(String(err), { title: 'Could not create link', kind: 'error' })
+      notify({ title: 'Could not create link', body: String(err), tone: 'error' })
     }
   }
 
@@ -377,7 +379,7 @@ export function FileBrowser({
         await openPath(local)
       } catch (e) {
         editing.current.delete(entry.path)
-        await message(String(e), { title: 'Could not open the editor', kind: 'error' })
+        notify({ title: 'Could not open the editor', body: String(e), tone: 'error' })
         return
       }
       // The panel may already be gone by the time the download finishes, in which case the
@@ -509,10 +511,12 @@ export function FileBrowser({
       if (await backend.exists(joinPath(cwdRef.current, basename(p)))) conflicts.push(basename(p))
     }
     if (conflicts.length > 0) {
-      const ok = await confirmDialog(
-        `${conflicts.length} item(s) already exist and will be overwritten. Continue?`,
-        { title: 'Overwrite?' },
-      )
+      const ok = await confirm({
+        title: 'Overwrite?',
+        body: `${conflicts.length} item(s) already exist and will be overwritten. Continue?`,
+        confirmLabel: 'Overwrite',
+        destructive: true,
+      })
       if (!ok) return
     }
     const dir = cwdRef.current
@@ -647,7 +651,7 @@ export function FileBrowser({
               await backend.rename(e.path, joinPath(parentOf(e.path), name))
               refresh(cwdRef.current)
             } catch (err) {
-              await message(String(err), { title: 'Rename failed', kind: 'error' })
+              notify({ title: 'Rename failed', body: String(err), tone: 'error' })
             }
           }}
           onDelete={(e) => setOp({ kind: 'delete', entries: targetsFor(e) })}
@@ -715,7 +719,7 @@ export function FileBrowser({
             setOp(null)
             refresh(cwdRef.current)
           } catch (e) {
-            await message(String(e), { title: 'Create folder failed', kind: 'error' })
+            notify({ title: 'Create folder failed', body: String(e), tone: 'error' })
           }
         }}
         onOpenChange={(open) => {

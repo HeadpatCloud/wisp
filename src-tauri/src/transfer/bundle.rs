@@ -2,11 +2,12 @@ use std::collections::{BTreeMap, HashSet};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
-use serde::de::IgnoredAny;
+use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::error::{AppError, AppResult};
+use crate::store::hosts::{ConnectionKind, Folder, Host, SavedLogin, SshKey, Tag};
 use crate::store::model::{Group, Profile, RdpProfile, S3Profile, SftpProfile, VncProfile};
 use crate::vault::crypto;
 use crate::vault::model::KdfParams;
@@ -22,7 +23,7 @@ pub struct KeyFile {
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Payload {
+pub struct LegacyPayload {
     #[serde(default)]
     pub groups: Vec<Group>,
     #[serde(default)]
@@ -42,6 +43,30 @@ pub struct Payload {
     pub key_files: BTreeMap<String, KeyFile>,
 }
 
+// Version 3: hosts with their connections. `LegacyPayload` above is what versions 1 and 2 hold.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PayloadV3 {
+    #[serde(default)]
+    pub folders: Vec<Folder>,
+    #[serde(default)]
+    pub hosts: Vec<Host>,
+    #[serde(default)]
+    pub logins: Vec<SavedLogin>,
+    #[serde(default)]
+    pub keys: Vec<SshKey>,
+    #[serde(default)]
+    pub tags: Vec<Tag>,
+    #[serde(default)]
+    pub secrets: BTreeMap<String, Zeroizing<String>>,
+    #[serde(default)]
+    pub key_files: BTreeMap<String, KeyFile>,
+    // Read from a version 1 or 2 bundle: its hosts were put together from whichever profiles were
+    // exported, so their names, folders and the connection labels say nothing about changes.
+    #[serde(skip)]
+    pub legacy: bool,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Envelope {
@@ -49,7 +74,7 @@ struct Envelope {
     #[serde(default)]
     encrypted: bool,
     #[serde(default)]
-    payload: Option<Payload>,
+    payload: Option<serde_json::Value>,
     #[serde(default)]
     kdf: Option<KdfParams>,
     #[serde(default)]
@@ -62,20 +87,26 @@ struct Envelope {
 
 pub enum Opened {
     NeedsPassword,
-    Payload(Payload),
+    Legacy(LegacyPayload),
+    V3(PayloadV3),
 }
 
-pub fn write(payload: &Payload, password: Option<&str>) -> AppResult<Vec<u8>> {
+fn write_envelope<P: Serialize>(
+    version: u32,
+    payload: &P,
+    carries_secrets: bool,
+    password: Option<&str>,
+) -> AppResult<Vec<u8>> {
     let envelope = match password {
-        None if !payload.secrets.is_empty() || !payload.key_files.is_empty() => {
+        None if carries_secrets => {
             return Err(AppError::Import(
                 "an export with passwords or key files must be encrypted".into(),
             ));
         }
         None => Envelope {
-            version: 2,
+            version,
             encrypted: false,
-            payload: Some(payload.clone()),
+            payload: Some(serde_json::to_value(payload)?),
             kdf: None,
             salt: None,
             nonce: None,
@@ -88,7 +119,7 @@ pub fn write(payload: &Payload, password: Option<&str>) -> AppResult<Vec<u8>> {
                 crypto::derive_key(password.as_bytes(), &salt, Some(KdfParams::STRONG.tuple()))?;
             let (nonce, ciphertext) = crypto::seal(&key, &plain)?;
             Envelope {
-                version: 2,
+                version,
                 encrypted: true,
                 payload: None,
                 kdf: Some(KdfParams::STRONG),
@@ -101,6 +132,17 @@ pub fn write(payload: &Payload, password: Option<&str>) -> AppResult<Vec<u8>> {
     Ok(serde_json::to_vec_pretty(&envelope)?)
 }
 
+pub fn write(payload: &PayloadV3, password: Option<&str>) -> AppResult<Vec<u8>> {
+    let carries_secrets = !payload.secrets.is_empty() || !payload.key_files.is_empty();
+    write_envelope(3, payload, carries_secrets, password)
+}
+
+#[cfg(test)]
+pub fn write_v2(payload: &LegacyPayload, password: Option<&str>) -> AppResult<Vec<u8>> {
+    let carries_secrets = !payload.secrets.is_empty() || !payload.key_files.is_empty();
+    write_envelope(2, payload, carries_secrets, password)
+}
+
 fn corrupt() -> AppError {
     AppError::Import("the export file is corrupt".into())
 }
@@ -110,7 +152,7 @@ fn decode(field: Option<String>) -> AppResult<Vec<u8>> {
 }
 
 // A repeated id within a kind would be imported as two items sharing that id.
-fn checked(payload: Payload) -> AppResult<Opened> {
+fn checked(payload: LegacyPayload) -> AppResult<Opened> {
     let unique = |ids: Vec<&String>| ids.iter().collect::<HashSet<_>>().len() == ids.len();
     if unique(payload.groups.iter().map(|g| &g.id).collect())
         && unique(payload.profiles.iter().map(|p| &p.id).collect())
@@ -119,7 +161,22 @@ fn checked(payload: Payload) -> AppResult<Opened> {
         && unique(payload.vnc_profiles.iter().map(|p| &p.id).collect())
         && unique(payload.rdp_profiles.iter().map(|p| &p.id).collect())
     {
-        Ok(Opened::Payload(payload))
+        Ok(Opened::Legacy(payload))
+    } else {
+        Err(corrupt())
+    }
+}
+
+fn checked_v3(payload: PayloadV3) -> AppResult<Opened> {
+    let unique = |ids: Vec<&String>| ids.iter().collect::<HashSet<_>>().len() == ids.len();
+    if unique(payload.folders.iter().map(|f| &f.id).collect())
+        && unique(payload.hosts.iter().map(|h| &h.id).collect())
+        && unique(payload.hosts.iter().flat_map(|h| &h.connections).map(|c| &c.id).collect())
+        && unique(payload.logins.iter().map(|l| &l.id).collect())
+        && unique(payload.keys.iter().map(|k| &k.id).collect())
+        && unique(payload.tags.iter().map(|t| &t.id).collect())
+    {
+        Ok(Opened::V3(payload))
     } else {
         Err(corrupt())
     }
@@ -129,9 +186,11 @@ fn newer() -> AppError {
     AppError::Import("this file was made by a newer version of Wisp".into())
 }
 
-// A key this build does not write holds a kind of profile it would leave out without a word.
-fn known_keys<'a>(keys: impl IntoIterator<Item = &'a String>) -> AppResult<()> {
-    let known = serde_json::to_value(Payload::default())?;
+// A key this build does not write holds a kind of item it would leave out without a word.
+fn known_keys<'a, P: Serialize + Default>(
+    keys: impl IntoIterator<Item = &'a String>,
+) -> AppResult<()> {
+    let known = serde_json::to_value(P::default())?;
     if keys.into_iter().all(|key| known.get(key).is_some()) {
         return Ok(());
     }
@@ -140,7 +199,7 @@ fn known_keys<'a>(keys: impl IntoIterator<Item = &'a String>) -> AppResult<()> {
 
 // A profile field this build does not know, such as a gateway, would be left out on import and the
 // profile would then connect without it.
-fn known_fields(payload: &Payload) -> AppResult<()> {
+fn known_fields(payload: &LegacyPayload) -> AppResult<()> {
     let known = payload.groups.iter().all(|g| g.extra.is_empty())
         && payload.profiles.iter().all(|p| p.extra.is_empty())
         && payload.sftp_profiles.iter().all(|p| p.extra.is_empty())
@@ -158,12 +217,77 @@ fn known_fields(payload: &Payload) -> AppResult<()> {
     }
 }
 
+fn kind_is_known(kind: &ConnectionKind) -> bool {
+    match kind {
+        ConnectionKind::Ssh(c) => c.extra.is_empty(),
+        ConnectionKind::Sftp(c) => c.extra.is_empty(),
+        ConnectionKind::Ftp(c) => c.extra.is_empty(),
+        ConnectionKind::S3(c) => c.extra.is_empty(),
+        ConnectionKind::Rdp(c) => {
+            c.extra.is_empty()
+                && c.shared_folder.as_ref().is_none_or(|f| f.extra.is_empty())
+                && c.gateway.as_ref().is_none_or(|g| g.extra.is_empty())
+        }
+        ConnectionKind::Vnc(c) => c.extra.is_empty(),
+        ConnectionKind::Local(c) => c.extra.is_empty(),
+    }
+}
+
+fn known_fields_v3(payload: &PayloadV3) -> AppResult<()> {
+    let known = payload.folders.iter().all(|f| f.extra.is_empty())
+        && payload.hosts.iter().all(|h| {
+            h.extra.is_empty()
+                && h.connections.iter().all(|c| c.extra.is_empty() && kind_is_known(&c.kind))
+        })
+        && payload.logins.iter().all(|l| l.extra.is_empty())
+        && payload.keys.iter().all(|k| k.extra.is_empty())
+        && payload.tags.iter().all(|t| t.extra.is_empty());
+    if known {
+        Ok(())
+    } else {
+        Err(newer())
+    }
+}
+
 pub fn load(path: &str) -> AppResult<Zeroizing<Vec<u8>>> {
     let io = |e: std::io::Error| AppError::Io(format!("{path}: {e}"));
     if std::fs::metadata(path).map_err(io)?.len() > MAX_FILE_BYTES {
         return Err(AppError::Import("the export file is too large".into()));
     }
     Ok(Zeroizing::new(std::fs::read(path).map_err(io)?))
+}
+
+// The payload of an envelope, or None when it is encrypted and no password was given.
+fn open_envelope<P: Serialize + DeserializeOwned + Default>(
+    value: serde_json::Value,
+    password: Option<&str>,
+) -> AppResult<Option<P>> {
+    if let Some(serde_json::Value::Object(payload)) = value.get("payload") {
+        known_keys::<P>(payload.keys())?;
+    }
+    let envelope: Envelope = serde_json::from_value(value)?;
+    if !envelope.encrypted {
+        let payload = envelope.payload.ok_or_else(corrupt)?;
+        return Ok(Some(serde_json::from_value(payload)?));
+    }
+    let Some(password) = password else { return Ok(None) };
+    let salt: [u8; 16] = decode(envelope.salt)?.try_into().map_err(|_| corrupt())?;
+    let nonce: [u8; 24] = decode(envelope.nonce)?.try_into().map_err(|_| corrupt())?;
+    let ciphertext = decode(envelope.ciphertext)?;
+    let params = envelope.kdf.ok_or_else(corrupt)?;
+    // The file is untrusted and these are spent before the password can be checked.
+    if !(1..=8).contains(&params.t_cost)
+        || !(1..=16).contains(&params.p_cost)
+        || !(8 * params.p_cost..=262_144).contains(&params.m_cost)
+    {
+        return Err(corrupt());
+    }
+    let key = crypto::derive_key(password.as_bytes(), &salt, Some(params.tuple()))?;
+    let plain = crypto::open(&key, &nonce, &ciphertext).map_err(|_| AppError::WrongPassphrase)?;
+    // Only the keys are read here, so that no secret is copied out of `plain`.
+    let keys: BTreeMap<String, IgnoredAny> = serde_json::from_slice(&plain)?;
+    known_keys::<P>(keys.keys())?;
+    Ok(Some(serde_json::from_slice(&plain)?))
 }
 
 pub fn read(bytes: &[u8], password: Option<&str>) -> AppResult<Opened> {
@@ -174,38 +298,20 @@ pub fn read(bytes: &[u8], password: Option<&str>) -> AppResult<Opened> {
             known_fields(&payload)?;
             checked(payload)
         }
-        Some(2) => {
-            if let Some(serde_json::Value::Object(payload)) = value.get("payload") {
-                known_keys(payload.keys())?;
-            }
-            let envelope: Envelope = serde_json::from_value(value)?;
-            if !envelope.encrypted {
-                let payload = envelope.payload.ok_or_else(corrupt)?;
+        Some(2) => match open_envelope::<LegacyPayload>(value, password)? {
+            None => Ok(Opened::NeedsPassword),
+            Some(payload) => {
                 known_fields(&payload)?;
-                return checked(payload);
+                checked(payload)
             }
-            let Some(password) = password else { return Ok(Opened::NeedsPassword) };
-            let salt: [u8; 16] = decode(envelope.salt)?.try_into().map_err(|_| corrupt())?;
-            let nonce: [u8; 24] = decode(envelope.nonce)?.try_into().map_err(|_| corrupt())?;
-            let ciphertext = decode(envelope.ciphertext)?;
-            let params = envelope.kdf.ok_or_else(corrupt)?;
-            // The file is untrusted and these are spent before the password can be checked.
-            if !(1..=8).contains(&params.t_cost)
-                || !(1..=16).contains(&params.p_cost)
-                || !(8 * params.p_cost..=262_144).contains(&params.m_cost)
-            {
-                return Err(corrupt());
+        },
+        Some(3) => match open_envelope::<PayloadV3>(value, password)? {
+            None => Ok(Opened::NeedsPassword),
+            Some(payload) => {
+                known_fields_v3(&payload)?;
+                checked_v3(payload)
             }
-            let key = crypto::derive_key(password.as_bytes(), &salt, Some(params.tuple()))?;
-            let plain =
-                crypto::open(&key, &nonce, &ciphertext).map_err(|_| AppError::WrongPassphrase)?;
-            // Only the keys are read here, so that no secret is copied out of `plain`.
-            let keys: BTreeMap<String, IgnoredAny> = serde_json::from_slice(&plain)?;
-            known_keys(keys.keys())?;
-            let payload = serde_json::from_slice(&plain)?;
-            known_fields(&payload)?;
-            checked(payload)
-        }
+        },
         Some(1) | None => Err(AppError::Import("this isn't a wisp export file".into())),
         Some(v) => Err(AppError::Import(format!("unsupported export version {v}"))),
     }
@@ -270,8 +376,82 @@ mod tests {
         }
     }
 
-    fn payload() -> Payload {
-        let mut p = Payload { profiles: vec![profile("p1")], ..Default::default() };
+    fn v3() -> PayloadV3 {
+        use crate::store::hosts::fixtures::{host, own, ssh, vnc};
+        let mut p = PayloadV3 {
+            hosts: vec![host(
+                "h1",
+                "nas",
+                "nas.local",
+                vec![ssh("c1", 22, own("admin", Some("sec-1"))), vnc("c2", None)],
+            )],
+            ..Default::default()
+        };
+        p.secrets.insert("sec-1".into(), Zeroizing::new("hunter2".into()));
+        p
+    }
+
+    fn opened_v3(bytes: &[u8], password: Option<&str>) -> PayloadV3 {
+        match read(bytes, password).unwrap() {
+            Opened::V3(p) => p,
+            _ => panic!("not a version 3 payload"),
+        }
+    }
+
+    #[test]
+    fn v3_round_trips_plain_and_encrypted() {
+        let plain = PayloadV3 { secrets: Default::default(), ..v3() };
+        let bytes = write(&plain, None).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["version"], 3);
+        assert!(opened_v3(&bytes, None) == plain);
+
+        let bytes = write(&v3(), Some("pw")).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("hunter2"));
+        assert!(matches!(read(&bytes, None).unwrap(), Opened::NeedsPassword));
+        assert!(opened_v3(&bytes, Some("pw")) == v3());
+        assert!(matches!(read(&bytes, Some("nope")), Err(AppError::WrongPassphrase)));
+    }
+
+    #[test]
+    fn v3_with_secrets_must_be_encrypted() {
+        assert!(matches!(write(&v3(), None), Err(AppError::Import(_))));
+    }
+
+    #[test]
+    fn v3_rejects_an_unknown_connection_field() {
+        let plain = PayloadV3 { secrets: Default::default(), ..v3() };
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&write(&plain, None).unwrap()).unwrap();
+        value["payload"]["hosts"][0]["connections"][0]["kind"]["x"] = 1.into();
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert!(matches!(read(&bytes, None), Err(AppError::Import(m)) if m.contains("newer")));
+
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&write(&plain, None).unwrap()).unwrap();
+        value["payload"]["themes"] = serde_json::json!([]);
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert!(matches!(read(&bytes, None), Err(AppError::Import(m)) if m.contains("newer")));
+    }
+
+    #[test]
+    fn v3_repeated_connection_ids_are_import_errors() {
+        let mut p = PayloadV3 { secrets: Default::default(), ..v3() };
+        let copy = p.hosts[0].connections[0].clone();
+        p.hosts.push(crate::store::hosts::fixtures::host("h2", "b", "b", vec![copy]));
+        let bytes = write(&p, None).unwrap();
+        assert!(matches!(read(&bytes, None), Err(AppError::Import(m)) if m.contains("corrupt")));
+    }
+
+    #[test]
+    fn legacy_v2_still_reads() {
+        let p = LegacyPayload { profiles: vec![profile("p1")], ..Default::default() };
+        let bytes = write_v2(&p, None).unwrap();
+        assert!(matches!(read(&bytes, None).unwrap(), Opened::Legacy(read) if read.profiles.len() == 1));
+    }
+
+    fn payload() -> LegacyPayload {
+        let mut p = LegacyPayload { profiles: vec![profile("p1")], ..Default::default() };
         p.secrets.insert("sec-1".into(), Zeroizing::new("hunter2".into()));
         p.key_files.insert(
             "/Users/me/.ssh/id_ed25519".into(),
@@ -302,17 +482,17 @@ mod tests {
 
     #[test]
     fn plain_write_with_secrets_or_key_files_is_refused() {
-        let mut with_secret = Payload { profiles: vec![profile("p1")], ..Default::default() };
+        let mut with_secret = LegacyPayload { profiles: vec![profile("p1")], ..Default::default() };
         with_secret.secrets.insert("sec-1".into(), Zeroizing::new("hunter2".into()));
-        let with_key = Payload { key_files: payload().key_files, ..Default::default() };
+        let with_key = LegacyPayload { key_files: payload().key_files, ..Default::default() };
         for payload in [&with_secret, &with_key] {
-            assert!(matches!(write(payload, None), Err(AppError::Import(_))));
+            assert!(matches!(write_v2(payload, None), Err(AppError::Import(_))));
         }
     }
 
     #[test]
     fn encrypted_write_uses_the_strong_kdf_parameters() {
-        let bytes = write(&payload(), Some("pw")).unwrap();
+        let bytes = write_v2(&payload(), Some("pw")).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let kdf: KdfParams = serde_json::from_value(value["kdf"].clone()).unwrap();
         assert_eq!(kdf, KdfParams::STRONG);
@@ -323,7 +503,7 @@ mod tests {
         let bytes = sealed_with(KdfParams { m_cost: 8, t_cost: 1, p_cost: 1 });
         assert!(matches!(
             read(&bytes, Some("pw")).unwrap(),
-            Opened::Payload(back) if back == payload()
+            Opened::Legacy(back) if back == payload()
         ));
     }
 
@@ -347,27 +527,27 @@ mod tests {
 
     #[test]
     fn plain_round_trips() {
-        let p = Payload { profiles: vec![profile("p1")], ..Default::default() };
-        let bytes = write(&p, None).unwrap();
-        assert!(matches!(read(&bytes, None).unwrap(), Opened::Payload(back) if back == p));
+        let p = LegacyPayload { profiles: vec![profile("p1")], ..Default::default() };
+        let bytes = write_v2(&p, None).unwrap();
+        assert!(matches!(read(&bytes, None).unwrap(), Opened::Legacy(back) if back == p));
     }
 
     #[test]
     fn encrypted_round_trips_and_hides_secrets() {
-        let bytes = write(&payload(), Some("pw")).unwrap();
+        let bytes = write_v2(&payload(), Some("pw")).unwrap();
         let text = String::from_utf8_lossy(&bytes);
         assert!(!text.contains("hunter2"));
         assert!(!text.contains("id_ed25519"));
         assert!(matches!(read(&bytes, None).unwrap(), Opened::NeedsPassword));
         assert!(matches!(
             read(&bytes, Some("pw")).unwrap(),
-            Opened::Payload(back) if back == payload()
+            Opened::Legacy(back) if back == payload()
         ));
     }
 
     #[test]
     fn wrong_password_is_wrong_passphrase() {
-        let bytes = write(&payload(), Some("pw")).unwrap();
+        let bytes = write_v2(&payload(), Some("pw")).unwrap();
         assert!(matches!(read(&bytes, Some("nope")), Err(AppError::WrongPassphrase)));
     }
 
@@ -391,7 +571,7 @@ mod tests {
         let v1 = serde_json::json!({
             "version": 1, "groups": [], "profiles": [profile("p1")], "s3Profiles": [s3]
         });
-        let Opened::Payload(p) = read(v1.to_string().as_bytes(), None).unwrap() else { panic!() };
+        let Opened::Legacy(p) = read(v1.to_string().as_bytes(), None).unwrap() else { panic!() };
         assert_eq!(p.profiles.len(), 1);
         assert_eq!(p.s3_profiles.len(), 1);
         assert!(p.secrets.is_empty());
@@ -410,39 +590,39 @@ mod tests {
 
     #[test]
     fn vnc_profiles_round_trip_in_a_version_two_file() {
-        let plain = Payload { vnc_profiles: vec![vnc("v1")], ..Default::default() };
+        let plain = LegacyPayload { vnc_profiles: vec![vnc("v1")], ..Default::default() };
         let mut sealed = plain.clone();
         sealed.secrets.insert("vnc-1".into(), Zeroizing::new("hunter2".into()));
         for (payload, password) in [(&plain, None), (&sealed, Some("pw"))] {
-            let bytes = write(payload, password).unwrap();
+            let bytes = write_v2(payload, password).unwrap();
             let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(value["version"], 2);
             assert!(matches!(
                 read(&bytes, password).unwrap(),
-                Opened::Payload(back) if &back == payload
+                Opened::Legacy(back) if &back == payload
             ));
         }
         let value: serde_json::Value =
-            serde_json::from_slice(&write(&plain, None).unwrap()).unwrap();
+            serde_json::from_slice(&write_v2(&plain, None).unwrap()).unwrap();
         assert_eq!(value["payload"]["vncProfiles"][0]["id"], "v1");
     }
 
     #[test]
     fn rdp_profiles_round_trip_in_a_version_two_file() {
-        let plain = Payload { rdp_profiles: vec![rdp("r1")], ..Default::default() };
+        let plain = LegacyPayload { rdp_profiles: vec![rdp("r1")], ..Default::default() };
         let mut sealed = plain.clone();
         sealed.secrets.insert("rdp-1".into(), Zeroizing::new("hunter2".into()));
         for (payload, password) in [(&plain, None), (&sealed, Some("pw"))] {
-            let bytes = write(payload, password).unwrap();
+            let bytes = write_v2(payload, password).unwrap();
             let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(value["version"], 2);
             assert!(matches!(
                 read(&bytes, password).unwrap(),
-                Opened::Payload(back) if &back == payload
+                Opened::Legacy(back) if &back == payload
             ));
         }
         let value: serde_json::Value =
-            serde_json::from_slice(&write(&plain, None).unwrap()).unwrap();
+            serde_json::from_slice(&write_v2(&plain, None).unwrap()).unwrap();
         assert_eq!(value["payload"]["rdpProfiles"][0]["id"], "r1");
     }
 
@@ -457,7 +637,7 @@ mod tests {
             "vncProfiles": [], "rdpProfiles": [old], "secrets": {}, "keyFiles": {}
         });
         for (file, password) in version_two_files(&payload) {
-            let Opened::Payload(p) = read(file.to_string().as_bytes(), password).unwrap() else {
+            let Opened::Legacy(p) = read(file.to_string().as_bytes(), password).unwrap() else {
                 panic!()
             };
             let r = &p.rdp_profiles[0];
@@ -487,19 +667,19 @@ mod tests {
             }),
             ..rdp("r1")
         };
-        let plain = Payload { rdp_profiles: vec![office], ..Default::default() };
+        let plain = LegacyPayload { rdp_profiles: vec![office], ..Default::default() };
         let mut sealed = plain.clone();
         sealed.secrets.insert("rdp-1".into(), Zeroizing::new("hunter2".into()));
         sealed.secrets.insert("rdp-gw".into(), Zeroizing::new("gateway".into()));
         for (payload, password) in [(&plain, None), (&sealed, Some("pw"))] {
-            let bytes = write(payload, password).unwrap();
+            let bytes = write_v2(payload, password).unwrap();
             assert!(matches!(
                 read(&bytes, password).unwrap(),
-                Opened::Payload(back) if &back == payload
+                Opened::Legacy(back) if &back == payload
             ));
         }
         let value: serde_json::Value =
-            serde_json::from_slice(&write(&plain, None).unwrap()).unwrap();
+            serde_json::from_slice(&write_v2(&plain, None).unwrap()).unwrap();
         let written = &value["payload"]["rdpProfiles"][0];
         assert_eq!(written["audio"], false);
         assert_eq!(written["sharedFolder"]["name"], "faye");
@@ -522,7 +702,7 @@ mod tests {
         });
         let plain = serde_json::json!({ "version": 2, "encrypted": false, "payload": old });
         for (file, password) in [(plain, None), (sealed, Some("pw"))] {
-            let Opened::Payload(p) = read(file.to_string().as_bytes(), password).unwrap() else {
+            let Opened::Legacy(p) = read(file.to_string().as_bytes(), password).unwrap() else {
                 panic!()
             };
             assert_eq!(p.vnc_profiles.len(), 1);
@@ -546,7 +726,7 @@ mod tests {
         });
         let plain = serde_json::json!({ "version": 2, "encrypted": false, "payload": old });
         for (file, password) in [(plain, None), (sealed, Some("pw"))] {
-            let Opened::Payload(p) = read(file.to_string().as_bytes(), password).unwrap() else {
+            let Opened::Legacy(p) = read(file.to_string().as_bytes(), password).unwrap() else {
                 panic!()
             };
             assert_eq!(p.profiles.len(), 1);
@@ -618,7 +798,7 @@ mod tests {
             "secrets": {}, "keyFiles": {}
         });
         for (file, password) in version_two_files(&known) {
-            let Opened::Payload(p) = read(file.to_string().as_bytes(), password).unwrap() else {
+            let Opened::Legacy(p) = read(file.to_string().as_bytes(), password).unwrap() else {
                 panic!()
             };
             assert_eq!(p.rdp_profiles, [rdp("r1")]);
@@ -677,7 +857,7 @@ mod tests {
 
     #[test]
     fn out_of_range_kdf_params_are_import_errors() {
-        let bytes = write(&payload(), Some("pw")).unwrap();
+        let bytes = write_v2(&payload(), Some("pw")).unwrap();
         for (field, cost) in
             [("mCost", u32::MAX), ("mCost", 262_145), ("tCost", 0), ("tCost", 9), ("pCost", 17)]
         {
@@ -698,13 +878,13 @@ mod tests {
             order: 0,
             extra: Default::default(),
         };
-        let groups = Payload { groups: vec![group.clone(), group], ..Default::default() };
+        let groups = LegacyPayload { groups: vec![group.clone(), group], ..Default::default() };
         let profiles =
-            Payload { profiles: vec![profile("p1"), profile("p1")], ..Default::default() };
+            LegacyPayload { profiles: vec![profile("p1"), profile("p1")], ..Default::default() };
         let vnc_profiles =
-            Payload { vnc_profiles: vec![vnc("v1"), vnc("v1")], ..Default::default() };
+            LegacyPayload { vnc_profiles: vec![vnc("v1"), vnc("v1")], ..Default::default() };
         let rdp_profiles =
-            Payload { rdp_profiles: vec![rdp("r1"), rdp("r1")], ..Default::default() };
+            LegacyPayload { rdp_profiles: vec![rdp("r1"), rdp("r1")], ..Default::default() };
         for (payload, password) in [
             (&groups, None),
             (&profiles, None),
@@ -712,7 +892,7 @@ mod tests {
             (&vnc_profiles, None),
             (&rdp_profiles, None),
         ] {
-            let bytes = write(payload, password).unwrap();
+            let bytes = write_v2(payload, password).unwrap();
             assert!(matches!(read(&bytes, password), Err(AppError::Import(_))));
         }
 
@@ -728,7 +908,7 @@ mod tests {
         for (kind, item) in [("sftpProfiles", sftp), ("s3Profiles", s3)] {
             let mut v1 = serde_json::json!({ "version": 1, "groups": [], "profiles": [] });
             v1[kind] = serde_json::json!([item]);
-            assert!(matches!(read(v1.to_string().as_bytes(), None), Ok(Opened::Payload(_))));
+            assert!(matches!(read(v1.to_string().as_bytes(), None), Ok(Opened::Legacy(_))));
             v1[kind] = serde_json::json!([item.clone(), item]);
             assert!(matches!(read(v1.to_string().as_bytes(), None), Err(AppError::Import(_))));
         }

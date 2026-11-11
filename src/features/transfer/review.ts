@@ -76,3 +76,22 @@ export function toPayload(review: ImportReview, decisions: Decisions): ItemDecis
     }
   })
 }
+
+// A new host and its connections go together: declining the host declines them, and taking one
+// of them takes the host.
+export function toggleItem(
+  review: ImportReview,
+  decisions: Decisions,
+  item: ReviewItem,
+  on: boolean,
+): Decisions {
+  let next = setItem(decisions, item, on)
+  if (item.kind === 'host' && item.status === 'new' && !on) {
+    for (const child of review.items.filter((i) => i.parent === item.key)) {
+      next = setItem(next, child, false)
+    }
+  }
+  const parent = review.items.find((i) => i.key === item.parent)
+  if (on && parent?.status === 'new') next = setItem(next, parent, true)
+  return next
+}

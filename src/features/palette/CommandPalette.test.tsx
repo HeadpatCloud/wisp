@@ -1,172 +1,171 @@
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, expect, test, vi } from 'vitest'
-import { useProfileStore } from '@/stores/profileStore'
-import { useRdpProfileStore } from '@/stores/rdpProfileStore'
-import { useS3ProfileStore } from '@/stores/s3ProfileStore'
+import type { Connection, Host } from '@/bindings'
+import { useHostStore } from '@/stores/hostStore'
 import { tabSecretIds, useSessionStore } from '@/stores/sessionStore'
-import { useVncProfileStore } from '@/stores/vncProfileStore'
 import { CommandPalette } from './CommandPalette'
 
-const profile = (id: string, name: string, host: string) =>
-  ({
-    id,
-    name,
-    host,
-    groupId: null,
+const conn = (id: string, kind: Connection['kind']): Connection => ({
+  id,
+  label: null,
+  address: null,
+  kind,
+})
+
+const own = {
+  kind: 'own',
+  username: 'admin',
+  authMethod: 'agent',
+  keyIds: [],
+  secretId: null,
+} as const
+
+function host(id: string, name: string, address: string, connections: Connection[]): Host {
+  return { id, name, address, folderId: null, color: null, order: 0, connections }
+}
+
+const nas = host('h1', 'nas.local', '192.168.1.20', [
+  conn('ssh-1', {
+    type: 'ssh',
     port: 22,
-    username: 'u',
-    authMethod: 'agent',
-    keyPath: null,
-    secretId: null,
-    icon: { kind: 'builtin', name: 'server' },
-    order: 0,
+    login: { ...own, keyIds: [] },
     jumpHostId: null,
     tunnels: [],
-  }) as never
+    appearance: null,
+  }),
+  conn('files-1', { type: 'sftp', own: null, startFolder: null }),
+])
+const desk = host('h2', 'desk', '10.0.0.5', [
+  conn('vnc-1', { type: 'vnc', port: 5901, username: null, secretId: null }),
+])
 
 beforeEach(() => {
-  useProfileStore.setState({
-    profiles: [profile('p1', 'web-01', '10.0.0.1'), profile('p2', 'db-02', '10.0.0.2')],
-    groups: [],
+  useHostStore.setState({
+    hosts: [nas, desk],
+    logins: [],
+    folders: [],
+    keys: [],
+    tags: [],
     loaded: true,
-  } as never)
-  useS3ProfileStore.setState({ profiles: [], loaded: true } as never)
-  useVncProfileStore.setState({ profiles: [], loaded: true })
-  useRdpProfileStore.setState({ profiles: [], loaded: true })
-  useSessionStore.setState({ tabs: [], sessions: {}, activeTabId: null })
+  })
+  useSessionStore.setState({ tabs: [], panes: {}, activeTabId: null })
 })
 
-test('lists profiles and actions, and filters by subsequence', async () => {
+test('lists every connection and the actions, and filters by subsequence', async () => {
   const user = userEvent.setup()
   render(<CommandPalette open onOpenChange={vi.fn()} />)
-  expect(screen.getByText('web-01')).toBeInTheDocument()
+  expect(screen.getByText('nas.local · SSH · admin')).toBeInTheDocument()
+  expect(screen.getByText('nas.local · Files')).toBeInTheDocument()
   expect(screen.getByText('New local shell')).toBeInTheDocument()
 
-  await user.type(screen.getByPlaceholderText('Search profiles and actions…'), 'wb01')
-  expect(screen.getByText('web-01')).toBeInTheDocument()
-  expect(screen.queryByText('db-02')).not.toBeInTheDocument()
+  await user.type(screen.getByPlaceholderText('Search hosts and actions…'), 'dsk')
+  expect(screen.getByText('desk · VNC')).toBeInTheDocument()
+  expect(screen.queryByText('nas.local · Files')).not.toBeInTheDocument()
 })
 
-test('Enter opens the highlighted profile as a session tab', async () => {
+test('a local shell is listed by its shell name', () => {
+  const pc = host('this-computer', 'This computer', '', [
+    conn('pc-1', { type: 'local', program: 'pwsh.exe', startFolder: null }),
+  ])
+  useHostStore.setState({ hosts: [pc], shells: [{ name: 'PowerShell', program: 'pwsh.exe' }] })
+  render(<CommandPalette open onOpenChange={vi.fn()} />)
+  expect(screen.getByText('This computer · PowerShell')).toBeInTheDocument()
+})
+
+test('Enter opens the highlighted connection by its id', async () => {
   const onOpenChange = vi.fn()
   const user = userEvent.setup()
   render(<CommandPalette open onOpenChange={onOpenChange} />)
-  await user.type(screen.getByPlaceholderText('Search profiles and actions…'), 'db-02')
+  await user.type(screen.getByPlaceholderText('Search hosts and actions…'), 'nas ssh')
   await user.keyboard('{Enter}')
 
   const st = useSessionStore.getState()
   expect(st.tabs).toHaveLength(1)
-  expect(st.tabs[0].kind).toBe('session')
-  expect(Object.values(st.sessions)[0].profileId).toBe('p2')
+  expect(st.tabs[0].kind).toBe('panes')
+  expect(Object.values(st.panes)[0]).toMatchObject({ kind: 'ssh', connectionId: 'ssh-1' })
   expect(onOpenChange).toHaveBeenCalledWith(false)
 })
 
 test('arrow keys move the highlight before running', async () => {
   const user = userEvent.setup()
   render(<CommandPalette open onOpenChange={vi.fn()} />)
-  const input = screen.getByPlaceholderText('Search profiles and actions…')
-  await user.type(input, 'sftp')
+  await user.type(screen.getByPlaceholderText('Search hosts and actions…'), 'nas.local')
   await user.keyboard('{ArrowDown}{Enter}')
+  expect(Object.values(useSessionStore.getState().panes)[0]).toMatchObject({
+    kind: 'sftp',
+    connectionId: 'files-1',
+  })
+})
 
+test('a desktop connection shows its address and opens without a secret of its own', async () => {
+  const user = userEvent.setup()
+  render(<CommandPalette open onOpenChange={vi.fn()} />)
+  const row = screen.getByText('desk · VNC').closest('button')
+  expect(row).toHaveTextContent('10.0.0.5')
+  expect(row).toHaveTextContent('Connect')
+  await user.click(screen.getByText('desk · VNC'))
+  const tabs = useSessionStore.getState().tabs
+  expect(tabs).toHaveLength(1)
+  expect(tabs[0].kind === 'vnc' && tabs[0].connectionId).toBe('vnc-1')
+  expect(tabSecretIds(tabs[0])).toEqual([])
+})
+
+test('actions passed in are listed and run', async () => {
+  const run = vi.fn()
+  const user = userEvent.setup()
+  render(
+    <CommandPalette
+      open
+      onOpenChange={vi.fn()}
+      actions={[{ id: 'ftp', label: 'Connect to FTP once', run }]}
+    />,
+  )
+  await user.click(screen.getByText('Connect to FTP once'))
+  expect(run).toHaveBeenCalled()
+})
+
+test('ctrl_enter_opens_in_a_split', async () => {
+  useSessionStore.getState().openSsh('ssh-1', 'nas.local')
+  const user = userEvent.setup()
+  render(<CommandPalette open onOpenChange={vi.fn()} />)
+  await user.type(screen.getByPlaceholderText('Search hosts and actions…'), 'nas files')
+  await user.keyboard('{Control>}{Enter}{/Control}')
   const st = useSessionStore.getState()
-  expect(st.tabs[0].kind).toBe('sftp')
+  expect(st.tabs).toHaveLength(1)
+  const tab = st.tabs[0]
+  if (tab.kind !== 'panes') throw new Error('not a panes tab')
+  expect(tab.paneIds.map((id) => st.panes[id].kind)).toEqual(['ssh', 'sftp'])
 })
 
-const desk = {
-  id: 'vnc-1',
-  name: 'desk',
-  host: '10.0.0.5',
-  port: 5901,
-  username: 'faye',
-  secretId: 'vault-1',
-  icon: { kind: 'builtin' as const, name: 'server' },
-  order: 0,
-}
-
-test('a saved VNC profile is listed under Connect with its address', () => {
-  useVncProfileStore.setState({ profiles: [desk] })
-  render(<CommandPalette open onOpenChange={vi.fn()} />)
-  const row = screen.getByText('VNC: desk').closest('button')
-  expect(row).toHaveTextContent('10.0.0.5:5901')
-  expect(row).toHaveTextContent('Connect')
-})
-
-test('running a VNC profile opens a new tab that holds the profile id and no secret', async () => {
-  useVncProfileStore.setState({ profiles: [desk] })
+test('tab_shows_the_items_actions', async () => {
+  useSessionStore.getState().openSsh('ssh-1', 'nas.local')
   const onOpenChange = vi.fn()
   const user = userEvent.setup()
   render(<CommandPalette open onOpenChange={onOpenChange} />)
-  await user.type(screen.getByPlaceholderText('Search profiles and actions…'), 'vnc: desk')
-  await user.keyboard('{Enter}')
-
-  const { tabs, activeTabId } = useSessionStore.getState()
-  expect(tabs).toEqual([
-    {
-      id: activeTabId,
-      kind: 'vnc',
-      title: 'desk',
-      host: '10.0.0.5',
-      port: 5901,
-      username: 'faye',
-      secretId: null,
-      profileId: 'vnc-1',
-    },
-  ])
-  expect(tabSecretIds(tabs[0])).toEqual([])
+  await user.type(screen.getByPlaceholderText('Search hosts and actions…'), 'nas ssh')
+  await user.keyboard('{Tab}')
+  expect(screen.getByText('Open')).toBeInTheDocument()
+  expect(screen.getByText('Open in split')).toBeInTheDocument()
+  expect(screen.getByText('Edit nas.local')).toBeInTheDocument()
+  await user.keyboard('{Escape}')
+  expect(onOpenChange).not.toHaveBeenCalledWith(false)
+  expect(screen.getByText('nas.local · SSH · admin')).toBeInTheDocument()
+  await user.keyboard('{Tab}{ArrowDown}{Enter}')
+  const st = useSessionStore.getState()
+  const tab = st.tabs[0]
+  if (tab.kind !== 'panes') throw new Error('not a panes tab')
+  expect(tab.paneIds).toHaveLength(2)
   expect(onOpenChange).toHaveBeenCalledWith(false)
-
-  await user.click(screen.getByText('VNC: desk'))
-  expect(useSessionStore.getState().tabs).toHaveLength(2)
 })
 
-const office = {
-  id: 'rdp-1',
-  name: 'office',
-  host: '10.0.0.9',
-  port: 3390,
-  username: 'CORP\\faye',
-  domain: 'CORP',
-  secretId: 'vault-1',
-  keyboardLayout: 0x407,
-  icon: { kind: 'builtin' as const, name: 'server' },
-  order: 0,
-}
-
-test('a saved RDP profile is listed under Connect with its address', () => {
-  useRdpProfileStore.setState({ profiles: [office] })
-  render(<CommandPalette open onOpenChange={vi.fn()} />)
-  const row = screen.getByText('RDP: office').closest('button')
-  expect(row).toHaveTextContent('10.0.0.9:3390')
-  expect(row).toHaveTextContent('Connect')
-})
-
-test('running an RDP profile opens a new tab that holds the profile id and no secret', async () => {
-  useRdpProfileStore.setState({ profiles: [office] })
-  const onOpenChange = vi.fn()
+test('Tab on a row without actions keeps the keys in the search box', async () => {
   const user = userEvent.setup()
-  render(<CommandPalette open onOpenChange={onOpenChange} />)
-  await user.type(screen.getByPlaceholderText('Search profiles and actions…'), 'rdp: office')
+  render(<CommandPalette open onOpenChange={vi.fn()} />)
+  const input = screen.getByPlaceholderText('Search hosts and actions…')
+  await user.type(input, 'new local')
+  await user.keyboard('{Tab}')
+  expect(input).toHaveFocus()
   await user.keyboard('{Enter}')
-
-  const { tabs, activeTabId } = useSessionStore.getState()
-  expect(tabs).toEqual([
-    {
-      id: activeTabId,
-      kind: 'rdp',
-      title: 'office',
-      host: '10.0.0.9',
-      port: 3390,
-      username: 'CORP\\faye',
-      domain: 'CORP',
-      secretId: null,
-      profileId: 'rdp-1',
-      keyboardLayout: 0x407,
-    },
-  ])
-  expect(tabSecretIds(tabs[0])).toEqual([])
-  expect(onOpenChange).toHaveBeenCalledWith(false)
-
-  await user.click(screen.getByText('RDP: office'))
-  expect(useSessionStore.getState().tabs).toHaveLength(2)
+  expect(Object.values(useSessionStore.getState().panes)[0]).toMatchObject({ kind: 'local' })
 })

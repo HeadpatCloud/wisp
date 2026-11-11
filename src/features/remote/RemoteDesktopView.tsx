@@ -8,6 +8,7 @@ import {
 } from 'react'
 import type { AppError } from '@/bindings'
 import { HostKeyDialog, type HostKeyPrompt } from '@/features/sessions/HostKeyDialog'
+import { requestCloseTab } from '@/features/sessions/tabHosts'
 import type { LockKeys, RemoteDriver, Viewport } from '@/lib/remoteDriver'
 import type { FrameMessage } from '@/lib/remoteFrames'
 import { detectPlatform, pointerButtons, RemoteKeyboard, WheelSteps } from '@/lib/remoteInput'
@@ -117,7 +118,11 @@ export function RemoteDesktopView({
   const attemptRef = useRef(0)
   const activeRef = useRef(active)
   const sendSizeRef = useRef(() => {})
-  const removeTab = useSessionStore((s) => s.removeTab)
+  const title = useSessionStore((s) => {
+    const t = s.tabs.find((tab) => tab.id === tabId)
+    return t?.kind === 'vnc' || t?.kind === 'rdp' ? t.title : ''
+  })
+  const setTabStatus = useSessionStore((s) => s.setTabStatus)
 
   const connect = useCallback(() => {
     stopRef.current()
@@ -429,6 +434,20 @@ export function RemoteDesktopView({
   }, [])
 
   useEffect(() => {
+    const s = state.status
+    setTabStatus(
+      tabId,
+      s === 'connected'
+        ? 'connected'
+        : s === 'closed'
+          ? 'closed'
+          : s === 'failed'
+            ? 'error'
+            : 'connecting',
+    )
+  }, [tabId, state.status, setTabStatus])
+
+  useEffect(() => {
     if (!fullscreen || (state.status === 'connected' && active)) return
     // The browser refused; there is nothing to show.
     document.exitFullscreen().catch(() => {})
@@ -604,6 +623,9 @@ export function RemoteDesktopView({
         <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-sm">
           {message !== null ? (
             <>
+              {state.status === 'failed' && (
+                <p className="font-medium">Couldn't connect to {title}</p>
+              )}
               <p
                 className={cn(
                   'max-h-40 max-w-xs overflow-y-auto break-words text-center',
@@ -623,7 +645,7 @@ export function RemoteDesktopView({
                 </button>
                 <button
                   type="button"
-                  onClick={() => removeTab(tabId)}
+                  onClick={() => void requestCloseTab(tabId)}
                   className="rounded border border-border px-3 py-1.5 hover:bg-muted"
                 >
                   Close tab

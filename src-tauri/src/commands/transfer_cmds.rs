@@ -6,9 +6,9 @@ use tauri::{AppHandle, Manager, State};
 use zeroize::Zeroizing;
 
 use crate::error::{AppError, AppResult};
-use crate::store::model::ProfileKey;
 use crate::store::Store;
-use crate::transfer::bundle::{self, Opened, Payload};
+use crate::commands::store_cmds::after_change;
+use crate::transfer::bundle::{self, Opened, PayloadV3};
 use crate::transfer::{
     apply, export, plan, ApplySummary, ExportOptions, ExportSelection, ExportSummary, ImportReview,
     ItemDecision, ItemProblem, LocalEnv, ReadOutcome, ReviewItem,
@@ -18,7 +18,7 @@ use crate::vault::Vault;
 // Decoded bundles (possibly with secrets) wait here between review and apply, so nothing
 // sensitive ever crosses into the webview. Each is kept with the items the user was shown.
 #[derive(Default)]
-pub struct PendingImports(pub Mutex<HashMap<String, (Payload, Vec<ReviewItem>)>>);
+pub struct PendingImports(pub Mutex<HashMap<String, (PayloadV3, Vec<ReviewItem>)>>);
 
 fn poisoned() -> AppError {
     AppError::Internal("lock poisoned".into())
@@ -57,7 +57,7 @@ pub fn transfer_export(
         let s = store.lock().map_err(|_| poisoned())?;
         let v = vault.lock().map_err(|_| poisoned())?;
         export::build(
-            &s.snapshot(),
+            &s.hosts(),
             &LocalEnv { vault: &v, config_dir: &dir },
             &selection,
             &options,
@@ -68,13 +68,10 @@ pub fn transfer_export(
     Ok(summary(&payload, warnings))
 }
 
-fn summary(payload: &Payload, warnings: Vec<String>) -> ExportSummary {
+fn summary(payload: &PayloadV3, warnings: Vec<String>) -> ExportSummary {
     ExportSummary {
-        profiles: (payload.profiles.len()
-            + payload.sftp_profiles.len()
-            + payload.s3_profiles.len()
-            + payload.vnc_profiles.len()
-            + payload.rdp_profiles.len()) as u32,
+        hosts: payload.hosts.len() as u32,
+        connections: payload.hosts.iter().map(|h| h.connections.len()).sum::<usize>() as u32,
         secrets: payload.secrets.len() as u32,
         key_files: payload.key_files.len() as u32,
         warnings,
@@ -95,13 +92,14 @@ pub fn transfer_read(
     let bytes = bundle::load(&path)?;
     let payload = match bundle::read(&bytes, password.as_deref().map(String::as_str))? {
         Opened::NeedsPassword => return Ok(ReadOutcome::NeedsPassword),
-        Opened::Payload(p) => p,
+        Opened::Legacy(p) => plan::from_legacy(p),
+        Opened::V3(p) => p,
     };
     let dir = config_dir(&app)?;
     let planned = {
         let s = store.lock().map_err(|_| poisoned())?;
         let v = vault.lock().map_err(|_| poisoned())?;
-        plan::plan(&s.snapshot(), &payload, &LocalEnv { vault: &v, config_dir: &dir })
+        plan::plan(&s.hosts(), &payload, &LocalEnv { vault: &v, config_dir: &dir })
     };
     let review_id = uuid::Uuid::new_v4().to_string();
     let reviewed = planned.items.clone();
@@ -128,9 +126,8 @@ pub fn transfer_validate(
         .ok_or_else(|| AppError::NotFound(format!("import {review_id}")))?;
     let s = store.lock().map_err(|_| poisoned())?;
     let v = vault.lock().map_err(|_| poisoned())?;
-    let snapshot = s.snapshot();
     let env = LocalEnv { vault: &v, config_dir: &dir };
-    let staged = apply::stage_reviewed(&snapshot, payload, reviewed, &decisions, &env)?;
+    let staged = apply::stage_reviewed(&s.hosts(), payload, reviewed, &decisions, &env)?;
     Ok(staged.err().unwrap_or_default())
 }
 
@@ -149,23 +146,20 @@ pub fn transfer_apply(
     let (payload, reviewed) = pending
         .get(&review_id)
         .ok_or_else(|| AppError::NotFound(format!("import {review_id}")))?;
-    let mut s = store.lock().map_err(|_| poisoned())?;
-    let mut v = vault.lock().map_err(|_| poisoned())?;
-    let snapshot = s.snapshot();
-    let staged = {
-        let env = LocalEnv { vault: &v, config_dir: &dir };
-        apply::stage_reviewed(&snapshot, payload, reviewed, &decisions, &env)?
-            .map_err(|p| AppError::Import(format!("{} item(s) still need attention", p.len())))?
+    let (before, after, summary) = {
+        let mut s = store.lock().map_err(|_| poisoned())?;
+        let mut v = vault.lock().map_err(|_| poisoned())?;
+        let before = s.hosts();
+        let staged = {
+            let env = LocalEnv { vault: &v, config_dir: &dir };
+            apply::stage_reviewed(&before, payload, reviewed, &decisions, &env)?.map_err(|p| {
+                AppError::Import(format!("{} item(s) still need attention", p.len()))
+            })?
+        };
+        let summary = apply::execute(&mut s, &mut v, &dir.join("keys"), staged)?;
+        (before, s.hosts(), summary)
     };
-    let keys_dir = dir.join("keys");
-    let summary = apply::execute(&mut s, &mut v, &keys_dir, staged)?;
-    let previous: Vec<ProfileKey> = snapshot
-        .profiles
-        .into_iter()
-        .flat_map(|p| p.keys)
-        .chain(snapshot.sftp_profiles.into_iter().flat_map(|p| p.keys))
-        .collect();
-    apply::remove_unreferenced_keys(&keys_dir, &previous, &s.snapshot());
+    after_change(&app, &before, &after);
     pending.remove(&review_id);
     Ok(summary)
 }
@@ -180,42 +174,18 @@ pub fn transfer_discard(pending: State<'_, PendingImports>, review_id: String) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::model::{IconRef, RdpProfile, VncProfile};
+    use crate::store::hosts::fixtures::{host, own, ssh, vnc};
 
     #[test]
-    fn the_export_summary_counts_vnc_and_rdp_profiles() {
-        let vnc = |id: &str| VncProfile {
-            id: id.into(),
-            name: id.into(),
-            host: "h".into(),
-            port: 5900,
-            username: None,
-            secret_id: None,
-            icon: IconRef::default(),
-            order: 0,
-            extra: Default::default(),
-        };
-        let rdp = |id: &str| RdpProfile {
-            id: id.into(),
-            name: id.into(),
-            host: "h".into(),
-            port: 3389,
-            username: "faye".into(),
-            domain: None,
-            secret_id: None,
-            keyboard_layout: None,
-            audio: true,
-            shared_folder: None,
-            gateway: None,
-            icon: IconRef::default(),
-            order: 0,
-            extra: Default::default(),
-        };
-        let payload = Payload {
-            vnc_profiles: vec![vnc("v1"), vnc("v2")],
-            rdp_profiles: vec![rdp("r1"), rdp("r2"), rdp("r3")],
+    fn the_export_summary_counts_hosts_and_connections() {
+        let payload = PayloadV3 {
+            hosts: vec![
+                host("a", "a", "a", vec![ssh("a1", 22, own("u", None)), vnc("a2", None)]),
+                host("b", "b", "b", vec![vnc("b1", None)]),
+            ],
             ..Default::default()
         };
-        assert_eq!(summary(&payload, vec![]).profiles, 5);
+        let summary = summary(&payload, vec![]);
+        assert_eq!((summary.hosts, summary.connections), (2, 3));
     }
 }

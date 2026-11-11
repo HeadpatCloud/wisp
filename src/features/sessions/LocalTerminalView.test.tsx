@@ -18,43 +18,48 @@ import { useSessionStore } from '@/stores/sessionStore'
 import { useSettingsStore } from '@/stores/settingsStore'
 import { LocalTerminalView } from './LocalTerminalView'
 
-const zoomOf = (id: string) => {
-  const t = useSessionStore.getState().tabs.find((tab) => tab.id === id)
-  return t?.kind === 'local' ? t.zoom : undefined
-}
+const zoomOf = (id: string) => useSessionStore.getState().panes[id]?.zoom
+const local = (id: string, zoom?: number) => ({
+  id,
+  kind: 'local' as const,
+  title: 'Local shell',
+  status: 'connecting' as const,
+  reconnectNonce: 0,
+  connectionId: null,
+  program: null,
+  startFolder: null,
+  zoom,
+})
 
 beforeEach(() => {
   useSettingsStore.setState({ settings: { ...useSettingsStore.getState().settings, fontSize: 14 } })
   useSessionStore.setState({
-    tabs: [
-      { id: 'l1', kind: 'local', title: 'Local shell', program: null },
-      { id: 'l2', kind: 'local', title: 'Local shell', program: null, zoom: 5 },
-    ],
-    sessions: {},
-    activeTabId: 'l1',
+    tabs: [],
+    panes: { l1: local('l1'), l2: local('l2', 5) },
+    activeTabId: null,
   })
 })
 
-test('the font size follows the zoom of its own tab', () => {
-  render(<LocalTerminalView tabId="l1" />)
+test('the font size follows the zoom of its own pane', () => {
+  render(<LocalTerminalView tabId="t1" paneId="l1" />)
   expect(screen.getByTestId('terminal')).toHaveTextContent('14')
-  act(() => useSessionStore.getState().setLocalZoom('l1', 3))
+  act(() => useSessionStore.getState().setZoom('l1', 3))
   expect(screen.getByTestId('terminal')).toHaveTextContent('17')
-  act(() => useSessionStore.getState().setLocalZoom('l1', -6))
+  act(() => useSessionStore.getState().setZoom('l1', -6))
   expect(screen.getByTestId('terminal')).toHaveTextContent('8')
-  act(() => useSessionStore.getState().setLocalZoom('l1', 0))
+  act(() => useSessionStore.getState().setZoom('l1', 0))
   expect(screen.getByTestId('terminal')).toHaveTextContent('14')
 })
 
 test('the font size never drops below 6', () => {
   useSettingsStore.setState({ settings: { ...useSettingsStore.getState().settings, fontSize: 8 } })
-  render(<LocalTerminalView tabId="l1" />)
-  act(() => useSessionStore.getState().setLocalZoom('l1', -6))
+  render(<LocalTerminalView tabId="t1" paneId="l1" />)
+  act(() => useSessionStore.getState().setZoom('l1', -6))
   expect(screen.getByTestId('terminal')).toHaveTextContent('6')
 })
 
-test('Ctrl+wheel zooms this tab only and a plain wheel does not', () => {
-  render(<LocalTerminalView tabId="l1" />)
+test('Ctrl+wheel zooms this pane only and a plain wheel does not', () => {
+  render(<LocalTerminalView tabId="t1" paneId="l1" />)
   const terminal = screen.getByTestId('terminal')
   expect(fireEvent.wheel(terminal, { deltaY: -100, ctrlKey: true })).toBe(false)
   fireEvent.wheel(terminal, { deltaY: -100, ctrlKey: true })

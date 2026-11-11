@@ -11,7 +11,6 @@ use zeroize::Zeroizing;
 use crate::commands::ssh_cmds::KnownHostsState;
 use crate::error::{AppError, AppResult};
 use crate::remote::{FrameBytes, FrameOp};
-use crate::store::model::VncProfile;
 use crate::store::Store;
 use crate::vnc::decode::ENCODINGS;
 use crate::vnc::handshake::Login;
@@ -44,16 +43,14 @@ type Target = (String, u16, Option<String>, Option<String>);
 // gives the profile another vault id, and a copy in an open or restored tab would be a dead one.
 // The store is read only for a profile, so a quick connect does not wait on its lock.
 fn resolve_target(
-    saved: impl FnOnce() -> AppResult<Vec<VncProfile>>,
+    saved: impl FnOnce(&str) -> AppResult<Target>,
     profile_id: Option<&str>,
     given: Target,
 ) -> AppResult<Target> {
-    let Some(id) = profile_id else { return Ok(given) };
-    let p = saved()?
-        .into_iter()
-        .find(|p| p.id == id)
-        .ok_or_else(|| AppError::NotFound("vnc: this profile no longer exists".into()))?;
-    Ok((p.host, p.port, p.username, p.secret_id))
+    match profile_id {
+        Some(id) => saved(id),
+        None => Ok(given),
+    }
 }
 
 #[tauri::command]
@@ -70,9 +67,9 @@ pub async fn vnc_open(
     profile_id: Option<String>,
     on_frame: Channel<FrameBytes>,
 ) -> AppResult<VncOpened> {
-    let saved = || -> AppResult<Vec<VncProfile>> {
+    let saved = |id: &str| -> AppResult<Target> {
         let store = store.lock().map_err(|_| AppError::Internal("store lock poisoned".into()))?;
-        Ok(store.vnc_profiles())
+        store.hosts().vnc_target(id)
     };
     let (host, port, username, secret_id) =
         resolve_target(saved, profile_id.as_deref(), (host, port, username, secret_id))?;
@@ -162,6 +159,7 @@ mod tests {
 
     use super::*;
     use crate::ssh::known_hosts::KnownHosts;
+    use crate::store::hosts::{fixtures, ConnectionKind, HostsFile};
     use crate::vnc::testserver::{After, Script, Seen, Server};
 
     const WAIT: Duration = Duration::from_secs(5);
@@ -200,45 +198,42 @@ mod tests {
         ]
     }
 
-    fn desk() -> VncProfile {
-        VncProfile {
-            id: "v1".into(),
-            name: "desk".into(),
-            host: "10.0.0.5".into(),
-            port: 5901,
-            username: Some("faye".into()),
-            secret_id: Some("vault-new".into()),
-            icon: Default::default(),
-            order: 0,
-            extra: Default::default(),
+    fn desk(username: Option<&str>, secret: Option<&str>) -> HostsFile {
+        let mut c = fixtures::vnc("v1", secret);
+        if let ConnectionKind::Vnc(v) = &mut c.kind {
+            v.port = 5901;
+            v.username = username.map(Into::into);
         }
+        fixtures::file(vec![fixtures::host("h", "desk", "10.0.0.5", vec![c])])
     }
 
     fn given() -> Target {
         ("shown".into(), 5900, Some("old".into()), Some("vault-old".into()))
     }
 
-    fn unreadable() -> AppResult<Vec<VncProfile>> {
+    fn unreadable(_: &str) -> AppResult<Target> {
         Err(AppError::Internal("store lock poisoned".into()))
     }
 
     #[test]
     fn a_profile_id_connects_with_what_the_profile_holds_now() {
-        let target = resolve_target(|| Ok(vec![desk()]), Some("v1"), given()).unwrap();
-        let held = ("10.0.0.5".into(), 5901, Some("faye".into()), Some("vault-new".into()));
-        assert_eq!(target, held);
+        let held = desk(Some("faye"), Some("vault-new"));
+        let target = resolve_target(|id| held.vnc_target(id), Some("v1"), given()).unwrap();
+        let expected = ("10.0.0.5".into(), 5901, Some("faye".into()), Some("vault-new".into()));
+        assert_eq!(target, expected);
 
-        let bare = VncProfile { username: None, secret_id: None, ..desk() };
-        let target = resolve_target(|| Ok(vec![bare]), Some("v1"), given()).unwrap();
+        let bare = desk(None, None);
+        let target = resolve_target(|id| bare.vnc_target(id), Some("v1"), given()).unwrap();
         assert_eq!(target, ("10.0.0.5".into(), 5901, None, None));
     }
 
     #[test]
     fn a_profile_id_that_is_gone_is_not_found() {
-        let missing = resolve_target(|| Ok(vec![desk()]), Some("gone"), given());
+        let held = desk(None, None);
+        let missing = resolve_target(|id| held.vnc_target(id), Some("gone"), given());
         assert!(matches!(
             missing,
-            Err(AppError::NotFound(m)) if m == "vnc: this profile no longer exists"
+            Err(AppError::NotFound(m)) if m == "This connection no longer exists."
         ));
     }
 
@@ -250,7 +245,8 @@ mod tests {
 
     #[test]
     fn without_a_profile_id_the_arguments_are_used() {
-        assert_eq!(resolve_target(|| Ok(vec![desk()]), None, given()).unwrap(), given());
+        let held = desk(None, None);
+        assert_eq!(resolve_target(|id| held.vnc_target(id), None, given()).unwrap(), given());
     }
 
     #[test]

@@ -22,7 +22,7 @@ export function skipVersion(version: string): void {
   localStorage.setItem(SKIP_KEY, version)
 }
 
-export async function installUpdate(
+export async function downloadUpdate(
   update: Update,
   onProgress?: (percent: number | null) => void,
 ): Promise<void> {
@@ -36,6 +36,9 @@ export async function installUpdate(
       onProgress?.(total ? Math.round((downloaded / total) * 100) : null)
     }
   })
+}
+
+export async function installUpdate(update: Update): Promise<void> {
   // On Windows the install ends the app at once, without the exit's close of the RDP sessions,
   // and a dropped one leaves the user's Windows session blocked.
   unwrap(await commands.rdpCloseAll())

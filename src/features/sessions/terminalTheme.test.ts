@@ -1,15 +1,9 @@
 import { afterEach, expect, test, vi } from 'vitest'
 import type { AppearanceSettings } from './terminalTheme'
-import {
-  applyTerminalSettings,
-  DARK_THEME,
-  LIGHT_THEME,
-  resolveTerminalTheme,
-} from './terminalTheme'
+import { applyTerminalSettings, LIGHT_THEME } from './terminalTheme'
 
 const base: AppearanceSettings = {
-  theme: 'light',
-  colorScheme: 'default',
+  colors: LIGHT_THEME,
   fontFamily: 'monospace',
   fontSize: 14,
   fontWeight: 'normal',
@@ -21,19 +15,6 @@ const base: AppearanceSettings = {
 }
 
 afterEach(() => vi.unstubAllGlobals())
-
-test('resolveTerminalTheme maps dark/light/system and named schemes', () => {
-  vi.stubGlobal('matchMedia', () => ({
-    matches: true,
-    addEventListener() {},
-    removeEventListener() {},
-  }))
-  expect(resolveTerminalTheme('dark', 'default')).toBe(DARK_THEME)
-  expect(resolveTerminalTheme('light', 'default')).toBe(LIGHT_THEME)
-  expect(resolveTerminalTheme('system', 'default')).toBe(DARK_THEME) // system prefers dark here
-  // a fixed named scheme ignores the app theme
-  expect(resolveTerminalTheme('light', 'dracula')).not.toBe(LIGHT_THEME)
-})
 
 test('applyTerminalSettings sets a new theme object and refits only on font change', () => {
   vi.stubGlobal('matchMedia', () => ({

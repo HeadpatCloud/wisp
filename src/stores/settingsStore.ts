@@ -1,9 +1,11 @@
 import { create } from 'zustand'
-import { commands, type ProfileAppearance, type Settings } from '@/bindings'
+import { type ConnAppearance, commands, type Settings } from '@/bindings'
 import type { AppearanceSettings } from '@/features/sessions/terminalTheme'
 import { unwrap } from '@/lib/ipc'
-import { type AppTheme, applyAccent, applyAppTheme, applyBackground, cacheTheme } from '@/lib/theme'
+import { terminalColorsFor } from '@/lib/schemes'
+import { type AppTheme, cacheTheme } from '@/lib/theme'
 import { setTransferLimit } from '@/lib/transferQueue'
+import { activeTheme, allThemes, applyAppearance, useThemeStore } from '@/stores/themeStore'
 
 const DEFAULTS: Settings = {
   theme: 'system',
@@ -30,13 +32,23 @@ function asAppTheme(theme: string): AppTheme {
   return theme === 'light' || theme === 'dark' ? theme : 'system'
 }
 
+// `connection` and `tag` are terminal-colours ids that win over the Terminal setting.
+function colorsFor(settings: Settings, connection?: string | null, tag?: string | null) {
+  const catalog = {
+    schemes: useThemeStore.getState().schemes,
+    themes: allThemes(),
+    active: activeTheme(settings),
+  }
+  return terminalColorsFor({ connection, tag, setting: settings.colorScheme }, catalog)
+}
+
 export function appearanceOf(settings: Settings): AppearanceSettings {
   return {
-    theme: asAppTheme(settings.theme),
-    colorScheme: settings.colorScheme,
+    colors: colorsFor(settings),
     fontFamily: settings.fontFamily,
     fontSize: settings.fontSize,
-    fontWeight: settings.fontWeight ?? 'normal',
+    // xterm takes numeric weights; it has no "medium".
+    fontWeight: settings.fontWeight === 'medium' ? '500' : (settings.fontWeight ?? 'normal'),
     lineHeight: settings.lineHeight ?? 1.0,
     letterSpacing: settings.letterSpacing ?? 0,
     cursorStyle: (settings.cursorStyle ?? 'block') as 'block' | 'bar' | 'underline',
@@ -45,16 +57,19 @@ export function appearanceOf(settings: Settings): AppearanceSettings {
   }
 }
 
-// Global appearance with an optional per-profile override layered on top.
+// Global appearance with an optional per-connection override layered on top.
 export function appearanceFor(
   settings: Settings,
-  override?: ProfileAppearance | null,
+  override?: ConnAppearance | null,
+  tagColors?: string | null,
 ): AppearanceSettings {
-  const base = appearanceOf(settings)
+  const base = {
+    ...appearanceOf(settings),
+    colors: colorsFor(settings, override?.colors, tagColors),
+  }
   if (!override) return base
   return {
     ...base,
-    theme: override.theme ? asAppTheme(override.theme) : base.theme,
     fontFamily: override.fontFamily ?? base.fontFamily,
     fontSize: override.fontSize ?? base.fontSize,
   }
@@ -72,9 +87,7 @@ export const useSettingsStore = create<SettingsState>()((set, get) => ({
   loaded: false,
   load: async () => {
     const settings = unwrap(await commands.getSettings())
-    applyAppTheme(asAppTheme(settings.theme))
-    applyAccent(settings.accent ?? 'teal')
-    applyBackground(settings.background ?? 'teal')
+    applyAppearance(settings)
     cacheTheme(asAppTheme(settings.theme))
     setTransferLimit(settings.maxConcurrentTransfers ?? 3)
     set({ settings, loaded: true })
@@ -83,9 +96,7 @@ export const useSettingsStore = create<SettingsState>()((set, get) => ({
     const next = { ...get().settings, ...patch }
     // Apply immediately so the UI (terminals, preview, chrome) reflects the change,
     // then persist - a save error must not swallow the visible update.
-    applyAppTheme(asAppTheme(next.theme))
-    applyAccent(next.accent ?? 'teal')
-    applyBackground(next.background ?? 'teal')
+    applyAppearance(next)
     cacheTheme(asAppTheme(next.theme))
     setTransferLimit(next.maxConcurrentTransfers ?? 3)
     set({ settings: next })

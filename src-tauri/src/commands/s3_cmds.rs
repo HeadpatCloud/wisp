@@ -48,13 +48,7 @@ pub async fn s3_connect(
     // Resolve the profile and its vault secret, then build the client - no await while the
     // store/vault locks are held.
     let config = {
-        let profile = store
-            .lock()
-            .map_err(|_| poisoned("store"))?
-            .s3_profiles()
-            .into_iter()
-            .find(|p| p.id == profile_id)
-            .ok_or_else(|| AppError::NotFound(format!("s3 profile {profile_id}")))?;
+        let profile = store.lock().map_err(|_| poisoned("store"))?.hosts().s3_target(&profile_id)?;
         let secret = match &profile.secret_id {
             Some(id) => {
                 let bytes = vault.lock().map_err(|_| poisoned("vault"))?.get_secret(id)?;

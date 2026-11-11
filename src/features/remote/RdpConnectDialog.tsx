@@ -9,13 +9,16 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import type { AdhocInitial } from '@/features/sessions/AdhocLoginFields'
 
 export function RdpConnectDialog({
   open,
   onOpenChange,
   onConnect,
+  initial,
 }: {
   open: boolean
+  initial?: AdhocInitial
   onOpenChange: (open: boolean) => void
   onConnect: (
     host: string,
@@ -38,11 +41,11 @@ export function RdpConnectDialog({
       setPassword('')
       return
     }
-    setHost('')
-    setPort('3389')
-    setUsername('')
+    setHost(initial?.host ?? '')
+    setPort(String(initial?.port ?? 3389))
+    setUsername(initial?.username ?? '')
     setDomain('')
-  }, [open])
+  }, [open, initial])
 
   const portNumber = Number(port)
   const portValid = Number.isInteger(portNumber) && portNumber >= 1 && portNumber <= 65535

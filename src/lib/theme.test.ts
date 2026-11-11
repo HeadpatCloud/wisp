@@ -67,20 +67,13 @@ test('cacheTheme round-trips, defaults to system', () => {
   expect(cachedTheme()).toBe('dark')
 })
 
-test('watchSystemTheme re-applies only while theme is system', () => {
+test('watchSystemTheme calls back on a system change until stopped', () => {
   const listeners = mockMatchMedia(true)
-  let current: 'light' | 'dark' | 'system' = 'light'
-  const stop = watchSystemTheme(() => current)
-  // explicit light: a system change must NOT force dark
+  const onChange = vi.fn()
+  const stop = watchSystemTheme(onChange)
   listeners.forEach((cb) => {
     cb()
   })
-  expect(document.documentElement.classList.contains('dark')).toBe(false)
-  // switch to system: now a system change applies
-  current = 'system'
-  listeners.forEach((cb) => {
-    cb()
-  })
-  expect(document.documentElement.classList.contains('dark')).toBe(true)
+  expect(onChange).toHaveBeenCalledTimes(1)
   stop()
 })

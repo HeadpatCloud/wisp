@@ -1,21 +1,124 @@
+pub mod hosts;
 pub mod io;
+pub mod migrate;
 pub mod model;
+pub mod themes;
 
+use std::collections::{BTreeSet, HashSet};
 use std::mem;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
 
+use crate::commands::local_cmds::ShellInfo;
 use crate::error::{AppError, AppResult};
-use model::{
-    AuthMethod, Group, Profile, ProfileKey, ProfileStore, RdpProfile, S3Profile, SftpProfile,
-    Settings, VncProfile,
+use hosts::{
+    Connection, ConnectionKind, ConnectionMove, DeletedConnection, DeletedHost, DeletedItem, Folder,
+    FolderMove, Host, HostMove, HostsFile, Login, MoveTarget, PendingDelete, SavedLogin, SshKey,
+    Tag, THIS_COMPUTER,
 };
+use migrate::MigrationReport;
+use model::{AuthMethod, IconRef, Profile, ProfileKey, ProfileStore, Settings};
 
 pub struct Store {
     dir: PathBuf,
-    data: ProfileStore,
+    hosts: HostsFile,
+    migration: Option<MigrationReport>,
     settings: Settings,
+    themes: themes::ThemesFile,
+}
+
+// Fields a later version put on a stored item are kept when the dialogs send it back without
+// them. An item new to the store starts with none: a duplicate is sent as a copy of what the
+// store gave, and could share a vault reference.
+fn keep_kind_extras(new: &mut ConnectionKind, old: Option<&mut ConnectionKind>) {
+    use ConnectionKind::*;
+    let Some(old) = old else {
+        match new {
+            Ssh(n) => {
+                n.extra.clear();
+                clear_login_extras(&mut n.login);
+                n.appearance.iter_mut().for_each(|a| a.extra.clear());
+            }
+            Sftp(n) => {
+                n.extra.clear();
+                n.own.iter_mut().for_each(|o| {
+                    o.extra.clear();
+                    clear_login_extras(&mut o.login);
+                });
+            }
+            Ftp(n) => {
+                n.extra.clear();
+                clear_login_extras(&mut n.login);
+            }
+            S3(n) => n.extra.clear(),
+            Rdp(n) => {
+                n.extra.clear();
+                clear_login_extras(&mut n.login);
+                n.gateway.iter_mut().for_each(|g| {
+                    g.extra.clear();
+                    g.login.iter_mut().for_each(clear_login_extras);
+                });
+                n.shared_folder.iter_mut().for_each(|f| f.extra.clear());
+            }
+            Vnc(n) => n.extra.clear(),
+            Local(n) => n.extra.clear(),
+        }
+        return;
+    };
+    match (new, old) {
+        (Ssh(n), Ssh(o)) => {
+            n.extra = mem::take(&mut o.extra);
+            keep_login_extras(&mut n.login, &mut o.login);
+            if let (Some(a), Some(kept)) = (n.appearance.as_mut(), o.appearance.as_mut()) {
+                a.extra = mem::take(&mut kept.extra);
+            }
+        }
+        (Sftp(n), Sftp(o)) => {
+            n.extra = mem::take(&mut o.extra);
+            if let (Some(own), Some(kept)) = (n.own.as_mut(), o.own.as_mut()) {
+                own.extra = mem::take(&mut kept.extra);
+                keep_login_extras(&mut own.login, &mut kept.login);
+            }
+        }
+        (Ftp(n), Ftp(o)) => {
+            n.extra = mem::take(&mut o.extra);
+            keep_login_extras(&mut n.login, &mut o.login);
+        }
+        (S3(n), S3(o)) => n.extra = mem::take(&mut o.extra),
+        (Rdp(n), Rdp(o)) => {
+            n.extra = mem::take(&mut o.extra);
+            keep_login_extras(&mut n.login, &mut o.login);
+            if let (Some(g), Some(kept)) = (n.gateway.as_mut(), o.gateway.as_mut()) {
+                g.extra = mem::take(&mut kept.extra);
+                if let (Some(l), Some(kept)) = (g.login.as_mut(), kept.login.as_mut()) {
+                    keep_login_extras(l, kept);
+                }
+            }
+            if let (Some(f), Some(kept)) = (n.shared_folder.as_mut(), o.shared_folder.as_mut()) {
+                f.extra = mem::take(&mut kept.extra);
+            }
+        }
+        (Vnc(n), Vnc(o)) => n.extra = mem::take(&mut o.extra),
+        (Local(n), Local(o)) => n.extra = mem::take(&mut o.extra),
+        _ => {}
+    }
+}
+
+fn keep_login_extras(new: &mut Login, old: &mut Login) {
+    match (new, old) {
+        (Login::Own(n), Login::Own(o)) => n.extra = mem::take(&mut o.extra),
+        (Login::Saved(n), Login::Saved(o)) => n.extra = mem::take(&mut o.extra),
+        _ => {}
+    }
+}
+
+fn clear_login_extras(login: &mut Login) {
+    match login {
+        Login::Own(o) => o.extra.clear(),
+        Login::Saved(s) => s.extra.clear(),
+    }
 }
 
 // Folds a pre-multi-key profile's single key_path into the keys list. Runs on every read and
@@ -31,6 +134,15 @@ pub(crate) fn normalize_keys(p: &mut Profile) {
     p.keys.push(ProfileKey { path, secret_id });
 }
 
+fn pending(item: DeletedItem) -> PendingDelete {
+    let deleted_at = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+    PendingDelete { id: Uuid::new_v4().to_string(), deleted_at, item, extra: Default::default() }
+}
+
+pub(crate) fn next_order(file: &HostsFile, folder_id: Option<&str>) -> u32 {
+    file.hosts.iter().filter(|h| h.folder_id.as_deref() == folder_id).map(|h| h.order + 1).max().unwrap_or(0)
+}
+
 pub(crate) const ICON_EXTENSIONS: [&str; 6] = ["png", "jpg", "jpeg", "gif", "webp", "svg"];
 
 // A custom icon is always `icons/<uuid>.<ext>`, exactly as `import_icon` writes it. The path
@@ -43,218 +155,407 @@ pub(crate) fn is_icon_path(rel: &str) -> bool {
     })
 }
 
+// The icons and key files 0.5.0's profiles.json names. Going back to 0.5.0 needs them, so no
+// change in 0.6.0 deletes them. None when the file is there but can't be read: it might name
+// anything, so nothing is deleted.
+pub(crate) fn named_by_profiles(dir: &Path) -> Option<(BTreeSet<String>, Vec<String>)> {
+    let old: ProfileStore = match io::read_json_strict(&dir.join("profiles.json")) {
+        Ok(Some(old)) => old,
+        Ok(None) => return Some(Default::default()),
+        Err(_) => return None,
+    };
+    let mut icons = BTreeSet::new();
+    let mut icon = |i: &IconRef| {
+        if let IconRef::Custom { path } = i {
+            icons.insert(path.clone());
+        }
+    };
+    old.groups.iter().for_each(|g| icon(&g.icon));
+    old.profiles.iter().for_each(|p| icon(&p.icon));
+    old.sftp_profiles.iter().for_each(|p| icon(&p.icon));
+    old.s3_profiles.iter().for_each(|p| icon(&p.icon));
+    old.vnc_profiles.iter().for_each(|p| icon(&p.icon));
+    old.rdp_profiles.iter().for_each(|p| icon(&p.icon));
+    let keys = old
+        .profiles
+        .iter()
+        .flat_map(|p| p.key_path.iter().chain(p.keys.iter().map(|k| &k.path)))
+        .chain(old.sftp_profiles.iter().flat_map(|p| p.keys.iter().map(|k| &k.path)))
+        .cloned()
+        .collect();
+    Some((icons, keys))
+}
+
 impl Store {
-    pub fn load(dir: PathBuf) -> AppResult<Self> {
-        let mut data: ProfileStore = io::read_json(&dir.join("profiles.json"))?;
-        if data.version < ProfileStore::CURRENT_VERSION {
-            data.version = ProfileStore::CURRENT_VERSION;
+    // profiles.json is only ever read here: 0.5.0 keeps working from it after an update.
+    pub fn load(dir: PathBuf, shells: &[ShellInfo]) -> AppResult<Self> {
+        let legacy: Option<ProfileStore> =
+            io::read_json_strict(&dir.join("profiles.json")).ok().flatten();
+
+        let hosts_path = dir.join("hosts.json");
+        // A corrupt file is renamed aside by read_json, and then counts as missing.
+        let existing = if hosts_path.exists() {
+            let file: HostsFile = io::read_json(&hosts_path)?;
+            hosts_path.exists().then_some(file)
+        } else {
+            None
+        };
+        let mut migration = None;
+        let mut write = existing.is_none();
+        let mut hosts = match (existing, &legacy) {
+            (Some(file), _) => file,
+            (None, Some(old)) => {
+                let (file, report) = migrate::migrate(old, shells);
+                migration = (report.profiles > 0).then_some(report);
+                file
+            }
+            (None, None) => HostsFile { version: HostsFile::CURRENT_VERSION, ..Default::default() },
+        };
+        if !hosts.hosts.iter().any(|h| h.id == THIS_COMPUTER) {
+            hosts.hosts.insert(0, migrate::this_computer(shells));
+            write = true;
         }
-        for p in data.profiles.iter_mut() {
-            normalize_keys(p);
+        if write {
+            io::write_json_atomic(&hosts_path, &hosts)?;
         }
-        let settings: Settings = io::read_json(&dir.join("settings.json"))?;
-        Ok(Self { dir, data, settings })
+
+        let mut settings: Settings = io::read_json(&dir.join("settings.json"))?;
+        let mut theme_file: themes::ThemesFile = io::read_json(&dir.join("themes.json"))?;
+        if settings.light_theme.is_empty() {
+            themes::migrate(&mut settings, &mut theme_file);
+            io::write_json_atomic(&dir.join("themes.json"), &theme_file)?;
+            io::write_json_atomic(&dir.join("settings.json"), &settings)?;
+        }
+        Ok(Self { dir, hosts, migration, settings, themes: theme_file })
     }
 
-    fn persist_profiles(&self) -> AppResult<()> {
-        io::write_json_atomic(&self.dir.join("profiles.json"), &self.data)
+    pub fn hosts(&self) -> HostsFile {
+        self.hosts.clone()
+    }
+
+    pub fn take_migration_report(&mut self) -> Option<MigrationReport> {
+        self.migration.take()
+    }
+
+    // Written first and swapped in only on success, so a failed write leaves memory as it was.
+    pub fn replace_hosts(&mut self, file: HostsFile) -> AppResult<()> {
+        file.validate()?;
+        io::write_json_atomic(&self.dir.join("hosts.json"), &file)?;
+        self.hosts = file;
+        Ok(())
+    }
+
+    // Connections the host no longer has, and that no move carries, become pending deletes; their
+    // ids come back for the Undo notices.
+    pub fn upsert_host(&mut self, mut host: Host, moves: Vec<ConnectionMove>) -> AppResult<Vec<String>> {
+        let mut file = self.hosts.clone();
+        let mut arriving: Vec<(MoveTarget, Connection)> = Vec::new();
+        for m in moves {
+            let mut c = m.connection;
+            let stored = file.hosts.iter_mut().find_map(|h| {
+                let at = h.connections.iter().position(|o| o.id == c.id)?;
+                Some(h.connections.remove(at))
+            });
+            match stored {
+                Some(mut old) => {
+                    c.extra = mem::take(&mut old.extra);
+                    keep_kind_extras(&mut c.kind, Some(&mut old.kind));
+                }
+                None => {
+                    c.extra.clear();
+                    keep_kind_extras(&mut c.kind, None);
+                }
+            }
+            arriving.push((m.to, c));
+        }
+
+        let mut deleted = Vec::new();
+        match file.hosts.iter_mut().find(|h| h.id == host.id) {
+            Some(existing) => {
+                host.extra = mem::take(&mut existing.extra);
+                for c in host.connections.iter_mut() {
+                    let old = existing.connections.iter_mut().find(|o| o.id == c.id);
+                    match old {
+                        Some(old) => {
+                            c.extra = mem::take(&mut old.extra);
+                            keep_kind_extras(&mut c.kind, Some(&mut old.kind));
+                        }
+                        None => {
+                            c.extra.clear();
+                            keep_kind_extras(&mut c.kind, None);
+                        }
+                    }
+                }
+                let kept: HashSet<&str> = host.connections.iter().map(|c| c.id.as_str()).collect();
+                for (index, old) in existing.connections.iter().enumerate() {
+                    if !kept.contains(old.id.as_str()) {
+                        deleted.push(pending(DeletedItem::Connection(DeletedConnection {
+                            host_id: host.id.clone(),
+                            index: index as u32,
+                            connection: old.clone(),
+                        })));
+                    }
+                }
+                if host.id == THIS_COMPUTER {
+                    host.name = existing.name.clone();
+                    host.address = existing.address.clone();
+                    host.folder_id = None;
+                    host.tag_ids.clear();
+                }
+                *existing = host;
+            }
+            None => {
+                host.extra.clear();
+                for c in host.connections.iter_mut() {
+                    c.extra.clear();
+                    keep_kind_extras(&mut c.kind, None);
+                }
+                file.hosts.push(host);
+            }
+        }
+
+        for (to, c) in arriving {
+            match to {
+                MoveTarget::Host(t) => file
+                    .hosts
+                    .iter_mut()
+                    .find(|h| h.id == t.host_id)
+                    .ok_or_else(|| AppError::Invalid("The host to move it to no longer exists.".into()))?
+                    .connections
+                    .push(c),
+                MoveTarget::NewHost(t) => {
+                    let order = next_order(&file, t.folder_id.as_deref());
+                    file.hosts.push(Host {
+                        id: Uuid::new_v4().to_string(),
+                        name: t.name,
+                        address: t.address,
+                        folder_id: t.folder_id,
+                        tag_ids: vec![],
+                        icon: IconRef::default(),
+                        color: None,
+                        order,
+                        connections: vec![c],
+                        extra: Default::default(),
+                    });
+                }
+            }
+        }
+
+        let ids = deleted.iter().map(|p| p.id.clone()).collect();
+        file.pending_deletes.extend(deleted);
+        self.replace_hosts(file)?;
+        Ok(ids)
+    }
+
+    pub fn delete_host(&mut self, id: &str) -> AppResult<String> {
+        if id == THIS_COMPUTER {
+            return Err(AppError::Invalid("This computer can't be deleted.".into()));
+        }
+        let mut file = self.hosts.clone();
+        let at = file
+            .hosts
+            .iter()
+            .position(|h| h.id == id)
+            .ok_or_else(|| AppError::NotFound(format!("host {id}")))?;
+        let item = pending(DeletedItem::Host(DeletedHost { host: file.hosts.remove(at) }));
+        let pending_id = item.id.clone();
+        file.pending_deletes.push(item);
+        self.replace_hosts(file)?;
+        Ok(pending_id)
+    }
+
+    pub fn undo_delete(&mut self, id: &str) -> AppResult<()> {
+        let mut file = self.hosts.clone();
+        let at = file
+            .pending_deletes
+            .iter()
+            .position(|p| p.id == id)
+            .ok_or_else(|| AppError::Invalid("Nothing to undo.".into()))?;
+        match file.pending_deletes.remove(at).item {
+            DeletedItem::Host(DeletedHost { mut host }) => {
+                if host.folder_id.as_ref().is_some_and(|f| !file.folders.iter().any(|x| &x.id == f)) {
+                    host.folder_id = None;
+                }
+                host.tag_ids.retain(|t| file.tags.iter().any(|x| &x.id == t));
+                file.hosts.push(host);
+            }
+            DeletedItem::Connection(d) => {
+                let host = file
+                    .hosts
+                    .iter_mut()
+                    .find(|h| h.id == d.host_id)
+                    .ok_or_else(|| AppError::Invalid("Its host was deleted. Undo that first.".into()))?;
+                let index = (d.index as usize).min(host.connections.len());
+                host.connections.insert(index, d.connection);
+            }
+            DeletedItem::Other(_) => {
+                return Err(AppError::Invalid("A newer Wisp deleted this, so only it can undo it.".into()));
+            }
+        }
+        self.replace_hosts(file)
+    }
+
+    // None purges every pending delete, as at start.
+    pub fn purge_deletes(&mut self, ids: Option<&[String]>) -> AppResult<()> {
+        let mut file = self.hosts.clone();
+        let count = file.pending_deletes.len();
+        file.pending_deletes.retain(|p| ids.is_some_and(|ids| !ids.contains(&p.id)));
+        if file.pending_deletes.len() == count {
+            return Ok(());
+        }
+        self.replace_hosts(file)
+    }
+
+    pub fn upsert_key(&mut self, mut key: SshKey) -> AppResult<()> {
+        let mut file = self.hosts.clone();
+        match file.keys.iter_mut().find(|k| k.id == key.id) {
+            Some(existing) => {
+                key.extra = mem::take(&mut existing.extra);
+                *existing = key;
+            }
+            None => {
+                key.extra.clear();
+                file.keys.push(key);
+            }
+        }
+        self.replace_hosts(file)
+    }
+
+    pub fn upsert_login(&mut self, mut login: SavedLogin) -> AppResult<()> {
+        let mut file = self.hosts.clone();
+        match file.logins.iter_mut().find(|l| l.id == login.id) {
+            Some(existing) => {
+                login.extra = mem::take(&mut existing.extra);
+                *existing = login;
+            }
+            None => {
+                login.extra.clear();
+                file.logins.push(login);
+            }
+        }
+        self.replace_hosts(file)
+    }
+
+    pub fn delete_login(&mut self, id: &str) -> AppResult<()> {
+        let mut file = self.hosts.clone();
+        let Some(login) = file.logins.iter().find(|l| l.id == id) else { return Ok(()) };
+        let users = file.login_users(id);
+        if !users.is_empty() {
+            return Err(AppError::Invalid(format!("{} is used by {}.", login.name, users.join(", "))));
+        }
+        file.logins.retain(|l| l.id != id);
+        self.replace_hosts(file)
+    }
+
+    pub fn delete_key(&mut self, id: &str) -> AppResult<()> {
+        let mut file = self.hosts.clone();
+        let Some(key) = file.keys.iter().find(|k| k.id == id) else { return Ok(()) };
+        let users = file.key_users(id);
+        if !users.is_empty() {
+            let name = std::path::Path::new(&key.path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| key.path.clone());
+            return Err(AppError::Invalid(format!("{name} is used by {}.", users.join(", "))));
+        }
+        file.keys.retain(|k| k.id != id);
+        self.replace_hosts(file)
+    }
+
+    pub fn upsert_tag(&mut self, mut tag: Tag) -> AppResult<()> {
+        let mut file = self.hosts.clone();
+        match file.tags.iter_mut().find(|t| t.id == tag.id) {
+            Some(existing) => {
+                tag.extra = mem::take(&mut existing.extra);
+                *existing = tag;
+            }
+            None => {
+                tag.extra.clear();
+                file.tags.push(tag);
+            }
+        }
+        self.replace_hosts(file)
+    }
+
+    // The tag goes from every host too, pending deletes included, so an Undo can't bring back
+    // a host that names it.
+    pub fn delete_tag(&mut self, id: &str) -> AppResult<()> {
+        let mut file = self.hosts.clone();
+        file.tags.retain(|t| t.id != id);
+        let untag = |h: &mut Host| h.tag_ids.retain(|t| t != id);
+        file.hosts.iter_mut().for_each(untag);
+        for p in &mut file.pending_deletes {
+            if let DeletedItem::Host(d) = &mut p.item {
+                untag(&mut d.host);
+            }
+        }
+        self.replace_hosts(file)
+    }
+
+    pub fn upsert_folder(&mut self, mut folder: Folder) -> AppResult<()> {
+        let mut file = self.hosts.clone();
+        match file.folders.iter_mut().find(|f| f.id == folder.id) {
+            Some(existing) => {
+                folder.extra = mem::take(&mut existing.extra);
+                *existing = folder;
+            }
+            None => {
+                folder.extra.clear();
+                file.folders.push(folder);
+            }
+        }
+        self.replace_hosts(file)
+    }
+
+    pub fn move_hosts(&mut self, moves: &[HostMove]) -> AppResult<()> {
+        let mut file = self.hosts.clone();
+        for m in moves {
+            let host = file
+                .hosts
+                .iter_mut()
+                .find(|h| h.id == m.id)
+                .ok_or_else(|| AppError::NotFound(format!("host {}", m.id)))?;
+            host.folder_id = m.folder_id.clone();
+            host.order = m.order;
+        }
+        self.replace_hosts(file)
+    }
+
+    pub fn move_folders(&mut self, moves: &[FolderMove]) -> AppResult<()> {
+        let mut file = self.hosts.clone();
+        for m in moves {
+            let folder = file
+                .folders
+                .iter_mut()
+                .find(|f| f.id == m.id)
+                .ok_or_else(|| AppError::NotFound(format!("folder {}", m.id)))?;
+            folder.parent_id = m.parent_id.clone();
+            folder.order = m.order;
+        }
+        self.replace_hosts(file)
     }
 
     fn persist_settings(&self) -> AppResult<()> {
         io::write_json_atomic(&self.dir.join("settings.json"), &self.settings)
     }
 
-    pub fn snapshot(&self) -> ProfileStore {
-        self.data.clone()
-    }
-
-    // Writes first and swaps only on success, so a failed import leaves memory and disk as they
-    // were.
-    pub fn commit(&mut self, mut data: ProfileStore) -> AppResult<()> {
-        data.version = ProfileStore::CURRENT_VERSION;
-        for p in data.profiles.iter_mut() {
-            normalize_keys(p);
-        }
-        io::write_json_atomic(&self.dir.join("profiles.json"), &data)?;
-        self.data = data;
-        Ok(())
-    }
-
-    pub fn groups(&self) -> Vec<Group> {
-        self.data.groups.clone()
-    }
-
-    pub fn profiles(&self) -> Vec<Profile> {
-        self.data.profiles.clone()
-    }
-
     pub fn settings(&self) -> Settings {
         self.settings.clone()
     }
 
-    // The dialogs send only the fields they know, so what a later version added to an entry is
-    // kept as it was stored, here and in the other upserts. A new entry starts without any: a
-    // duplicate is sent as a copy of what the store gave, and could share a vault reference.
-    pub fn upsert_group(&mut self, group: Group) -> AppResult<()> {
-        match self.data.groups.iter_mut().find(|g| g.id == group.id) {
-            Some(existing) => *existing = Group { extra: mem::take(&mut existing.extra), ..group },
-            None => self.data.groups.push(Group { extra: Default::default(), ..group }),
-        }
-        self.persist_profiles()
-    }
-
-    pub fn delete_group(&mut self, id: &str) -> AppResult<()> {
-        let before = self.data.groups.len();
-        self.data.groups.retain(|g| g.id != id);
-        if self.data.groups.len() == before {
-            return Err(AppError::NotFound(format!("group {id}")));
-        }
-        for p in self.data.profiles.iter_mut() {
-            if p.group_id.as_deref() == Some(id) {
-                p.group_id = None;
-            }
-        }
-        self.persist_profiles()
-    }
-
-    pub fn upsert_profile(&mut self, mut profile: Profile) -> AppResult<()> {
-        normalize_keys(&mut profile);
-        match self.data.profiles.iter_mut().find(|p| p.id == profile.id) {
-            Some(existing) => {
-                *existing = Profile { extra: mem::take(&mut existing.extra), ..profile }
-            }
-            None => self.data.profiles.push(Profile { extra: Default::default(), ..profile }),
-        }
-        self.persist_profiles()
-    }
-
-    pub fn delete_profile(&mut self, id: &str) -> AppResult<()> {
-        let before = self.data.profiles.len();
-        self.data.profiles.retain(|p| p.id != id);
-        if self.data.profiles.len() == before {
-            return Err(AppError::NotFound(format!("profile {id}")));
-        }
-        self.persist_profiles()
-    }
-
-    pub fn set_settings(&mut self, settings: Settings) -> AppResult<()> {
+    pub fn set_settings(&mut self, mut settings: Settings) -> AppResult<()> {
+        settings.extra = mem::take(&mut self.settings.extra);
         self.settings = settings;
         self.persist_settings()
     }
 
-    pub fn sftp_profiles(&self) -> Vec<SftpProfile> {
-        self.data.sftp_profiles.clone()
+    pub fn themes(&self) -> themes::ThemesFile {
+        self.themes.clone()
     }
 
-    pub fn upsert_sftp_profile(&mut self, profile: SftpProfile) -> AppResult<()> {
-        match self.data.sftp_profiles.iter_mut().find(|p| p.id == profile.id) {
-            Some(existing) => {
-                *existing = SftpProfile { extra: mem::take(&mut existing.extra), ..profile }
-            }
-            None => {
-                self.data.sftp_profiles.push(SftpProfile { extra: Default::default(), ..profile })
-            }
-        }
-        self.persist_profiles()
-    }
-
-    pub fn delete_sftp_profile(&mut self, id: &str) -> AppResult<()> {
-        let before = self.data.sftp_profiles.len();
-        self.data.sftp_profiles.retain(|p| p.id != id);
-        if self.data.sftp_profiles.len() == before {
-            return Err(AppError::NotFound(format!("sftp profile {id}")));
-        }
-        self.persist_profiles()
-    }
-
-    pub fn s3_profiles(&self) -> Vec<S3Profile> {
-        self.data.s3_profiles.clone()
-    }
-
-    pub fn upsert_s3_profile(&mut self, profile: S3Profile) -> AppResult<()> {
-        match self.data.s3_profiles.iter_mut().find(|p| p.id == profile.id) {
-            Some(existing) => {
-                *existing = S3Profile { extra: mem::take(&mut existing.extra), ..profile }
-            }
-            None => self.data.s3_profiles.push(S3Profile { extra: Default::default(), ..profile }),
-        }
-        self.persist_profiles()
-    }
-
-    pub fn delete_s3_profile(&mut self, id: &str) -> AppResult<()> {
-        let before = self.data.s3_profiles.len();
-        self.data.s3_profiles.retain(|p| p.id != id);
-        if self.data.s3_profiles.len() == before {
-            return Err(AppError::NotFound(format!("s3 profile {id}")));
-        }
-        self.persist_profiles()
-    }
-
-    pub fn vnc_profiles(&self) -> Vec<VncProfile> {
-        self.data.vnc_profiles.clone()
-    }
-
-    // A copy is changed and written, and swapped in only on success. Changed in place, a write
-    // that fails would leave memory ahead of the file: the profile would then use a password the
-    // caller has already taken back, and the next save of anything would write that out.
-    pub fn upsert_vnc_profile(&mut self, profile: VncProfile) -> AppResult<()> {
-        let mut data = self.data.clone();
-        match data.vnc_profiles.iter_mut().find(|p| p.id == profile.id) {
-            Some(existing) => {
-                *existing = VncProfile { extra: mem::take(&mut existing.extra), ..profile }
-            }
-            None => data.vnc_profiles.push(VncProfile { extra: Default::default(), ..profile }),
-        }
-        io::write_json_atomic(&self.dir.join("profiles.json"), &data)?;
-        self.data = data;
-        Ok(())
-    }
-
-    pub fn delete_vnc_profile(&mut self, id: &str) -> AppResult<()> {
-        let mut data = self.data.clone();
-        data.vnc_profiles.retain(|p| p.id != id);
-        if data.vnc_profiles.len() == self.data.vnc_profiles.len() {
-            return Err(AppError::NotFound(format!("vnc profile {id}")));
-        }
-        io::write_json_atomic(&self.dir.join("profiles.json"), &data)?;
-        self.data = data;
-        Ok(())
-    }
-
-    pub fn rdp_profiles(&self) -> Vec<RdpProfile> {
-        self.data.rdp_profiles.clone()
-    }
-
-    // Written before it is swapped in, like the VNC ones: a failed write leaves memory as it was.
-    pub fn upsert_rdp_profile(&mut self, mut profile: RdpProfile) -> AppResult<()> {
-        let mut data = self.data.clone();
-        match data.rdp_profiles.iter_mut().find(|p| p.id == profile.id) {
-            Some(existing) => {
-                let folders = profile.shared_folder.as_mut().zip(existing.shared_folder.as_mut());
-                if let Some((folder, kept)) = folders {
-                    folder.extra = mem::take(&mut kept.extra);
-                }
-                let gateways = profile.gateway.as_mut().zip(existing.gateway.as_mut());
-                if let Some((gateway, kept)) = gateways {
-                    gateway.extra = mem::take(&mut kept.extra);
-                }
-                *existing = RdpProfile { extra: mem::take(&mut existing.extra), ..profile }
-            }
-            None => data.rdp_profiles.push(RdpProfile { extra: Default::default(), ..profile }),
-        }
-        io::write_json_atomic(&self.dir.join("profiles.json"), &data)?;
-        self.data = data;
-        Ok(())
-    }
-
-    pub fn delete_rdp_profile(&mut self, id: &str) -> AppResult<()> {
-        let mut data = self.data.clone();
-        data.rdp_profiles.retain(|p| p.id != id);
-        if data.rdp_profiles.len() == self.data.rdp_profiles.len() {
-            return Err(AppError::NotFound(format!("rdp profile {id}")));
-        }
-        io::write_json_atomic(&self.dir.join("profiles.json"), &data)?;
-        self.data = data;
+    pub fn set_themes(&mut self, file: themes::ThemesFile) -> AppResult<()> {
+        io::write_json_atomic(&self.dir.join("themes.json"), &file)?;
+        self.themes = file;
         Ok(())
     }
 }
@@ -263,38 +564,6 @@ impl Store {
 mod tests {
     use super::*;
     use model::{AuthMethod, IconRef};
-
-    fn profile(id: &str, group: Option<&str>) -> Profile {
-        Profile {
-            id: id.into(),
-            name: id.into(),
-            group_id: group.map(Into::into),
-            host: "h".into(),
-            port: 22,
-            username: "u".into(),
-            auth_method: AuthMethod::Password,
-            key_path: None,
-            keys: vec![],
-            secret_id: None,
-            icon: IconRef::default(),
-            order: 0,
-            jump_host_id: None,
-            tunnels: vec![],
-            appearance: None,
-            extra: Default::default(),
-        }
-    }
-
-    fn group(id: &str) -> Group {
-        Group {
-            id: id.into(),
-            name: id.into(),
-            parent_id: None,
-            icon: IconRef::default(),
-            order: 0,
-            extra: Default::default(),
-        }
-    }
 
     #[test]
     fn icon_path_is_only_what_import_icon_writes() {
@@ -323,505 +592,521 @@ mod tests {
         assert!(accepted.is_empty(), "{accepted:?}");
     }
 
-    #[test]
-    fn upsert_inserts_then_updates_and_persists() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        store.upsert_profile(profile("p1", None)).unwrap();
-        let mut p = profile("p1", None);
-        p.host = "changed".into();
-        store.upsert_profile(p).unwrap();
-        assert_eq!(store.profiles().len(), 1);
-        assert_eq!(store.profiles()[0].host, "changed");
+    fn profile(id: &str) -> Profile {
+        Profile {
+            id: id.into(),
+            name: id.into(),
+            group_id: None,
+            host: "h".into(),
+            port: 22,
+            username: "u".into(),
+            auth_method: AuthMethod::Password,
+            key_path: None,
+            keys: vec![],
+            secret_id: None,
+            icon: IconRef::default(),
+            order: 0,
+            jump_host_id: None,
+            tunnels: vec![],
+            appearance: None,
+            extra: Default::default(),
+        }
+    }
 
-        let reopened = Store::load(dir.path().to_path_buf()).unwrap();
-        assert_eq!(reopened.profiles()[0].host, "changed");
+    fn shells() -> Vec<ShellInfo> {
+        vec![ShellInfo { name: "Command Prompt".into(), program: "cmd.exe".into() }]
+    }
+
+    fn two_ssh_profiles(dir: &std::path::Path) -> Vec<u8> {
+        let mut a = profile("a");
+        a.host = "nas.local".into();
+        let mut b = profile("b");
+        b.host = "nas.local".into();
+        b.username = "root".into();
+        let old = ProfileStore {
+            version: 1,
+            profiles: vec![a, b],
+            ..Default::default()
+        };
+        let bytes = serde_json::to_vec_pretty(&old).unwrap();
+        std::fs::write(dir.join("profiles.json"), &bytes).unwrap();
+        bytes
+    }
+
+    const SETTINGS_050: &str = r#"{
+        "theme": "dark", "fontFamily": "Cascadia Mono", "fontSize": 13, "colorScheme": "default",
+        "accent": "blue", "background": "slate"
+    }"#;
+
+    #[test]
+    fn settings_migration_makes_tint_themes_once() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("settings.json"), SETTINGS_050).unwrap();
+        let store = Store::load(dir.path().to_path_buf(), &shells()).unwrap();
+        let s = store.settings();
+        assert_eq!((s.light_theme.as_str(), s.dark_theme.as_str()), ("paper-slate", "graphite-slate"));
+        assert_eq!(s.color_scheme, "default");
+        let themes = store.themes();
+        let names: Vec<_> = themes.themes.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
+        assert_eq!(names, ["Paper · Slate", "Graphite · Slate"]);
+        assert_eq!(themes.themes[0]["tint"], 255);
+        assert_eq!(themes.themes[1]["kind"], "dark");
+
+        drop(store);
+        let again = Store::load(dir.path().to_path_buf(), &shells()).unwrap();
+        assert_eq!(again.themes().themes.len(), 2);
     }
 
     #[test]
-    fn delete_group_detaches_profiles() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        store.upsert_group(group("g1")).unwrap();
-        store.upsert_profile(profile("p1", Some("g1"))).unwrap();
-        store.delete_group("g1").unwrap();
-        assert_eq!(store.profiles()[0].group_id, None);
-    }
-
-    // Profiles written before multi-key support carry key_path + a passphrase in secret_id.
-    #[test]
-    fn load_migrates_a_legacy_single_key() {
+    fn a_teal_0_5_0_setup_gets_the_built_in_themes() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
-            dir.path().join("profiles.json"),
-            r#"{"version":1,"groups":[],"profiles":[
-                {"id":"p1","name":"p1","groupId":null,"host":"h","port":22,"username":"u",
-                 "authMethod":"key","keyPath":"/keys/id_ed25519","secretId":"vault-1",
-                 "order":0,"jumpHostId":null},
-                {"id":"p2","name":"p2","groupId":null,"host":"h","port":22,"username":"u",
-                 "authMethod":"password","keyPath":null,"secretId":"vault-2",
-                 "order":1,"jumpHostId":null}
-            ]}"#,
+            dir.path().join("settings.json"),
+            SETTINGS_050.replace("\"slate\"", "\"teal\""),
         )
         .unwrap();
-        let store = Store::load(dir.path().to_path_buf()).unwrap();
-        let profiles = store.profiles();
-
-        let key_profile = profiles.iter().find(|p| p.id == "p1").unwrap();
-        assert_eq!(key_profile.key_path, None);
-        assert_eq!(key_profile.keys.len(), 1);
-        assert_eq!(key_profile.keys[0].path, "/keys/id_ed25519");
-        // The old profile secret was that key's passphrase, and it MOVED - leaving it on the
-        // profile too would give one vault entry two owners, and whichever is edited first
-        // would delete the other's secret.
-        assert_eq!(key_profile.keys[0].secret_id.as_deref(), Some("vault-1"));
-        assert_eq!(key_profile.secret_id, None);
-
-        // Password auth keeps its secret where it was, with no phantom key.
-        let pw_profile = profiles.iter().find(|p| p.id == "p2").unwrap();
-        assert!(pw_profile.keys.is_empty());
-        assert_eq!(pw_profile.secret_id.as_deref(), Some("vault-2"));
-    }
-
-    // Imports and the ssh-config importer write through upsert, never through load.
-    #[test]
-    fn upsert_normalizes_a_legacy_key_profile() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        let mut p = profile("p1", None);
-        p.auth_method = AuthMethod::Key;
-        p.key_path = Some("/keys/id_rsa".into());
-        p.secret_id = Some("vault-9".into());
-        store.upsert_profile(p).unwrap();
-
-        let saved = &store.profiles()[0];
-        assert_eq!(saved.key_path, None);
-        assert_eq!(saved.keys.len(), 1);
-        assert_eq!(saved.keys[0].path, "/keys/id_rsa");
-        assert_eq!(saved.keys[0].secret_id.as_deref(), Some("vault-9"));
-        assert_eq!(saved.secret_id, None);
+        let store = Store::load(dir.path().to_path_buf(), &shells()).unwrap();
+        assert_eq!(store.settings().light_theme, "paper");
+        assert_eq!(store.settings().dark_theme, "graphite");
+        assert!(store.themes().themes.is_empty());
     }
 
     #[test]
-    fn sftp_profiles_round_trip() {
+    fn unknown_settings_fields_survive_a_save() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        let with_future = SETTINGS_050.replace("\"accent\"", "\"fromTheFuture\": [1, 2], \"accent\"");
+        std::fs::write(dir.path().join("settings.json"), with_future).unwrap();
+        let mut store = Store::load(dir.path().to_path_buf(), &shells()).unwrap();
+        let mut s = store.settings();
+        s.extra.clear();
+        s.font_size = 15;
+        store.set_settings(s).unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("settings.json")).unwrap()).unwrap();
+        assert_eq!(raw["fromTheFuture"], serde_json::json!([1, 2]));
+        assert_eq!(raw["fontSize"], 15);
+    }
+
+    #[test]
+    fn a_settings_file_written_by_0_6_still_has_0_5_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf(), &shells()).unwrap();
+        store.set_settings(Settings { density: "compact".into(), ..store.settings() }).unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("settings.json")).unwrap()).unwrap();
+        for field in ["theme", "fontFamily", "fontSize", "colorScheme"] {
+            assert!(raw.get(field).is_some(), "{field} missing");
+        }
+        assert_eq!(raw["density"], "compact");
+    }
+
+    #[test]
+    fn deleting_a_tag_removes_it_from_hosts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf(), &shells()).unwrap();
+        let tag = |id: &str| hosts::Tag {
+            id: id.into(),
+            name: id.to_uppercase(),
+            color: "red".into(),
+            show_color: true,
+            ask_before_close: true,
+            ask_before_paste: false,
+            terminal_colors: None,
+            extra: Default::default(),
+        };
+        store.upsert_tag(tag("prod")).unwrap();
+        store.upsert_tag(tag("db")).unwrap();
+        let mut web = hosts::fixtures::host("h", "web", "web.lan", vec![]);
+        web.tag_ids = vec!["prod".into(), "db".into()];
+        store.upsert_host(web, vec![]).unwrap();
+
+        store.delete_tag("prod").unwrap();
+        let file = store.hosts();
+        assert_eq!(file.tags.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["db"]);
+        assert_eq!(file.hosts.iter().find(|h| h.id == "h").unwrap().tag_ids, ["db"]);
+    }
+
+    fn saved_login(id: &str, name: &str, key_ids: Vec<String>) -> hosts::SavedLogin {
+        hosts::SavedLogin {
+            id: id.into(),
+            name: name.into(),
+            username: "deploy".into(),
+            auth_method: AuthMethod::Key,
+            key_ids,
+            secret_id: None,
+            extra: Default::default(),
+        }
+    }
+
+    fn key(id: &str, path: &str) -> hosts::SshKey {
+        hosts::SshKey { id: id.into(), path: path.into(), secret_id: None, extra: Default::default() }
+    }
+
+    #[test]
+    fn a_login_in_use_cannot_be_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf(), &shells()).unwrap();
+        store.upsert_login(saved_login("l1", "Deploy", vec![])).unwrap();
+        let saved = hosts::Login::Saved(hosts::SavedLoginRef { login_id: "l1".into(), extra: Default::default() });
+        let web = hosts::fixtures::host("h", "web", "web.lan", vec![hosts::fixtures::ssh("c", 22, saved)]);
+        store.upsert_host(web, vec![]).unwrap();
+
+        match store.delete_login("l1") {
+            Err(AppError::Invalid(m)) => assert_eq!(m, "Deploy is used by web · SSH."),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(store.hosts().logins.len(), 1);
+
+        store.delete_host("h").unwrap();
+        assert!(store.delete_login("l1").is_err(), "a deleted host can still be undone");
+        store.purge_deletes(None).unwrap();
+        store.delete_login("l1").unwrap();
+        assert!(store.hosts().logins.is_empty());
+    }
+
+    #[test]
+    fn a_key_in_use_cannot_be_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf(), &shells()).unwrap();
+        store.upsert_key(key("k1", "C:/keys/id_deploy")).unwrap();
+        store.upsert_key(key("k2", "C:/keys/id_spare")).unwrap();
+        store.upsert_login(saved_login("l1", "Deploy", vec!["k1".into()])).unwrap();
+
+        match store.delete_key("k1") {
+            Err(AppError::Invalid(m)) => assert_eq!(m, "id_deploy is used by the login Deploy."),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        store.delete_key("k2").unwrap();
+        assert_eq!(store.hosts().keys.iter().map(|k| k.id.as_str()).collect::<Vec<_>>(), ["k1"]);
+    }
+
+    #[test]
+    fn profiles_json_is_never_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = two_ssh_profiles(dir.path());
+        let mut store = Store::load(dir.path().to_path_buf(), &shells()).unwrap();
+        store.upsert_folder(hosts::fixtures::folder("f", None)).unwrap();
+        store.upsert_host(hosts::fixtures::host("x", "x", "x", vec![]), vec![]).unwrap();
+        store.move_hosts(&[HostMove { id: "x".into(), folder_id: Some("f".into()), order: 3 }]).unwrap();
+        store.move_folders(&[FolderMove { id: "f".into(), parent_id: None, order: 1 }]).unwrap();
+        store.replace_hosts(store.hosts()).unwrap();
+        store.set_settings(Settings::default()).unwrap();
+        assert_eq!(std::fs::read(dir.path().join("profiles.json")).unwrap(), before);
+    }
+
+    #[test]
+    fn first_start_without_files_has_only_this_computer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf(), &shells()).unwrap();
+        let hosts = store.hosts().hosts;
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].id, THIS_COMPUTER);
+        assert!(dir.path().join("hosts.json").is_file());
+        assert_eq!(store.take_migration_report(), None);
+    }
+
+    #[test]
+    fn existing_profiles_are_migrated_once_and_left_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = two_ssh_profiles(dir.path());
+        let mut store = Store::load(dir.path().to_path_buf(), &shells()).unwrap();
+        assert_eq!(
+            store.take_migration_report(),
+            Some(MigrationReport { profiles: 2, hosts: 1 })
+        );
+        assert_eq!(store.take_migration_report(), None);
+        assert_eq!(std::fs::read(dir.path().join("profiles.json")).unwrap(), before);
+
+        let mut reopened = Store::load(dir.path().to_path_buf(), &shells()).unwrap();
+        assert_eq!(reopened.hosts(), store.hosts());
+        assert_eq!(reopened.take_migration_report(), None);
+    }
+
+    #[test]
+    fn corrupt_hosts_file_is_set_aside_and_migration_runs_again() {
+        let dir = tempfile::tempdir().unwrap();
+        two_ssh_profiles(dir.path());
+        std::fs::write(dir.path().join("hosts.json"), "{not json").unwrap();
+        let mut store = Store::load(dir.path().to_path_buf(), &shells()).unwrap();
+        assert!(dir.path().join("hosts.json.corrupt").is_file());
+        assert!(store.take_migration_report().is_some());
+        assert_eq!(store.hosts().hosts.len(), 2);
+    }
+
+    #[test]
+    fn unreadable_profiles_file_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("profiles.json"), "{bad").unwrap();
+        let store = Store::load(dir.path().to_path_buf(), &shells()).unwrap();
+        let hosts = store.hosts().hosts;
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].id, THIS_COMPUTER);
+        assert_eq!(std::fs::read(dir.path().join("profiles.json")).unwrap(), b"{bad");
+        assert!(!dir.path().join("profiles.json.corrupt").exists());
+    }
+
+    #[test]
+    fn a_failed_write_leaves_memory_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf(), &shells()).unwrap();
+        let before = store.hosts();
+        std::fs::remove_file(dir.path().join("hosts.json")).unwrap();
+        std::fs::create_dir(dir.path().join("hosts.json")).unwrap();
+        let new = hosts::fixtures::host("h", "box", "10.0.0.1", vec![]);
+        assert!(store.upsert_host(new, vec![]).is_err());
+        assert_eq!(store.hosts(), before);
+    }
+
+    #[test]
+    fn moving_a_folder_into_its_descendant_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf(), &shells()).unwrap();
+        store.upsert_folder(hosts::fixtures::folder("a", None)).unwrap();
+        store.upsert_folder(hosts::fixtures::folder("b", Some("a"))).unwrap();
+        let bytes = std::fs::read(dir.path().join("hosts.json")).unwrap();
+        let moved = store.move_folders(&[FolderMove {
+            id: "a".into(),
+            parent_id: Some("b".into()),
+            order: 0,
+        }]);
+        assert!(matches!(moved, Err(AppError::Invalid(_))));
+        assert_eq!(std::fs::read(dir.path().join("hosts.json")).unwrap(), bytes);
+    }
+
+    #[test]
+    fn move_hosts_changes_folder_and_order_in_one_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf(), &shells()).unwrap();
+        store.upsert_folder(hosts::fixtures::folder("f", None)).unwrap();
+        store.upsert_host(hosts::fixtures::host("x", "x", "x", vec![]), vec![]).unwrap();
+        store.upsert_host(hosts::fixtures::host("y", "y", "y", vec![]), vec![]).unwrap();
         store
-            .upsert_sftp_profile(SftpProfile {
-                id: "s1".into(),
-                name: "files".into(),
-                host: "h".into(),
-                port: 22,
-                username: "u".into(),
-                auth_method: AuthMethod::Key,
-                keys: vec![ProfileKey { path: "/keys/a".into(), secret_id: None }],
+            .move_hosts(&[
+                HostMove { id: "x".into(), folder_id: Some("f".into()), order: 1 },
+                HostMove { id: "y".into(), folder_id: Some("f".into()), order: 0 },
+            ])
+            .unwrap();
+        let on_disk: HostsFile =
+            serde_json::from_slice(&std::fs::read(dir.path().join("hosts.json")).unwrap()).unwrap();
+        let get = |id: &str| on_disk.hosts.iter().find(|h| h.id == id).unwrap().clone();
+        assert_eq!((get("x").folder_id.as_deref(), get("x").order), (Some("f"), 1));
+        assert_eq!((get("y").folder_id.as_deref(), get("y").order), (Some("f"), 0));
+    }
+
+    #[test]
+    fn upsert_keeps_unknown_fields_of_host_and_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf(), &shells()).unwrap();
+        let mut h = hosts::fixtures::host("h", "box", "a", vec![hosts::fixtures::vnc("c", None)]);
+        store.upsert_host(h.clone(), vec![]).unwrap();
+        let mut file = store.hosts();
+        let stored = file.hosts.iter_mut().find(|x| x.id == "h").unwrap();
+        stored.extra.insert("pinned".into(), serde_json::json!(true));
+        stored.connections[0].extra.insert("note".into(), serde_json::json!("x"));
+        store.replace_hosts(file).unwrap();
+
+        h.name = "renamed".into();
+        store.upsert_host(h, vec![]).unwrap();
+        let after = store.hosts().hosts.into_iter().find(|x| x.id == "h").unwrap();
+        assert_eq!(after.name, "renamed");
+        assert_eq!(after.extra["pinned"], true);
+        assert_eq!(after.connections[0].extra["note"], "x");
+    }
+
+    #[test]
+    fn an_unknown_pending_delete_kind_does_not_break_the_file() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf(), &shells()).unwrap();
+        store.upsert_host(hosts::fixtures::host("h", "web", "web.lan", vec![hosts::fixtures::vnc("c", None)]), vec![]).unwrap();
+        drop(store);
+        // A later version deleted something this one has no kind for.
+        let path = dir.path().join("hosts.json");
+        let item = json!({ "kind": "tunnel", "tunnel": { "id": "t" } });
+        let mut raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        raw["pendingDeletes"] = json!([{ "id": "p1", "deletedAt": 1, "item": item }]);
+        std::fs::write(&path, raw.to_string()).unwrap();
+
+        let mut store = Store::load(dir.path().to_path_buf(), &shells()).unwrap();
+        assert!(!dir.path().join("hosts.json.corrupt").exists());
+        assert!(store.hosts().hosts.iter().any(|h| h.id == "h"));
+        assert!(matches!(store.undo_delete("p1"), Err(AppError::Invalid(_))));
+
+        // A save keeps it as it was written, and the purge at start takes it like any other.
+        store.upsert_host(hosts::fixtures::host("h2", "db", "db.lan", vec![]), vec![]).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["pendingDeletes"][0]["item"], item);
+        store.purge_deletes(None).unwrap();
+        assert!(store.hosts().pending_deletes.is_empty());
+    }
+
+    #[test]
+    fn nested_login_fields_survive_an_edit() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf(), &shells()).unwrap();
+        store
+            .upsert_login(SavedLogin {
+                id: "l".into(),
+                name: "deploy".into(),
+                username: "d".into(),
+                auth_method: AuthMethod::Password,
+                key_ids: vec![],
                 secret_id: None,
-                icon: IconRef::default(),
-                order: 0,
                 extra: Default::default(),
             })
             .unwrap();
-        assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().sftp_profiles().len(), 1);
-        store.delete_sftp_profile("s1").unwrap();
-        assert!(store.sftp_profiles().is_empty());
-    }
-
-    fn vnc(id: &str) -> VncProfile {
-        VncProfile {
-            id: id.into(),
-            name: id.into(),
-            host: "h".into(),
-            port: 5900,
-            username: Some("faye".into()),
-            secret_id: Some("vault-1".into()),
-            icon: IconRef::default(),
-            order: 0,
-            extra: Default::default(),
-        }
-    }
-
-    #[test]
-    fn vnc_profiles_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        let mut desk = vnc("v1");
-        store.upsert_vnc_profile(desk.clone()).unwrap();
-        desk.host = "changed".into();
-        store.upsert_vnc_profile(desk.clone()).unwrap();
-        assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().vnc_profiles(), [desk]);
-
-        store.delete_vnc_profile("v1").unwrap();
-        assert!(Store::load(dir.path().to_path_buf()).unwrap().vnc_profiles().is_empty());
-        assert!(matches!(store.delete_vnc_profile("v1"), Err(AppError::NotFound(_))));
-    }
-
-    // A store holding one VNC profile, and the directory that stands where the temp file of a
-    // store write should be, so that every write fails until it is removed.
-    fn store_with_blocked_writes(dir: &std::path::Path) -> (Store, VncProfile, PathBuf) {
-        let mut store = Store::load(dir.to_path_buf()).unwrap();
-        let desk = vnc("v1");
-        store.upsert_vnc_profile(desk.clone()).unwrap();
-        let blocker = dir.join("profiles.json.tmp");
-        std::fs::create_dir(&blocker).unwrap();
-        (store, desk, blocker)
-    }
-
-    #[test]
-    fn vnc_upsert_that_cannot_be_written_leaves_the_profiles_as_they_were() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut store, desk, blocker) = store_with_blocked_writes(dir.path());
-        let edited = VncProfile { secret_id: Some("vault-2".into()), ..desk.clone() };
-        assert!(matches!(store.upsert_vnc_profile(edited), Err(AppError::Io(_))));
-        assert!(matches!(store.upsert_vnc_profile(vnc("v2")), Err(AppError::Io(_))));
-        assert_eq!(store.vnc_profiles(), [desk.clone()]);
-
-        std::fs::remove_dir(blocker).unwrap();
-        store.upsert_group(group("g1")).unwrap();
-        assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().vnc_profiles(), [desk]);
-    }
-
-    #[test]
-    fn vnc_delete_that_cannot_be_written_keeps_the_profile() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut store, desk, blocker) = store_with_blocked_writes(dir.path());
-        assert!(matches!(store.delete_vnc_profile("v1"), Err(AppError::Io(_))));
-        assert_eq!(store.vnc_profiles(), [desk.clone()]);
-
-        std::fs::remove_dir(blocker).unwrap();
-        store.upsert_group(group("g1")).unwrap();
-        assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().vnc_profiles(), [desk]);
-    }
-
-    fn rdp(id: &str) -> RdpProfile {
-        RdpProfile {
-            id: id.into(),
-            name: id.into(),
-            host: "h".into(),
-            port: 3389,
-            username: "faye".into(),
-            domain: Some("corp".into()),
-            secret_id: Some("vault-1".into()),
-            keyboard_layout: Some(0x407),
-            audio: true,
-            shared_folder: None,
-            gateway: None,
-            icon: IconRef::default(),
-            order: 0,
-            extra: Default::default(),
-        }
-    }
-
-    #[test]
-    fn rdp_profiles_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        let mut office = rdp("r1");
-        store.upsert_rdp_profile(office.clone()).unwrap();
-        office.host = "changed".into();
-        store.upsert_rdp_profile(office.clone()).unwrap();
-        assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().rdp_profiles(), [office]);
-
-        store.delete_rdp_profile("r1").unwrap();
-        assert!(Store::load(dir.path().to_path_buf()).unwrap().rdp_profiles().is_empty());
-        assert!(matches!(store.delete_rdp_profile("r1"), Err(AppError::NotFound(_))));
-    }
-
-    fn store_with_blocked_rdp_writes(dir: &std::path::Path) -> (Store, RdpProfile, PathBuf) {
-        let mut store = Store::load(dir.to_path_buf()).unwrap();
-        let office = rdp("r1");
-        store.upsert_rdp_profile(office.clone()).unwrap();
-        let blocker = dir.join("profiles.json.tmp");
-        std::fs::create_dir(&blocker).unwrap();
-        (store, office, blocker)
-    }
-
-    #[test]
-    fn rdp_upsert_that_cannot_be_written_leaves_the_profiles_as_they_were() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut store, office, blocker) = store_with_blocked_rdp_writes(dir.path());
-        let edited = RdpProfile { secret_id: Some("vault-2".into()), ..office.clone() };
-        assert!(matches!(store.upsert_rdp_profile(edited), Err(AppError::Io(_))));
-        assert!(matches!(store.upsert_rdp_profile(rdp("r2")), Err(AppError::Io(_))));
-        assert_eq!(store.rdp_profiles(), [office.clone()]);
-
-        std::fs::remove_dir(blocker).unwrap();
-        store.upsert_group(group("g1")).unwrap();
-        assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().rdp_profiles(), [office]);
-    }
-
-    #[test]
-    fn rdp_delete_that_cannot_be_written_keeps_the_profile() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut store, office, blocker) = store_with_blocked_rdp_writes(dir.path());
-        assert!(matches!(store.delete_rdp_profile("r1"), Err(AppError::Io(_))));
-        assert_eq!(store.rdp_profiles(), [office.clone()]);
-
-        std::fs::remove_dir(blocker).unwrap();
-        store.upsert_group(group("g1")).unwrap();
-        assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().rdp_profiles(), [office]);
-    }
-
-    #[test]
-    fn profiles_file_from_before_rdp_profiles_loads_with_none() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("profiles.json"),
-            r#"{"version":1,"groups":[{"id":"g1","name":"g1","parentId":null,"order":0}],
-                "profiles":[],"sftpProfiles":[],"s3Profiles":[],"vncProfiles":[]}"#,
-        )
+        let own = || json!({ "kind": "own", "username": "u", "authMethod": "password", "keyIds": [], "secretId": null });
+        let mut sent = serde_json::to_value(hosts::fixtures::host("h", "box", "a", vec![
+            hosts::fixtures::ssh("c", 22, hosts::fixtures::own("u", None)),
+            hosts::fixtures::ssh("d", 22, hosts::fixtures::own("u", None)),
+            hosts::fixtures::ssh("e", 22, hosts::fixtures::own("u", None)),
+        ]))
         .unwrap();
-        let store = Store::load(dir.path().to_path_buf()).unwrap();
-        // A file that does not parse loads as an empty store, so the group shows it was read.
-        assert_eq!(store.groups(), [group("g1")]);
-        assert!(store.rdp_profiles().is_empty());
+        sent["connections"][0]["kind"]["appearance"] = json!({ "colors": null, "fontFamily": null, "fontSize": null });
+        sent["connections"][1]["kind"]["login"] = json!({ "kind": "saved", "loginId": "l" });
+        sent["connections"][2]["kind"] = json!({ "type": "sftp", "own": { "port": 22, "login": own() }, "startFolder": null });
+        // What a later version wrote: a field on each nested object.
+        let mut later = sent.clone();
+        later["connections"][0]["kind"]["login"]["note"] = json!("own");
+        later["connections"][0]["kind"]["appearance"]["note"] = json!("look");
+        later["connections"][1]["kind"]["login"]["note"] = json!("saved");
+        later["connections"][2]["kind"]["own"]["note"] = json!("sftp");
+        later["connections"][2]["kind"]["own"]["login"]["note"] = json!("sftp login");
+        let mut file = store.hosts();
+        file.hosts.push(serde_json::from_value(later).unwrap());
+        store.replace_hosts(file).unwrap();
+
+        // The editor sends the host back without them.
+        let mut edit: Host = serde_json::from_value(sent).unwrap();
+        edit.name = "renamed".into();
+        store.upsert_host(edit, vec![]).unwrap();
+
+        let after = serde_json::to_value(stored(&store, "h")).unwrap();
+        assert_eq!(after["name"], "renamed");
+        assert_eq!(after["connections"][0]["kind"]["login"]["note"], "own");
+        assert_eq!(after["connections"][0]["kind"]["appearance"]["note"], "look");
+        assert_eq!(after["connections"][1]["kind"]["login"]["note"], "saved");
+        assert_eq!(after["connections"][2]["kind"]["own"]["note"], "sftp");
+        assert_eq!(after["connections"][2]["kind"]["own"]["login"]["note"], "sftp login");
     }
 
     #[test]
-    fn an_rdp_profile_from_before_sound_is_written_back_with_sound_and_no_share_or_gateway() {
+    fn this_computer_keeps_its_name_and_place() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("profiles.json");
-        std::fs::write(
-            &path,
-            r#"{"version":1,"groups":[],"profiles":[],"rdpProfiles":[{"id":"r1","name":"r1",
-                "host":"h","port":3389,"username":"faye","domain":"corp","secretId":"vault-1",
-                "keyboardLayout":1031,"icon":{"kind":"builtin","name":"server"},"order":0}]}"#,
-        )
-        .unwrap();
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        assert_eq!(store.rdp_profiles(), [rdp("r1")]);
+        let mut store = Store::load(dir.path().to_path_buf(), &shells()).unwrap();
+        store.upsert_folder(hosts::fixtures::folder("f", None)).unwrap();
+        let mut pc = store.hosts().hosts.into_iter().find(|h| h.id == THIS_COMPUTER).unwrap();
+        pc.name = "X".into();
+        pc.folder_id = Some("f".into());
+        store.upsert_host(pc, vec![]).unwrap();
+        let after = store.hosts().hosts.into_iter().find(|h| h.id == THIS_COMPUTER).unwrap();
+        assert_eq!(after.name, "This computer");
+        assert_eq!(after.folder_id, None);
+    }
 
-        store.upsert_group(group("g1")).unwrap();
-        let saved: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(saved["rdpProfiles"][0]["audio"], true);
-        assert_eq!(saved["rdpProfiles"][0]["sharedFolder"], serde_json::Value::Null);
-        assert_eq!(saved["rdpProfiles"][0]["gateway"], serde_json::Value::Null);
-        assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().rdp_profiles(), [rdp("r1")]);
+    fn stored(store: &Store, id: &str) -> Host {
+        store.hosts().hosts.into_iter().find(|h| h.id == id).unwrap()
+    }
+
+    fn conn_ids(store: &Store, id: &str) -> Vec<String> {
+        stored(store, id).connections.into_iter().map(|c| c.id).collect()
     }
 
     #[test]
-    fn profiles_file_from_before_vnc_profiles_loads_with_none() {
+    fn a_deleted_host_keeps_its_secrets_until_purged() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("profiles.json"),
-            r#"{"version":1,"groups":[{"id":"g1","name":"g1","parentId":null,"order":0}],
-                "profiles":[],"sftpProfiles":[],"s3Profiles":[]}"#,
-        )
-        .unwrap();
-        let store = Store::load(dir.path().to_path_buf()).unwrap();
-        // A file that does not parse loads as an empty store, so the group shows it was read.
-        assert_eq!(store.groups(), [group("g1")]);
-        assert!(store.vnc_profiles().is_empty());
-    }
-
-    // What a later build that knows more kinds of profile leaves in the file.
-    #[test]
-    fn sections_this_build_does_not_know_survive_a_save() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("profiles.json");
-        let kiosks = serde_json::json!([{
-            "id": "r1", "name": "büro", "host": "10.0.0.9", "port": 3389, "gateway": null,
-            "scale": 1.5, "icon": { "kind": "builtin", "name": "server" }, "order": 0
-        }]);
-        let file = serde_json::json!({
-            "version": 1, "groups": [], "profiles": [], "vncProfiles": [vnc("v1")],
-            "kioskProfiles": kiosks, "syncedAt": 1759622400
-        });
-        std::fs::write(&path, file.to_string()).unwrap();
-        let saved = || -> serde_json::Value {
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
-        };
-
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        store.upsert_vnc_profile(VncProfile { name: "renamed".into(), ..vnc("v1") }).unwrap();
-        assert_eq!(saved()["vncProfiles"][0]["name"], "renamed");
-        assert_eq!(saved()["kioskProfiles"].to_string(), kiosks.to_string());
-        assert_eq!(saved()["syncedAt"], 1759622400);
-
-        // Every other save writes the same data: the plain ones, an import, and a later start.
-        store.upsert_group(group("g1")).unwrap();
-        assert_eq!(saved()["kioskProfiles"].to_string(), kiosks.to_string());
-        store.commit(store.snapshot()).unwrap();
-        assert_eq!(saved()["kioskProfiles"].to_string(), kiosks.to_string());
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        store.delete_vnc_profile("v1").unwrap();
-        assert_eq!(saved()["kioskProfiles"].to_string(), kiosks.to_string());
-        assert_eq!(saved()["groups"][0]["id"], "g1");
-    }
-
-    // A field a later build adds to a profile, and one entry of each kind that carries it.
-    fn later_file() -> (serde_json::Value, serde_json::Value) {
-        let later = serde_json::json!({ "host": "gw.lan", "port": 443, "user": null });
-        let icon = serde_json::json!({ "kind": "builtin", "name": "server" });
-        let file = serde_json::json!({
-            "version": 1,
-            "groups": [{ "id": "g1", "name": "g1", "parentId": null, "icon": icon, "order": 0,
-                "later": later }],
-            "profiles": [{ "id": "p1", "name": "p1", "groupId": null, "host": "h", "port": 22,
-                "username": "u", "authMethod": "password", "keys": [], "secretId": null,
-                "icon": icon, "order": 0, "jumpHostId": null, "tunnels": [], "appearance": null,
-                "later": later }],
-            "sftpProfiles": [{ "id": "s1", "name": "s1", "host": "h", "port": 22,
-                "username": "u", "authMethod": "password", "keys": [], "secretId": null,
-                "icon": icon, "order": 0, "later": later }],
-            "s3Profiles": [{ "id": "b1", "name": "b1", "endpoint": "e", "port": null,
-                "region": "r", "useTls": true, "pathStyle": false, "accessKeyId": "k",
-                "secretId": null, "bucket": null, "icon": icon, "order": 0, "later": later }],
-            "vncProfiles": [{ "id": "v1", "name": "v1", "host": "h", "port": 5900,
-                "username": null, "secretId": null, "icon": icon, "order": 0, "later": later }],
-            "rdpProfiles": [{ "id": "r1", "name": "r1", "host": "h", "port": 3389,
-                "username": "u", "domain": null, "secretId": null, "keyboardLayout": null,
-                "icon": icon, "order": 0, "later": later }],
-        });
-        (file, later)
-    }
-
-    const KINDS: [&str; 6] =
-        ["groups", "profiles", "sftpProfiles", "s3Profiles", "vncProfiles", "rdpProfiles"];
-
-    #[test]
-    fn fields_a_later_version_added_to_a_profile_survive_an_unrelated_save() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("profiles.json");
-        let (file, later) = later_file();
-        std::fs::write(&path, file.to_string()).unwrap();
-        let saved = || -> serde_json::Value {
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
-        };
-
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        store.upsert_group(group("g2")).unwrap();
-        for kind in KINDS {
-            assert_eq!(saved()[kind][0]["later"].to_string(), later.to_string(), "{kind}");
-        }
-        store.commit(store.snapshot()).unwrap();
-        for kind in KINDS {
-            assert_eq!(saved()[kind][0]["later"].to_string(), later.to_string(), "{kind}");
-        }
-    }
-
-    // The dialogs send a profile as the bindings describe it, without the fields they do not know.
-    #[test]
-    fn an_edit_from_the_dialogs_keeps_the_fields_a_later_version_added() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("profiles.json");
-        let (file, later) = later_file();
-        std::fs::write(&path, file.to_string()).unwrap();
-        let saved = || -> serde_json::Value {
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
-        };
-        let edited = |kind: &str| {
-            let mut entry = file[kind][0].clone();
-            let entry_map = entry.as_object_mut().unwrap();
-            entry_map.remove("later");
-            entry_map.insert("name".into(), "renamed".into());
-            entry
-        };
-
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        store.upsert_group(serde_json::from_value(edited("groups")).unwrap()).unwrap();
-        store.upsert_profile(serde_json::from_value(edited("profiles")).unwrap()).unwrap();
-        store.upsert_sftp_profile(serde_json::from_value(edited("sftpProfiles")).unwrap()).unwrap();
-        store.upsert_s3_profile(serde_json::from_value(edited("s3Profiles")).unwrap()).unwrap();
-        store.upsert_vnc_profile(serde_json::from_value(edited("vncProfiles")).unwrap()).unwrap();
-        store.upsert_rdp_profile(serde_json::from_value(edited("rdpProfiles")).unwrap()).unwrap();
-        for kind in KINDS {
-            assert_eq!(saved()[kind].as_array().unwrap().len(), 1, "{kind}");
-            assert_eq!(saved()[kind][0]["name"], "renamed", "{kind}");
-            assert_eq!(saved()[kind][0]["later"].to_string(), later.to_string(), "{kind}");
-        }
+        let mut store = Store::load(dir.path().to_path_buf(), &shells()).unwrap();
+        store.upsert_host(hosts::fixtures::host("h", "nas", "nas.local", vec![hosts::fixtures::vnc("c", Some("s1"))]), vec![]).unwrap();
+        store.delete_host("h").unwrap();
+        assert!(store.hosts().hosts.iter().all(|h| h.id != "h"));
+        assert!(store.hosts().referenced_secrets().contains("s1"));
+        let before = store.hosts();
+        store.purge_deletes(None).unwrap();
+        assert_eq!(crate::commands::store_cmds::secrets_to_delete(&before, &store.hosts()), vec!["s1".to_string()]);
     }
 
     #[test]
-    fn an_edit_from_the_dialog_keeps_what_a_later_version_added_to_the_folder_and_gateway() {
+    fn undo_puts_a_host_back_unchanged() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("profiles.json");
-        let (mut file, later) = later_file();
-        let rdp = &mut file["rdpProfiles"][0];
-        rdp["sharedFolder"] = serde_json::json!({ "path": "/s", "name": "s", "later": later });
-        rdp["gateway"] = serde_json::json!({ "host": "gw", "port": 443, "sameLogin": true,
-            "username": "", "secretId": null, "later": later });
-        std::fs::write(&path, file.to_string()).unwrap();
-        let mut edited = file["rdpProfiles"][0].clone();
-        edited["name"] = "renamed".into();
-        for nested in ["sharedFolder", "gateway"] {
-            edited[nested].as_object_mut().unwrap().remove("later");
-        }
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        store.upsert_rdp_profile(serde_json::from_value(edited).unwrap()).unwrap();
-        let saved: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        let rdp = &saved["rdpProfiles"][0];
-        assert_eq!(rdp["name"], "renamed");
-        assert_eq!(rdp["sharedFolder"]["later"].to_string(), later.to_string());
-        assert_eq!(rdp["gateway"]["later"].to_string(), later.to_string());
-    }
-
-    // A duplicate is sent as a copy of what the store gave, with a new id.
-    #[test]
-    fn a_new_entry_starts_without_the_fields_a_later_version_added() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("profiles.json");
-        let (file, later) = later_file();
-        std::fs::write(&path, file.to_string()).unwrap();
-        let saved = || -> serde_json::Value {
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
-        };
-        let copied = |kind: &str| {
-            let mut entry = file[kind][0].clone();
-            entry["id"] = "copy".into();
-            entry
-        };
-
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        store.upsert_group(serde_json::from_value(copied("groups")).unwrap()).unwrap();
-        store.upsert_profile(serde_json::from_value(copied("profiles")).unwrap()).unwrap();
-        store.upsert_sftp_profile(serde_json::from_value(copied("sftpProfiles")).unwrap()).unwrap();
-        store.upsert_s3_profile(serde_json::from_value(copied("s3Profiles")).unwrap()).unwrap();
-        store.upsert_vnc_profile(serde_json::from_value(copied("vncProfiles")).unwrap()).unwrap();
-        store.upsert_rdp_profile(serde_json::from_value(copied("rdpProfiles")).unwrap()).unwrap();
-        for kind in KINDS {
-            assert_eq!(saved()[kind][1]["id"], "copy", "{kind}");
-            assert!(saved()[kind][1].get("later").is_none(), "{kind}");
-            assert_eq!(saved()[kind][0]["later"].to_string(), later.to_string(), "{kind}");
-        }
+        let mut store = Store::load(dir.path().to_path_buf(), &shells()).unwrap();
+        store.upsert_host(hosts::fixtures::host("h", "nas", "nas.local", vec![hosts::fixtures::vnc("c", Some("s1"))]), vec![]).unwrap();
+        let before = stored(&store, "h");
+        let id = store.delete_host("h").unwrap();
+        store.undo_delete(&id).unwrap();
+        assert_eq!(stored(&store, "h"), before);
+        assert!(store.hosts().pending_deletes.is_empty());
     }
 
     #[test]
-    fn delete_missing_is_not_found() {
+    fn a_connection_left_out_of_a_save_becomes_a_pending_delete() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        assert!(matches!(store.delete_profile("ghost"), Err(AppError::NotFound(_))));
+        let mut store = Store::load(dir.path().to_path_buf(), &shells()).unwrap();
+        let vnc = hosts::fixtures::vnc;
+        let h = hosts::fixtures::host("h", "nas", "nas.local", vec![vnc("a", None), vnc("b", Some("s")), vnc("c", None)]);
+        store.upsert_host(h.clone(), vec![]).unwrap();
+        let mut edited = h;
+        edited.connections.remove(1);
+        let ids = store.upsert_host(edited, vec![]).unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(conn_ids(&store, "h"), ["a", "c"]);
+        assert!(store.hosts().referenced_secrets().contains("s"));
+        store.undo_delete(&ids[0]).unwrap();
+        assert_eq!(conn_ids(&store, "h"), ["a", "b", "c"]);
     }
 
     #[test]
-    fn load_migrates_version_zero_to_current() {
+    fn a_moved_connection_lands_on_the_target_in_the_same_write() {
+        use hosts::{ConnectionMove, MoveTarget, MoveToHost, NewHostTarget};
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("profiles.json");
-        std::fs::write(&path, r#"{"version":0,"groups":[],"profiles":[]}"#).unwrap();
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        store.upsert_group(group("g1")).unwrap(); // a write persists the bumped version
-        let raw = std::fs::read_to_string(&path).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(parsed["version"].as_u64(), Some(ProfileStore::CURRENT_VERSION as u64));
+        let mut store = Store::load(dir.path().to_path_buf(), &shells()).unwrap();
+        let vnc = hosts::fixtures::vnc;
+        store.upsert_host(hosts::fixtures::host("h", "nas", "nas.local", vec![vnc("a", None), vnc("b", None), vnc("c", None)]), vec![]).unwrap();
+        store.upsert_host(hosts::fixtures::host("t", "box", "box.lan", vec![]), vec![]).unwrap();
+        let mut edited = stored(&store, "h");
+        let b = edited.connections.remove(1);
+        let c = edited.connections.remove(1);
+        let ids = store
+            .upsert_host(
+                edited,
+                vec![
+                    ConnectionMove { connection: b, to: MoveTarget::Host(MoveToHost { host_id: "t".into() }) },
+                    ConnectionMove {
+                        connection: c,
+                        to: MoveTarget::NewHost(NewHostTarget { name: "desk".into(), address: "desk.lan".into(), folder_id: None }),
+                    },
+                ],
+            )
+            .unwrap();
+        assert!(ids.is_empty());
+        assert_eq!(conn_ids(&store, "h"), ["a"]);
+        assert_eq!(conn_ids(&store, "t"), ["b"]);
+        let desk = store.hosts().hosts.into_iter().find(|h| h.name == "desk").unwrap();
+        assert_eq!(desk.connections[0].id, "c");
+        assert!(store.hosts().pending_deletes.is_empty());
+        let on_disk: HostsFile =
+            serde_json::from_slice(&std::fs::read(dir.path().join("hosts.json")).unwrap()).unwrap();
+        assert_eq!(on_disk, store.hosts());
     }
 
     #[test]
-    fn commit_persists_and_a_failed_commit_changes_nothing() {
+    fn purging_a_duplicate_keeps_the_shared_secret() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        let mut data = store.snapshot();
-        data.profiles.push(profile("p1", None));
-        store.commit(data).unwrap();
-        assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().profiles().len(), 1);
+        let mut store = Store::load(dir.path().to_path_buf(), &shells()).unwrap();
+        let vnc = hosts::fixtures::vnc;
+        store.upsert_host(hosts::fixtures::host("h", "nas", "nas.local", vec![vnc("a", Some("s")), vnc("b", Some("s"))]), vec![]).unwrap();
+        let mut edited = stored(&store, "h");
+        edited.connections.remove(1);
+        store.upsert_host(edited, vec![]).unwrap();
+        let before = store.hosts();
+        store.purge_deletes(None).unwrap();
+        assert!(crate::commands::store_cmds::secrets_to_delete(&before, &store.hosts()).is_empty());
+    }
 
-        // A directory where profiles.json should be makes the final rename fail.
-        let blocked = tempfile::tempdir().unwrap();
-        let mut store = Store::load(blocked.path().to_path_buf()).unwrap();
-        std::fs::create_dir(blocked.path().join("profiles.json")).unwrap();
-        let mut data = store.snapshot();
-        data.profiles.push(profile("p2", None));
-        assert!(store.commit(data).is_err());
-        assert!(store.profiles().is_empty());
+    #[test]
+    fn this_computer_cannot_be_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf(), &shells()).unwrap();
+        assert!(matches!(store.delete_host(THIS_COMPUTER), Err(AppError::Invalid(_))));
     }
 }

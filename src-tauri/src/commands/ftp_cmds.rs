@@ -11,6 +11,8 @@ use crate::commands::sftp_cmds::TransferProgress;
 use crate::error::{AppError, AppResult};
 use crate::ftp::{self, FtpStream};
 use crate::sftp::SftpEntry;
+use crate::store::hosts::FtpResolved;
+use crate::store::Store;
 
 // suppaftp is a synchronous client; each connection lives behind a blocking mutex and
 // every operation runs on a blocking thread so it never stalls the tokio runtime.
@@ -63,6 +65,26 @@ where
     result
 }
 
+async fn open(
+    sessions: &FtpSessions,
+    vault: &StdMutex<crate::vault::Vault>,
+    t: FtpResolved,
+) -> AppResult<String> {
+    // The password lives in the vault; the caller only ever holds a reference to it.
+    let password = match &t.secret_id {
+        Some(id) => crate::commands::ssh_cmds::secret_string(vault, id)?,
+        None => Zeroizing::new(String::new()),
+    };
+    let stream = tokio::task::spawn_blocking(move || {
+        ftp::connect(&t.host, t.port, &t.username, &password, t.secure, t.allow_invalid_cert, t.ignore_hostname)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("ftp task: {e}")))??;
+    let id = uuid::Uuid::new_v4().to_string();
+    sessions.0.lock().await.insert(id.clone(), Arc::new(StdMutex::new(stream)));
+    Ok(id)
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn ftp_connect(
@@ -76,19 +98,21 @@ pub async fn ftp_connect(
     allow_invalid_cert: bool,
     ignore_hostname: bool,
 ) -> AppResult<String> {
-    // The password lives in the vault; the caller only ever holds a reference to it.
-    let password = match &secret_id {
-        Some(id) => crate::commands::ssh_cmds::secret_string(&vault, id)?,
-        None => Zeroizing::new(String::new()),
-    };
-    let stream = tokio::task::spawn_blocking(move || {
-        ftp::connect(&host, port, &username, &password, secure, allow_invalid_cert, ignore_hostname)
-    })
-    .await
-    .map_err(|e| AppError::Internal(format!("ftp task: {e}")))??;
-    let id = uuid::Uuid::new_v4().to_string();
-    sessions.0.lock().await.insert(id.clone(), Arc::new(StdMutex::new(stream)));
-    Ok(id)
+    let t = FtpResolved { host, port, username, secret_id, secure, allow_invalid_cert, ignore_hostname };
+    open(&sessions, &vault, t).await
+}
+
+// A saved connection is read at connect time, so the tab holds only its id.
+#[tauri::command]
+#[specta::specta]
+pub async fn ftp_connect_saved(
+    sessions: State<'_, FtpSessions>,
+    vault: State<'_, StdMutex<crate::vault::Vault>>,
+    store: State<'_, StdMutex<Store>>,
+    connection_id: String,
+) -> AppResult<String> {
+    let t = store.lock().map_err(|_| AppError::Internal("store lock poisoned".into()))?.hosts().ftp_target(&connection_id)?;
+    open(&sessions, &vault, t).await
 }
 
 #[tauri::command]

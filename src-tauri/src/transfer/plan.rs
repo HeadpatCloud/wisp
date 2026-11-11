@@ -4,13 +4,15 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
 
-use super::bundle::Payload;
+use super::bundle::{LegacyPayload, PayloadV3};
 use super::{Env, FieldDiff, ItemKind, ItemStatus, LocalMatch, ReviewItem};
-use crate::store::model::{
-    AuthMethod, Group, IconRef, Profile, ProfileAppearance, ProfileKey, ProfileStore, RdpGateway,
-    RdpProfile, S3Profile, SftpProfile, SharedFolder, Tunnel, TunnelKind, VncProfile,
+use crate::net::address_key;
+use crate::store::hosts::{
+    ConnAppearance, Connection, ConnectionKind, Folder, Host, HostsFile, Login, RdpGatewayConn,
+    SavedLogin, SshKey, Tag, THIS_COMPUTER,
 };
-use crate::store::normalize_keys;
+use crate::store::migrate::migrate;
+use crate::store::model::{AuthMethod, IconRef, ProfileStore, SharedFolder, Tunnel, TunnelKind};
 
 pub struct Plan {
     pub items: Vec<ReviewItem>,
@@ -24,17 +26,22 @@ pub mod field {
     pub const NAME: &str = "name";
     pub const PARENT_ID: &str = "parentId";
     pub const ICON: &str = "icon";
-    pub const HOST: &str = "host";
+    pub const ADDRESS: &str = "address";
+    pub const FOLDER_ID: &str = "folderId";
+    pub const TAGS: &str = "tags";
+    pub const COLOR: &str = "color";
+    pub const LABEL: &str = "label";
     pub const PORT: &str = "port";
-    pub const USERNAME: &str = "username";
-    pub const AUTH_METHOD: &str = "authMethod";
-    pub const GROUP_ID: &str = "groupId";
-    pub const JUMP_HOST_ID: &str = "jumpHostId";
-    pub const APPEARANCE: &str = "appearance";
-    pub const TUNNELS: &str = "tunnels";
-    pub const KEYS: &str = "keys";
+    pub const LOGIN: &str = "login";
     pub const PASSWORD: &str = "password";
-    pub const ENDPOINT: &str = "endpoint";
+    pub const JUMP_HOST_ID: &str = "jumpHostId";
+    pub const TUNNELS: &str = "tunnels";
+    pub const APPEARANCE: &str = "appearance";
+    pub const START_FOLDER: &str = "startFolder";
+    pub const SFTP_LOGIN: &str = "sftpLogin";
+    pub const SECURE: &str = "secure";
+    pub const ALLOW_INVALID_CERT: &str = "allowInvalidCert";
+    pub const IGNORE_HOSTNAME: &str = "ignoreHostname";
     pub const REGION: &str = "region";
     pub const USE_TLS: &str = "useTls";
     pub const PATH_STYLE: &str = "pathStyle";
@@ -46,10 +53,19 @@ pub mod field {
     pub const SHARED_FOLDER: &str = "sharedFolder";
     pub const GATEWAY: &str = "gateway";
     pub const GATEWAY_PASSWORD: &str = "gatewayPassword";
+    pub const USERNAME: &str = "username";
+    pub const AUTH_METHOD: &str = "authMethod";
+    pub const KEYS: &str = "keys";
+    pub const KEY_FILE: &str = "keyFile";
+    pub const PASSPHRASE: &str = "passphrase";
+    pub const SHOW_COLOR: &str = "showColor";
+    pub const ASK_BEFORE_CLOSE: &str = "askBeforeClose";
+    pub const ASK_BEFORE_PASTE: &str = "askBeforePaste";
+    pub const TERMINAL_COLORS: &str = "terminalColors";
 }
 
-// The same list as the profile dialog offers; a test keeps them equal.
-const RDP_LAYOUTS: &[(u32, &str)] = &[
+// The same list as src/lib/rdpLayouts.ts; a test keeps them equal.
+pub(crate) const RDP_LAYOUTS: &[(u32, &str)] = &[
     (0x409, "English (US)"),
     (0x20409, "English (US International)"),
     (0x809, "English (UK)"),
@@ -80,9 +96,9 @@ pub fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-pub fn group_depth(g: &Group, all: &[Group]) -> usize {
+pub fn folder_depth(f: &Folder, all: &[Folder]) -> usize {
     let mut depth = 0;
-    let mut parent = g.parent_id.as_deref();
+    let mut parent = f.parent_id.as_deref();
     while let Some(p) = parent {
         depth += 1;
         if depth > all.len() {
@@ -102,15 +118,42 @@ pub fn same_tunnel(a: &Tunnel, b: &Tunnel) -> bool {
         && a.auto_start == b.auto_start
 }
 
+// A version 1 or 2 bundle, read through the same migration as a 0.5.0 profiles file. No shells:
+// This computer is never imported.
+pub fn from_legacy(p: LegacyPayload) -> PayloadV3 {
+    let old = ProfileStore {
+        version: 1,
+        groups: p.groups,
+        profiles: p.profiles,
+        sftp_profiles: p.sftp_profiles,
+        s3_profiles: p.s3_profiles,
+        vnc_profiles: p.vnc_profiles,
+        rdp_profiles: p.rdp_profiles,
+        unknown: Default::default(),
+    };
+    let (file, _) = migrate(&old, &[]);
+    PayloadV3 {
+        folders: file.folders,
+        hosts: file.hosts,
+        logins: file.logins,
+        keys: file.keys,
+        tags: file.tags,
+        secrets: p.secrets,
+        key_files: p.key_files,
+        legacy: true,
+    }
+}
+
 // Matches in passes so an earlier look-alike can't take the local item a later one matches
 // outright: first by id, then the only free local on the same server with the same name, then
 // the only free local on the same server. The keys are (id, name); `same_server` also gets the
-// incoming id -> local id pairs matched so far.
+// incoming id -> local id pairs matched so far. `same_kind` rules out an id match across kinds.
 fn match_items<'a, L, I>(
     locals: &'a [L],
     incoming: &[I],
     local_key: impl Fn(&L) -> (&str, &str),
     incoming_key: impl Fn(&I) -> (&str, &str),
+    same_kind: impl Fn(&L, &I) -> bool,
     same_server: impl Fn(&L, &I, &HashMap<String, String>) -> bool,
 ) -> (Vec<Option<&'a L>>, HashMap<String, String>) {
     let mut found = vec![None; incoming.len()];
@@ -118,7 +161,9 @@ fn match_items<'a, L, I>(
     let mut map = HashMap::new();
     for (slot, inc) in found.iter_mut().zip(incoming) {
         let (id, _) = incoming_key(inc);
-        let at = (0..locals.len()).find(|&at| !taken[at] && local_key(&locals[at]).0 == id);
+        let at = (0..locals.len()).find(|&at| {
+            !taken[at] && local_key(&locals[at]).0 == id && same_kind(&locals[at], inc)
+        });
         if let Some(at) = at {
             taken[at] = true;
             map.insert(id.to_string(), id.to_string());
@@ -156,6 +201,10 @@ fn text(v: Option<&str>) -> String {
     v.filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| "(none)".into())
 }
 
+fn on_off(on: bool) -> String {
+    if on { "On" } else { "Off" }.into()
+}
+
 fn layout_label(layout: Option<u32>) -> String {
     match layout {
         None => "Automatic".into(),
@@ -171,25 +220,6 @@ fn folder_label(folder: Option<&SharedFolder>) -> String {
         None => "None".into(),
         Some(f) => format!("{} as {}", f.path, f.name),
     }
-}
-
-fn gateway_label(gateway: Option<&RdpGateway>) -> String {
-    match gateway {
-        None => "None".into(),
-        Some(g) if g.same_login => format!("{}:{}, same login", g.host, g.port),
-        Some(g) => format!("{}:{}, {}", g.host, g.port, g.username),
-    }
-}
-
-// A gateway that takes the RDP login has no password of its own.
-pub fn gateway_secret(gateway: Option<&RdpGateway>) -> Option<&str> {
-    gateway.filter(|g| !g.same_login).and_then(|g| g.secret_id.as_deref())
-}
-
-// A shared folder is a path on the exporting machine, and one that is not a folder here would stop
-// every connect.
-fn missing_folder<'a>(p: &'a RdpProfile, env: &dyn Env) -> Option<&'a str> {
-    p.shared_folder.as_ref().map(|f| f.path.as_str()).filter(|path| !env.dir_exists(path))
 }
 
 fn auth(a: AuthMethod) -> String {
@@ -208,12 +238,12 @@ fn icon_label(i: &IconRef) -> String {
     }
 }
 
-fn appearance_label(a: &Option<ProfileAppearance>) -> String {
+fn appearance_label(a: &Option<ConnAppearance>) -> String {
     match a {
         None => "(default)".into(),
         Some(a) => format!(
-            "theme {}, font {} {}",
-            a.theme.as_deref().unwrap_or("default"),
+            "colours {}, font {} {}",
+            a.colors.as_deref().unwrap_or("default"),
             a.font_family.as_deref().unwrap_or("default"),
             a.font_size.map(|s| s.to_string()).unwrap_or_else(|| "default".into()),
         ),
@@ -245,724 +275,842 @@ fn tunnels_label(ts: &[Tunnel]) -> String {
         .join("; ")
 }
 
-fn icon_field(
-    local: &IconRef,
-    incoming: &IconRef,
-    env: &dyn Env,
-    fields: &mut Vec<FieldDiff>,
-    notes: &mut Vec<String>,
-) {
-    if let IconRef::Custom { path } = incoming {
-        if !env.icon_exists(path) {
-            if local != incoming {
-                notes.push("Kept your icon; the custom image isn't on this machine".into());
-            }
-            return;
+fn file_name(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().filter(|s| !s.is_empty()).unwrap_or(path)
+}
+
+pub fn kind_name(kind: &ConnectionKind) -> &'static str {
+    match kind {
+        ConnectionKind::Ssh(_) => "SSH",
+        ConnectionKind::Sftp(_) => "Files",
+        ConnectionKind::Ftp(_) => "FTP",
+        ConnectionKind::S3(_) => "S3",
+        ConnectionKind::Rdp(_) => "RDP",
+        ConnectionKind::Vnc(_) => "VNC",
+        ConnectionKind::Local(_) => "Local shell",
+    }
+}
+
+fn same_type(a: &ConnectionKind, b: &ConnectionKind) -> bool {
+    std::mem::discriminant(a) == std::mem::discriminant(b)
+}
+
+fn login_user<'a>(login: &'a Login, logins: &'a [SavedLogin]) -> &'a str {
+    match login {
+        Login::Own(o) => &o.username,
+        Login::Saved(s) => {
+            logins.iter().find(|l| l.id == s.login_id).map(|l| l.username.as_str()).unwrap_or("")
         }
     }
-    if local != incoming {
-        fields.push(FieldDiff {
-            field: field::ICON.into(),
-            label: "Icon".into(),
-            local: icon_label(local),
-            incoming: icon_label(incoming),
-        });
+}
+
+// The port and user a connection is told apart by on a shared host.
+fn port_and_user<'a>(kind: &'a ConnectionKind, logins: &'a [SavedLogin]) -> (u16, &'a str) {
+    match kind {
+        ConnectionKind::Ssh(c) => (c.port, login_user(&c.login, logins)),
+        ConnectionKind::Sftp(c) => {
+            c.own.as_ref().map(|o| (o.port, login_user(&o.login, logins))).unwrap_or((0, ""))
+        }
+        ConnectionKind::Ftp(c) => (c.port, login_user(&c.login, logins)),
+        ConnectionKind::S3(c) => (c.port.unwrap_or(0), &c.access_key_id),
+        ConnectionKind::Rdp(c) => (c.port, login_user(&c.login, logins)),
+        ConnectionKind::Vnc(c) => (c.port, c.username.as_deref().unwrap_or("")),
+        ConnectionKind::Local(_) => (0, ""),
     }
+}
+
+pub fn connection_name(host: &Host, c: &Connection, logins: &[SavedLogin]) -> String {
+    let (_, user) = port_and_user(&c.kind, logins);
+    match c.label.as_deref().filter(|l| !l.is_empty()) {
+        Some(label) => format!("{} · {} · {label}", host.name, kind_name(&c.kind)),
+        None if !user.is_empty() && !matches!(c.kind, ConnectionKind::S3(_)) => {
+            format!("{} · {} · {user}", host.name, kind_name(&c.kind))
+        }
+        None => format!("{} · {}", host.name, kind_name(&c.kind)),
+    }
+}
+
+pub fn own_secret(login: &Login) -> Option<&str> {
+    match login {
+        Login::Own(o) => o.secret_id.as_deref(),
+        Login::Saved(_) => None,
+    }
+}
+
+// A gateway that takes the RDP login, or a saved one, has no password of its own.
+pub fn gateway_secret(gateway: &Option<RdpGatewayConn>) -> Option<&str> {
+    gateway.as_ref().and_then(|g| g.login.as_ref()).and_then(own_secret)
 }
 
 struct KeyView {
     label: String,
     content: Option<String>,
-    passphrase: Option<String>,
     usable: bool,
 }
 
-fn incoming_keys(keys: &[ProfileKey], payload: &Payload, env: &dyn Env) -> Vec<KeyView> {
-    keys.iter()
-        .map(|k| {
-            let embedded = payload
-                .key_files
-                .get(&k.path)
-                .and_then(|f| STANDARD.decode(f.data.as_bytes()).ok());
-            let (content, usable, label) = match embedded {
-                Some(bytes) => (Some(digest(&bytes)), true, format!("{} (in export)", k.path)),
-                None => match env.read_file(&k.path) {
-                    Some(bytes) => (Some(digest(&bytes)), true, k.path.clone()),
-                    None => (None, false, format!("{} (not on this machine)", k.path)),
-                },
-            };
-            let passphrase = k
-                .secret_id
-                .as_ref()
-                .and_then(|id| payload.secrets.get(id))
-                .map(|v| digest(v.as_bytes()));
-            KeyView { label, content, passphrase, usable }
-        })
-        .collect()
-}
-
-fn local_keys(keys: &[ProfileKey], env: &dyn Env) -> Vec<KeyView> {
-    keys.iter()
-        .map(|k| KeyView {
-            label: k.path.clone(),
-            content: env.read_file(&k.path).map(|b| digest(&b)),
-            passphrase: k.secret_id.as_ref().and_then(|id| env.secret(id)).map(|v| digest(&v)),
-            usable: true,
-        })
-        .collect()
-}
-
-fn keys_label(keys: &[KeyView]) -> String {
-    if keys.is_empty() {
-        return "(none)".into();
-    }
-    keys.iter().map(|k| k.label.clone()).collect::<Vec<_>>().join(", ")
-}
-
-fn keys_field(
-    local: Option<&[ProfileKey]>,
-    incoming: &[ProfileKey],
-    payload: &Payload,
-    env: &dyn Env,
-    fields: &mut Vec<FieldDiff>,
-    notes: &mut Vec<String>,
-) {
-    let inc = incoming_keys(incoming, payload, env);
-    let missing: Vec<&str> = incoming
-        .iter()
-        .zip(&inc)
-        .filter(|(_, v)| !v.usable)
-        .map(|(k, _)| k.path.as_str())
-        .collect();
-    match local {
-        Some(local) if !local.is_empty() && !missing.is_empty() => {
-            notes.push(format!(
-                "Kept your local keys; not on this machine: {}",
-                missing.join(", ")
-            ));
+fn incoming_key(k: &SshKey, payload: &PayloadV3, env: &dyn Env) -> KeyView {
+    let embedded = payload.key_files.get(&k.path).and_then(|f| STANDARD.decode(f.data.as_bytes()).ok());
+    match embedded {
+        Some(bytes) => {
+            KeyView { label: format!("{} (in export)", k.path), content: Some(digest(&bytes)), usable: true }
         }
-        Some(local) => {
-            let loc = local_keys(local, env);
-            let same = loc.len() == inc.len()
-                && loc.iter().zip(&inc).all(|(l, i)| {
-                    let content = match (&l.content, &i.content) {
-                        (Some(a), Some(b)) => a == b,
-                        _ => l.label == i.label,
-                    };
-                    content && (i.passphrase.is_none() || i.passphrase == l.passphrase)
-                });
-            if !same {
-                fields.push(FieldDiff {
-                    field: field::KEYS.into(),
-                    label: "Private keys".into(),
-                    local: keys_label(&loc),
-                    incoming: keys_label(&inc),
-                });
-            }
-            if !missing.is_empty() {
-                notes.push(format!("Key file not on this machine: {}", missing.join(", ")));
-            }
-        }
-        None => {
-            if !missing.is_empty() {
-                notes.push(format!("Key file not on this machine: {}", missing.join(", ")));
-            }
-        }
+        None => match env.read_file(&k.path) {
+            Some(bytes) => KeyView { label: k.path.clone(), content: Some(digest(&bytes)), usable: true },
+            None => KeyView {
+                label: format!("{} (not on this machine)", k.path),
+                content: None,
+                usable: false,
+            },
+        },
     }
-}
-
-fn password_field(
-    field: &str,
-    label: &str,
-    local: Option<&str>,
-    incoming: Option<&str>,
-    payload: &Payload,
-    env: &dyn Env,
-    fields: &mut Vec<FieldDiff>,
-) {
-    let Some(value) = incoming.and_then(|id| payload.secrets.get(id)) else { return };
-    let current = local.and_then(|id| env.secret(id));
-    if current.as_ref().is_some_and(|c| c.as_slice() == value.as_bytes()) {
-        return;
-    }
-    fields.push(FieldDiff {
-        field: field.into(),
-        label: label.into(),
-        local: if current.is_some() { "••••".into() } else { "(none)".into() },
-        incoming: if current.is_some() { "•••• (different)".into() } else { "••••".into() },
-    });
 }
 
 struct Collector<'a> {
     items: Vec<ReviewItem>,
     unchanged: u32,
     matches: HashMap<String, String>,
-    payload: &'a Payload,
-    local: &'a ProfileStore,
+    payload: &'a PayloadV3,
+    local: &'a HostsFile,
+    env: &'a dyn Env,
+    folder_map: HashMap<String, String>,
+    tag_map: HashMap<String, String>,
+    key_map: HashMap<String, String>,
+    login_map: HashMap<String, String>,
+    conn_map: HashMap<String, String>,
 }
 
 impl Collector<'_> {
+    #[allow(clippy::too_many_arguments)]
     fn matched(
         &mut self,
         key: String,
         kind: ItemKind,
-        name: &str,
+        name: String,
         local: (&str, &str),
         fields: Vec<FieldDiff>,
         (notes, notes_as_new): (Vec<String>, Vec<String>),
+        parent: Option<String>,
     ) {
         self.matches.insert(key.clone(), local.0.to_string());
         if fields.is_empty() {
-            self.unchanged += 1;
+            if kind != ItemKind::Connection {
+                self.unchanged += 1;
+            }
             return;
         }
         self.items.push(ReviewItem {
             key,
             kind,
-            name: name.into(),
+            name,
             status: ItemStatus::Conflict,
             matched: Some(LocalMatch { id: local.0.into(), name: local.1.into() }),
             fields,
             notes,
             notes_as_new,
+            parent,
         });
     }
 
-    fn added(&mut self, key: String, kind: ItemKind, name: &str, notes: Vec<String>) {
+    fn added(&mut self, key: String, kind: ItemKind, name: String, notes: Vec<String>, parent: Option<String>) {
         self.items.push(ReviewItem {
             key,
             kind,
-            name: name.into(),
+            name,
             status: ItemStatus::New,
             matched: None,
             fields: vec![],
             notes_as_new: notes.clone(),
             notes,
+            parent,
         });
     }
 
-    fn group_name(&self, id: &str) -> String {
+    fn folder_name(&self, id: &str) -> String {
         self.local
-            .groups
+            .folders
             .iter()
-            .chain(&self.payload.groups)
-            .find(|g| g.id == id)
-            .map(|g| g.name.clone())
+            .chain(&self.payload.folders)
+            .find(|f| f.id == id)
+            .map(|f| f.name.clone())
             .unwrap_or_else(|| id.into())
     }
 
-    fn profile_name(&self, id: &str) -> String {
-        self.local
-            .profiles
-            .iter()
-            .chain(&self.payload.profiles)
-            .find(|p| p.id == id)
-            .map(|p| p.name.clone())
+    fn connection_name_by_id(&self, id: &str) -> String {
+        let find = |hosts: &[Host], logins: &[SavedLogin]| {
+            hosts.iter().find_map(|h| {
+                h.connections.iter().find(|c| c.id == id).map(|c| connection_name(h, c, logins))
+            })
+        };
+        find(&self.local.hosts, &self.local.logins)
+            .or_else(|| find(&self.payload.hosts, &self.payload.logins))
             .unwrap_or_else(|| id.into())
     }
 
-    fn group_fields(
-        &self,
-        l: &Group,
-        g: &Group,
-        parent: Option<&str>,
-        env: &dyn Env,
-        notes: &mut Vec<String>,
-    ) -> Vec<FieldDiff> {
-        let mut fields = vec![];
-        push(&mut fields, field::NAME, "Name", l.name.clone(), g.name.clone());
-        if l.parent_id.as_deref() != parent {
-            fields.push(FieldDiff {
-                field: field::PARENT_ID.into(),
-                label: "Parent group".into(),
-                local: l
-                    .parent_id
-                    .as_deref()
-                    .map(|p| self.group_name(p))
-                    .unwrap_or_else(|| "(top level)".into()),
-                incoming: parent
-                    .map(|p| self.group_name(p))
-                    .unwrap_or_else(|| "(top level)".into()),
-            });
-        }
-        icon_field(&l.icon, &g.icon, env, &mut fields, notes);
-        fields
-    }
-
-    fn ssh_fields(
-        &self,
-        l: &Profile,
-        inc: &Profile,
-        group: Option<&str>,
-        jump: Option<&str>,
-        env: &dyn Env,
-        notes: &mut Vec<String>,
-    ) -> Vec<FieldDiff> {
-        let mut fields = vec![];
-        push(&mut fields, field::NAME, "Name", l.name.clone(), inc.name.clone());
-        push(&mut fields, field::HOST, "Host", l.host.clone(), inc.host.clone());
-        push(&mut fields, field::PORT, "Port", l.port.to_string(), inc.port.to_string());
-        push(&mut fields, field::USERNAME, "Username", l.username.clone(), inc.username.clone());
-        push(&mut fields, field::AUTH_METHOD, "Login", auth(l.auth_method), auth(inc.auth_method));
-        if l.group_id.as_deref() != group {
-            fields.push(FieldDiff {
-                field: field::GROUP_ID.into(),
-                label: "Group".into(),
-                local: l
-                    .group_id
-                    .as_deref()
-                    .map(|g| self.group_name(g))
-                    .unwrap_or_else(|| "(ungrouped)".into()),
-                incoming: group.map(|g| self.group_name(g)).unwrap_or_else(|| "(ungrouped)".into()),
-            });
-        }
-        if l.jump_host_id.as_deref() != jump {
-            fields.push(FieldDiff {
-                field: field::JUMP_HOST_ID.into(),
-                label: "Jump host".into(),
-                local: text(l.jump_host_id.as_deref().map(|j| self.profile_name(j)).as_deref()),
-                incoming: text(jump.map(|j| self.profile_name(j)).as_deref()),
-            });
-        }
-        icon_field(&l.icon, &inc.icon, env, &mut fields, notes);
-        push(
-            &mut fields,
-            field::APPEARANCE,
-            "Appearance",
-            appearance_label(&l.appearance),
-            appearance_label(&inc.appearance),
-        );
-        let same_tunnels = l.tunnels.len() == inc.tunnels.len()
-            && l.tunnels.iter().zip(&inc.tunnels).all(|(a, b)| same_tunnel(a, b));
-        if !same_tunnels {
-            fields.push(FieldDiff {
-                field: field::TUNNELS.into(),
-                label: "Tunnels".into(),
-                local: tunnels_label(&l.tunnels),
-                incoming: tunnels_label(&inc.tunnels),
-            });
-        }
-        keys_field(Some(l.keys.as_slice()), &inc.keys, self.payload, env, &mut fields, notes);
-        password_field(
-            field::PASSWORD,
-            "Password",
-            l.secret_id.as_deref(),
-            inc.secret_id.as_deref(),
-            self.payload,
-            env,
-            &mut fields,
-        );
-        fields
-    }
-
-    fn sftp_fields(
-        &self,
-        l: &SftpProfile,
-        inc: &SftpProfile,
-        env: &dyn Env,
-        notes: &mut Vec<String>,
-    ) -> Vec<FieldDiff> {
-        let mut fields = vec![];
-        push(&mut fields, field::NAME, "Name", l.name.clone(), inc.name.clone());
-        push(&mut fields, field::HOST, "Host", l.host.clone(), inc.host.clone());
-        push(&mut fields, field::PORT, "Port", l.port.to_string(), inc.port.to_string());
-        push(&mut fields, field::USERNAME, "Username", l.username.clone(), inc.username.clone());
-        push(&mut fields, field::AUTH_METHOD, "Login", auth(l.auth_method), auth(inc.auth_method));
-        icon_field(&l.icon, &inc.icon, env, &mut fields, notes);
-        keys_field(Some(l.keys.as_slice()), &inc.keys, self.payload, env, &mut fields, notes);
-        password_field(
-            field::PASSWORD,
-            "Password",
-            l.secret_id.as_deref(),
-            inc.secret_id.as_deref(),
-            self.payload,
-            env,
-            &mut fields,
-        );
-        fields
-    }
-
-    fn s3_fields(
-        &self,
-        l: &S3Profile,
-        inc: &S3Profile,
-        env: &dyn Env,
-        notes: &mut Vec<String>,
-    ) -> Vec<FieldDiff> {
-        let mut fields = vec![];
-        push(&mut fields, field::NAME, "Name", l.name.clone(), inc.name.clone());
-        push(&mut fields, field::ENDPOINT, "Endpoint", l.endpoint.clone(), inc.endpoint.clone());
-        push(
-            &mut fields,
-            field::PORT,
-            "Port",
-            text(l.port.map(|p| p.to_string()).as_deref()),
-            text(inc.port.map(|p| p.to_string()).as_deref()),
-        );
-        push(&mut fields, field::REGION, "Region", l.region.clone(), inc.region.clone());
-        push(
-            &mut fields,
-            field::USE_TLS,
-            "Use TLS",
-            l.use_tls.to_string(),
-            inc.use_tls.to_string(),
-        );
-        push(
-            &mut fields,
-            field::PATH_STYLE,
-            "Path-style addressing",
-            l.path_style.to_string(),
-            inc.path_style.to_string(),
-        );
-        push(
-            &mut fields,
-            field::ACCESS_KEY_ID,
-            "Access key id",
-            l.access_key_id.clone(),
-            inc.access_key_id.clone(),
-        );
-        push(
-            &mut fields,
-            field::BUCKET,
-            "Bucket",
-            text(l.bucket.as_deref()),
-            text(inc.bucket.as_deref()),
-        );
-        icon_field(&l.icon, &inc.icon, env, &mut fields, notes);
-        password_field(
-            field::PASSWORD,
-            "Secret access key",
-            l.secret_id.as_deref(),
-            inc.secret_id.as_deref(),
-            self.payload,
-            env,
-            &mut fields,
-        );
-        fields
-    }
-
-    fn vnc_fields(
-        &self,
-        l: &VncProfile,
-        inc: &VncProfile,
-        env: &dyn Env,
-        notes: &mut Vec<String>,
-    ) -> Vec<FieldDiff> {
-        let mut fields = vec![];
-        push(&mut fields, field::NAME, "Name", l.name.clone(), inc.name.clone());
-        push(&mut fields, field::HOST, "Host", l.host.clone(), inc.host.clone());
-        push(&mut fields, field::PORT, "Port", l.port.to_string(), inc.port.to_string());
-        push(
-            &mut fields,
-            field::USERNAME,
-            "Username",
-            text(l.username.as_deref()),
-            text(inc.username.as_deref()),
-        );
-        icon_field(&l.icon, &inc.icon, env, &mut fields, notes);
-        password_field(
-            field::PASSWORD,
-            "Password",
-            l.secret_id.as_deref(),
-            inc.secret_id.as_deref(),
-            self.payload,
-            env,
-            &mut fields,
-        );
-        fields
-    }
-
-    fn rdp_fields(
-        &self,
-        l: &RdpProfile,
-        inc: &RdpProfile,
-        env: &dyn Env,
-        notes: &mut Vec<String>,
-    ) -> Vec<FieldDiff> {
-        let mut fields = vec![];
-        push(&mut fields, field::NAME, "Name", l.name.clone(), inc.name.clone());
-        push(&mut fields, field::HOST, "Host", l.host.clone(), inc.host.clone());
-        push(&mut fields, field::PORT, "Port", l.port.to_string(), inc.port.to_string());
-        push(
-            &mut fields,
-            field::USERNAME,
-            "Username",
-            text(Some(&l.username)),
-            text(Some(&inc.username)),
-        );
-        push(
-            &mut fields,
-            field::DOMAIN,
-            "Domain",
-            text(l.domain.as_deref()),
-            text(inc.domain.as_deref()),
-        );
-        push(
-            &mut fields,
-            field::KEYBOARD_LAYOUT,
-            "Keyboard layout",
-            layout_label(l.keyboard_layout),
-            layout_label(inc.keyboard_layout),
-        );
-        let sound = |on: bool| if on { "On" } else { "Off" }.to_string();
-        push(&mut fields, field::AUDIO, "Sound", sound(l.audio), sound(inc.audio));
-        match missing_folder(inc, env) {
-            None => push(
-                &mut fields,
-                field::SHARED_FOLDER,
-                "Shared folder",
-                folder_label(l.shared_folder.as_ref()),
-                folder_label(inc.shared_folder.as_ref()),
-            ),
-            Some(path) if l.shared_folder.is_none() => {
-                notes.push(format!("Shared folder left out; not on this machine: {path}"));
+    // How a login reads, from the lists it belongs to.
+    fn login_label(login: &Login, logins: &[SavedLogin], keys: &[SshKey]) -> String {
+        match login {
+            Login::Saved(s) => match logins.iter().find(|l| l.id == s.login_id) {
+                Some(l) => format!("saved login {}", l.name),
+                None => "a saved login that isn't here".into(),
+            },
+            Login::Own(o) => {
+                let key_names: Vec<&str> = o
+                    .key_ids
+                    .iter()
+                    .filter_map(|id| keys.iter().find(|k| &k.id == id))
+                    .map(|k| file_name(&k.path))
+                    .collect();
+                if key_names.is_empty() {
+                    format!("{}, {}", o.username, auth(o.auth_method))
+                } else {
+                    format!("{}, {} {}", o.username, auth(o.auth_method), key_names.join(", "))
+                }
             }
-            Some(path) if l.shared_folder != inc.shared_folder => {
-                notes.push(format!("Kept your local shared folder; not on this machine: {path}"));
+        }
+    }
+
+    // The same login in local terms: references to incoming logins and keys follow their matches.
+    fn same_login(&self, local: &Login, incoming: &Login) -> bool {
+        let map = |m: &HashMap<String, String>, id: &str| m.get(id).cloned().unwrap_or_else(|| id.to_string());
+        match (local, incoming) {
+            (Login::Saved(l), Login::Saved(i)) => l.login_id == map(&self.login_map, &i.login_id),
+            (Login::Own(l), Login::Own(i)) => {
+                l.username == i.username
+                    && l.auth_method == i.auth_method
+                    && l.key_ids.len() == i.key_ids.len()
+                    && l.key_ids.iter().zip(&i.key_ids).all(|(a, b)| *a == map(&self.key_map, b))
             }
-            Some(_) => {}
+            _ => false,
+        }
+    }
+
+    fn login_field(&self, field: &str, label: &str, local: &Login, incoming: &Login, fields: &mut Vec<FieldDiff>) {
+        if !self.same_login(local, incoming) {
+            fields.push(FieldDiff {
+                field: field.into(),
+                label: label.into(),
+                local: Self::login_label(local, &self.local.logins, &self.local.keys),
+                incoming: Self::login_label(incoming, &self.payload.logins, &self.payload.keys),
+            });
+        }
+    }
+
+    fn password_field(
+        &self,
+        field: &str,
+        label: &str,
+        local: Option<&str>,
+        incoming: Option<&str>,
+        fields: &mut Vec<FieldDiff>,
+    ) {
+        let Some(value) = incoming.and_then(|id| self.payload.secrets.get(id)) else { return };
+        let current = local.and_then(|id| self.env.secret(id));
+        if current.as_ref().is_some_and(|c| c.as_slice() == value.as_bytes()) {
+            return;
+        }
+        fields.push(FieldDiff {
+            field: field.into(),
+            label: label.into(),
+            local: if current.is_some() { "••••".into() } else { "(none)".into() },
+            incoming: if current.is_some() { "•••• (different)".into() } else { "••••".into() },
+        });
+    }
+
+    fn icon_field(&self, local: &IconRef, incoming: &IconRef, fields: &mut Vec<FieldDiff>, notes: &mut Vec<String>) {
+        if let IconRef::Custom { path } = incoming {
+            if !self.env.icon_exists(path) {
+                if local != incoming {
+                    notes.push("Kept your icon; the custom image isn't on this machine".into());
+                }
+                return;
+            }
+        }
+        if local != incoming {
+            fields.push(FieldDiff {
+                field: field::ICON.into(),
+                label: "Icon".into(),
+                local: icon_label(local),
+                incoming: icon_label(incoming),
+            });
+        }
+    }
+
+    // Where an incoming reference lands locally: the matched item, one arriving in the bundle,
+    // an identical local id, or nowhere.
+    fn reference(map: &HashMap<String, String>, id: &str, in_bundle: bool, here: bool) -> Option<String> {
+        if let Some(mapped) = map.get(id) {
+            return Some(mapped.clone());
+        }
+        (in_bundle || here).then(|| id.to_string())
+    }
+
+    fn folder_ref(&self, id: Option<&str>, notes: &mut Vec<String>) -> Option<String> {
+        let id = id?;
+        let in_bundle = self.payload.folders.iter().any(|f| f.id == id);
+        let here = self.local.folders.iter().any(|f| f.id == id);
+        let found = Self::reference(&self.folder_map, id, in_bundle, here);
+        if found.is_none() {
+            notes.push("Its folder isn't in the export; it will have no folder".into());
+        }
+        found
+    }
+
+    fn tag_names(&self, ids: &[String], tags: &[Tag]) -> String {
+        let mut names: Vec<&str> = ids
+            .iter()
+            .filter_map(|id| tags.iter().find(|t| &t.id == id))
+            .map(|t| t.name.as_str())
+            .collect();
+        names.sort_unstable();
+        if names.is_empty() {
+            "(none)".into()
+        } else {
+            names.join(", ")
+        }
+    }
+
+    fn host_fields(&self, l: &Host, inc: &Host, notes: &mut Vec<String>) -> Vec<FieldDiff> {
+        let mut fields = vec![];
+        push(&mut fields, field::NAME, "Name", l.name.clone(), inc.name.clone());
+        push(&mut fields, field::ADDRESS, "Address", l.address.clone(), inc.address.clone());
+        let folder = self.folder_ref(inc.folder_id.as_deref(), notes);
+        if l.folder_id != folder {
+            let name = |f: Option<&str>| f.map(|f| self.folder_name(f)).unwrap_or_else(|| "(no folder)".into());
+            fields.push(FieldDiff {
+                field: field::FOLDER_ID.into(),
+                label: "Folder".into(),
+                local: name(l.folder_id.as_deref()),
+                incoming: name(folder.as_deref()),
+            });
+        }
+        let mut mapped: Vec<String> =
+            inc.tag_ids.iter().map(|t| self.tag_map.get(t).cloned().unwrap_or_else(|| t.clone())).collect();
+        mapped.sort();
+        let mut current = l.tag_ids.clone();
+        current.sort();
+        if mapped != current {
+            fields.push(FieldDiff {
+                field: field::TAGS.into(),
+                label: "Tags".into(),
+                local: self.tag_names(&l.tag_ids, &self.local.tags),
+                incoming: self.tag_names(&inc.tag_ids, &self.payload.tags),
+            });
+        }
+        self.icon_field(&l.icon, &inc.icon, &mut fields, notes);
+        push(&mut fields, field::COLOR, "Colour", text(l.color.as_deref()), text(inc.color.as_deref()));
+        fields
+    }
+
+    fn jump_ref(&self, inc: Option<&str>, unchanged: bool, notes: &mut Vec<String>) -> Option<String> {
+        let id = inc?;
+        if unchanged {
+            return Some(id.to_string());
+        }
+        let in_bundle = self.payload.hosts.iter().flat_map(|h| &h.connections).any(|c| c.id == id);
+        let here = self.local.hosts.iter().flat_map(|h| &h.connections).any(|c| c.id == id);
+        let found = Self::reference(&self.conn_map, id, in_bundle, here);
+        if found.is_none() {
+            notes.push("Its jump host isn't in the export; it will connect directly".into());
+        }
+        found
+    }
+
+    fn missing_share<'b>(&self, folder: Option<&'b SharedFolder>) -> Option<&'b str> {
+        folder.map(|f| f.path.as_str()).filter(|path| !self.env.dir_exists(path))
+    }
+
+    fn gateway_label(gateway: Option<&RdpGatewayConn>, logins: &[SavedLogin], keys: &[SshKey]) -> String {
+        match gateway {
+            None => "None".into(),
+            Some(g) => match &g.login {
+                None => format!("{}:{}, same login", g.host, g.port),
+                Some(l) => format!("{}:{}, {}", g.host, g.port, Self::login_label(l, logins, keys)),
+            },
+        }
+    }
+
+    fn connection_fields(&self, l: &Connection, inc: &Connection, notes: &mut Vec<String>) -> Vec<FieldDiff> {
+        let mut fields = vec![];
+        if !self.payload.legacy {
+            push(&mut fields, field::LABEL, "Label", text(l.label.as_deref()), text(inc.label.as_deref()));
         }
         push(
             &mut fields,
-            field::GATEWAY,
-            "RD Gateway",
-            gateway_label(l.gateway.as_ref()),
-            gateway_label(inc.gateway.as_ref()),
+            field::ADDRESS,
+            "Different address",
+            text(l.address.as_deref()),
+            text(inc.address.as_deref()),
         );
-        icon_field(&l.icon, &inc.icon, env, &mut fields, notes);
-        password_field(
-            field::PASSWORD,
-            "Password",
-            l.secret_id.as_deref(),
-            inc.secret_id.as_deref(),
-            self.payload,
-            env,
-            &mut fields,
-        );
-        password_field(
-            field::GATEWAY_PASSWORD,
-            "Gateway password",
-            gateway_secret(l.gateway.as_ref()),
-            gateway_secret(inc.gateway.as_ref()),
-            self.payload,
-            env,
-            &mut fields,
-        );
+        let port = |f: &mut Vec<FieldDiff>, a: u16, b: u16| push(f, field::PORT, "Port", a.to_string(), b.to_string());
+        match (&l.kind, &inc.kind) {
+            (ConnectionKind::Ssh(a), ConnectionKind::Ssh(b)) => {
+                port(&mut fields, a.port, b.port);
+                self.login_field(field::LOGIN, "Login", &a.login, &b.login, &mut fields);
+                self.password_field(field::PASSWORD, "Password", own_secret(&a.login), own_secret(&b.login), &mut fields);
+                // A jump host the import leaves alone is not a change, even if it points nowhere.
+                let jump = self.jump_ref(b.jump_host_id.as_deref(), a.jump_host_id == b.jump_host_id, notes);
+                if a.jump_host_id != jump {
+                    let name = |j: Option<&str>| text(j.map(|j| self.connection_name_by_id(j)).as_deref());
+                    fields.push(FieldDiff {
+                        field: field::JUMP_HOST_ID.into(),
+                        label: "Jump host".into(),
+                        local: name(a.jump_host_id.as_deref()),
+                        incoming: name(jump.as_deref()),
+                    });
+                }
+                let same_tunnels = a.tunnels.len() == b.tunnels.len()
+                    && a.tunnels.iter().zip(&b.tunnels).all(|(x, y)| same_tunnel(x, y));
+                if !same_tunnels {
+                    fields.push(FieldDiff {
+                        field: field::TUNNELS.into(),
+                        label: "Tunnels".into(),
+                        local: tunnels_label(&a.tunnels),
+                        incoming: tunnels_label(&b.tunnels),
+                    });
+                }
+                push(
+                    &mut fields,
+                    field::APPEARANCE,
+                    "Terminal look",
+                    appearance_label(&a.appearance),
+                    appearance_label(&b.appearance),
+                );
+            }
+            (ConnectionKind::Sftp(a), ConnectionKind::Sftp(b)) => {
+                let own_label = |c: &crate::store::hosts::SftpConn, logins: &[SavedLogin], keys: &[SshKey]| match &c.own {
+                    None => "Same login as SSH".to_string(),
+                    Some(o) => format!("port {}, {}", o.port, Self::login_label(&o.login, logins, keys)),
+                };
+                let same = match (&a.own, &b.own) {
+                    (None, None) => true,
+                    (Some(x), Some(y)) => x.port == y.port && self.same_login(&x.login, &y.login),
+                    _ => false,
+                };
+                if !same {
+                    fields.push(FieldDiff {
+                        field: field::SFTP_LOGIN.into(),
+                        label: "Login".into(),
+                        local: own_label(a, &self.local.logins, &self.local.keys),
+                        incoming: own_label(b, &self.payload.logins, &self.payload.keys),
+                    });
+                }
+                self.password_field(
+                    field::PASSWORD,
+                    "Password",
+                    a.own.as_ref().and_then(|o| own_secret(&o.login)),
+                    b.own.as_ref().and_then(|o| own_secret(&o.login)),
+                    &mut fields,
+                );
+                push(
+                    &mut fields,
+                    field::START_FOLDER,
+                    "Start folder",
+                    text(a.start_folder.as_deref()),
+                    text(b.start_folder.as_deref()),
+                );
+            }
+            (ConnectionKind::Ftp(a), ConnectionKind::Ftp(b)) => {
+                port(&mut fields, a.port, b.port);
+                self.login_field(field::LOGIN, "Login", &a.login, &b.login, &mut fields);
+                self.password_field(field::PASSWORD, "Password", own_secret(&a.login), own_secret(&b.login), &mut fields);
+                push(&mut fields, field::SECURE, "TLS (FTPS)", on_off(a.secure), on_off(b.secure));
+                push(
+                    &mut fields,
+                    field::ALLOW_INVALID_CERT,
+                    "Accept a certificate that doesn't check out",
+                    on_off(a.allow_invalid_cert),
+                    on_off(b.allow_invalid_cert),
+                );
+                push(
+                    &mut fields,
+                    field::IGNORE_HOSTNAME,
+                    "Ignore a certificate name mismatch",
+                    on_off(a.ignore_hostname),
+                    on_off(b.ignore_hostname),
+                );
+            }
+            (ConnectionKind::S3(a), ConnectionKind::S3(b)) => {
+                let port_text = |p: Option<u16>| text(p.map(|p| p.to_string()).as_deref());
+                push(&mut fields, field::PORT, "Port", port_text(a.port), port_text(b.port));
+                push(&mut fields, field::REGION, "Region", a.region.clone(), b.region.clone());
+                push(&mut fields, field::USE_TLS, "Use TLS", on_off(a.use_tls), on_off(b.use_tls));
+                push(&mut fields, field::PATH_STYLE, "Path-style addressing", on_off(a.path_style), on_off(b.path_style));
+                push(&mut fields, field::ACCESS_KEY_ID, "Access key ID", a.access_key_id.clone(), b.access_key_id.clone());
+                push(&mut fields, field::BUCKET, "Bucket", text(a.bucket.as_deref()), text(b.bucket.as_deref()));
+                self.password_field(
+                    field::PASSWORD,
+                    "Secret access key",
+                    a.secret_id.as_deref(),
+                    b.secret_id.as_deref(),
+                    &mut fields,
+                );
+            }
+            (ConnectionKind::Rdp(a), ConnectionKind::Rdp(b)) => {
+                port(&mut fields, a.port, b.port);
+                self.login_field(field::LOGIN, "Login", &a.login, &b.login, &mut fields);
+                self.password_field(field::PASSWORD, "Password", own_secret(&a.login), own_secret(&b.login), &mut fields);
+                push(&mut fields, field::DOMAIN, "Domain", text(a.domain.as_deref()), text(b.domain.as_deref()));
+                push(
+                    &mut fields,
+                    field::KEYBOARD_LAYOUT,
+                    "Keyboard layout",
+                    layout_label(a.keyboard_layout),
+                    layout_label(b.keyboard_layout),
+                );
+                push(&mut fields, field::AUDIO, "Sound", on_off(a.audio), on_off(b.audio));
+                match self.missing_share(b.shared_folder.as_ref()) {
+                    None => push(
+                        &mut fields,
+                        field::SHARED_FOLDER,
+                        "Shared folder",
+                        folder_label(a.shared_folder.as_ref()),
+                        folder_label(b.shared_folder.as_ref()),
+                    ),
+                    Some(path) if a.shared_folder.is_none() => {
+                        notes.push(format!("Shared folder left out; not on this machine: {path}"));
+                    }
+                    Some(path) if a.shared_folder != b.shared_folder => {
+                        notes.push(format!("Kept your local shared folder; not on this machine: {path}"));
+                    }
+                    Some(_) => {}
+                }
+                let same_gateway = match (&a.gateway, &b.gateway) {
+                    (None, None) => true,
+                    (Some(x), Some(y)) => {
+                        x.host == y.host
+                            && x.port == y.port
+                            && match (&x.login, &y.login) {
+                                (None, None) => true,
+                                (Some(xl), Some(yl)) => self.same_login(xl, yl),
+                                _ => false,
+                            }
+                    }
+                    _ => false,
+                };
+                if !same_gateway {
+                    fields.push(FieldDiff {
+                        field: field::GATEWAY.into(),
+                        label: "RD Gateway".into(),
+                        local: Self::gateway_label(a.gateway.as_ref(), &self.local.logins, &self.local.keys),
+                        incoming: Self::gateway_label(b.gateway.as_ref(), &self.payload.logins, &self.payload.keys),
+                    });
+                }
+                self.password_field(
+                    field::GATEWAY_PASSWORD,
+                    "Gateway password",
+                    gateway_secret(&a.gateway),
+                    gateway_secret(&b.gateway),
+                    &mut fields,
+                );
+            }
+            (ConnectionKind::Vnc(a), ConnectionKind::Vnc(b)) => {
+                port(&mut fields, a.port, b.port);
+                push(&mut fields, field::USERNAME, "User", text(a.username.as_deref()), text(b.username.as_deref()));
+                self.password_field(field::PASSWORD, "Password", a.secret_id.as_deref(), b.secret_id.as_deref(), &mut fields);
+            }
+            _ => {}
+        }
         fields
+    }
+
+    fn new_connection_notes(&self, inc: &Connection) -> Vec<String> {
+        let mut notes = vec![];
+        match &inc.kind {
+            ConnectionKind::Ssh(s) => {
+                self.jump_ref(s.jump_host_id.as_deref(), false, &mut notes);
+            }
+            ConnectionKind::Rdp(r) => {
+                if let Some(path) = self.missing_share(r.shared_folder.as_ref()) {
+                    notes.push(format!("Shared folder left out; not on this machine: {path}"));
+                }
+            }
+            _ => {}
+        }
+        notes
     }
 }
 
-// Where an incoming group reference lands locally: the matched group, a group arriving in the
-// bundle, an identical local id, or nowhere (the profile imports ungrouped).
-fn group_ref(
-    id: Option<&str>,
-    group_map: &HashMap<String, String>,
-    payload: &Payload,
-    local: &ProfileStore,
-    notes: &mut Vec<String>,
-) -> Option<String> {
-    let id = id?;
-    if let Some(mapped) = group_map.get(id) {
-        return Some(mapped.clone());
-    }
-    if payload.groups.iter().any(|g| g.id == id) || local.groups.iter().any(|g| g.id == id) {
-        return Some(id.to_string());
-    }
-    notes.push("Its group isn't in the export; it will be ungrouped".into());
-    None
-}
+pub fn plan(local: &HostsFile, payload: &PayloadV3, env: &dyn Env) -> Plan {
+    let mut c = Collector {
+        items: vec![],
+        unchanged: 0,
+        matches: HashMap::new(),
+        payload,
+        local,
+        env,
+        folder_map: HashMap::new(),
+        tag_map: HashMap::new(),
+        key_map: HashMap::new(),
+        login_map: HashMap::new(),
+        conn_map: HashMap::new(),
+    };
 
-pub fn plan(local: &ProfileStore, payload: &Payload, env: &dyn Env) -> Plan {
-    let mut c = Collector { items: vec![], unchanged: 0, matches: HashMap::new(), payload, local };
-
-    let mut groups: Vec<&Group> = payload.groups.iter().collect();
-    groups.sort_by_key(|g| group_depth(g, &payload.groups));
-    let (found, group_map) = match_items(
-        &local.groups,
-        &groups,
+    let mut folders: Vec<&Folder> = payload.folders.iter().collect();
+    folders.sort_by_key(|f| folder_depth(f, &payload.folders));
+    let (found, folder_map) = match_items(
+        &local.folders,
+        &folders,
         |l| (l.id.as_str(), l.name.as_str()),
-        |g| (g.id.as_str(), g.name.as_str()),
-        |l, g, map| {
-            let parent = g.parent_id.as_ref().map(|p| map.get(p).unwrap_or(p));
-            l.name == g.name && l.parent_id.as_ref() == parent
+        |f| (f.id.as_str(), f.name.as_str()),
+        |_, _| true,
+        |l, f, map| {
+            let parent = f.parent_id.as_ref().map(|p| map.get(p).unwrap_or(p));
+            l.name == f.name && l.parent_id.as_ref() == parent
         },
     );
-    for (g, found) in groups.into_iter().zip(found) {
-        let parent =
-            g.parent_id.as_ref().map(|p| group_map.get(p).cloned().unwrap_or_else(|| p.clone()));
-        let key = ItemKind::Group.key(&g.id);
-        let as_new = vec![];
+    c.folder_map = folder_map;
+    for (f, found) in folders.into_iter().zip(found) {
+        let key = ItemKind::Folder.key(&f.id);
         match found {
             Some(l) => {
                 let mut notes = vec![];
-                let fields = c.group_fields(l, g, parent.as_deref(), env, &mut notes);
-                c.matched(key, ItemKind::Group, &g.name, (&l.id, &l.name), fields, (notes, as_new));
+                let mut fields = vec![];
+                push(&mut fields, field::NAME, "Name", l.name.clone(), f.name.clone());
+                let parent = f.parent_id.as_ref().map(|p| c.folder_map.get(p).cloned().unwrap_or_else(|| p.clone()));
+                if l.parent_id != parent {
+                    let name = |p: Option<&str>| p.map(|p| c.folder_name(p)).unwrap_or_else(|| "(top level)".into());
+                    fields.push(FieldDiff {
+                        field: field::PARENT_ID.into(),
+                        label: "Parent folder".into(),
+                        local: name(l.parent_id.as_deref()),
+                        incoming: name(parent.as_deref()),
+                    });
+                }
+                c.icon_field(&l.icon, &f.icon, &mut fields, &mut notes);
+                c.matched(key, ItemKind::Folder, f.name.clone(), (&l.id, &l.name), fields, (notes, vec![]), None);
             }
-            None => c.added(key, ItemKind::Group, &g.name, as_new),
+            None => c.added(key, ItemKind::Folder, f.name.clone(), vec![], None),
         }
     }
 
-    let ssh: Vec<_> = payload
-        .profiles
-        .iter()
-        .map(|p| {
-            let mut p = p.clone();
-            normalize_keys(&mut p);
-            p
-        })
-        .collect();
-    let (found, profile_map) = match_items(
-        &local.profiles,
-        &ssh,
+    let (found, tag_map) = match_items(
+        &local.tags,
+        &payload.tags,
         |l| (l.id.as_str(), l.name.as_str()),
-        |p| (p.id.as_str(), p.name.as_str()),
-        |l, p, _| {
-            l.host.eq_ignore_ascii_case(&p.host) && l.port == p.port && l.username == p.username
-        },
+        |t| (t.id.as_str(), t.name.as_str()),
+        |_, _| true,
+        |l, t, _| l.name == t.name,
     );
-    for (inc, found) in ssh.iter().zip(found) {
-        let key = ItemKind::Ssh.key(&inc.id);
-        let mut notes = vec![];
-        let group = group_ref(inc.group_id.as_deref(), &group_map, payload, local, &mut notes);
-        let mut as_new = notes.clone();
-        let jump_ref = |same_jump: bool, notes: &mut Vec<String>| {
-            inc.jump_host_id.as_deref().and_then(|j| {
-                if same_jump {
-                    return Some(j.to_string());
+    c.tag_map = tag_map;
+    for (t, found) in payload.tags.iter().zip(found) {
+        let key = ItemKind::Tag.key(&t.id);
+        match found {
+            Some(l) => {
+                let mut fields = vec![];
+                push(&mut fields, field::NAME, "Name", l.name.clone(), t.name.clone());
+                push(&mut fields, field::COLOR, "Colour", l.color.clone(), t.color.clone());
+                push(&mut fields, field::SHOW_COLOR, "Show the colour", on_off(l.show_color), on_off(t.show_color));
+                push(
+                    &mut fields,
+                    field::ASK_BEFORE_CLOSE,
+                    "Ask before closing",
+                    on_off(l.ask_before_close),
+                    on_off(t.ask_before_close),
+                );
+                push(
+                    &mut fields,
+                    field::ASK_BEFORE_PASTE,
+                    "Ask before pasting several lines",
+                    on_off(l.ask_before_paste),
+                    on_off(t.ask_before_paste),
+                );
+                push(
+                    &mut fields,
+                    field::TERMINAL_COLORS,
+                    "Terminal colours",
+                    text(l.terminal_colors.as_deref()),
+                    text(t.terminal_colors.as_deref()),
+                );
+                c.matched(key, ItemKind::Tag, t.name.clone(), (&l.id, &l.name), fields, (vec![], vec![]), None);
+            }
+            None => c.added(key, ItemKind::Tag, t.name.clone(), vec![], None),
+        }
+    }
+
+    let (found, key_map) = match_items(
+        &local.keys,
+        &payload.keys,
+        |l| (l.id.as_str(), l.path.as_str()),
+        |k| (k.id.as_str(), k.path.as_str()),
+        |_, _| true,
+        |l, k, _| l.path == k.path,
+    );
+    c.key_map = key_map;
+    for (k, found) in payload.keys.iter().zip(found) {
+        let key = ItemKind::Key.key(&k.id);
+        let view = incoming_key(k, payload, env);
+        let name = file_name(&k.path).to_string();
+        let missing = (!view.usable).then(|| format!("Key file not on this machine: {}", k.path));
+        match found {
+            Some(l) => {
+                let mut fields = vec![];
+                let mut notes = vec![];
+                if view.usable {
+                    let here = env.read_file(&l.path).map(|b| digest(&b));
+                    let same = match (&here, &view.content) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => l.path == k.path,
+                    };
+                    if !same {
+                        fields.push(FieldDiff {
+                            field: field::KEY_FILE.into(),
+                            label: "Key file".into(),
+                            local: l.path.clone(),
+                            incoming: view.label.clone(),
+                        });
+                    }
+                } else if l.path != k.path {
+                    notes.push(format!("Kept your local key file; not on this machine: {}", k.path));
                 }
-                if let Some(mapped) = profile_map.get(j) {
-                    return Some(mapped.clone());
+                c.password_field(field::PASSPHRASE, "Passphrase", l.secret_id.as_deref(), k.secret_id.as_deref(), &mut fields);
+                let as_new = missing.into_iter().collect();
+                c.matched(key, ItemKind::Key, name, (&l.id, file_name(&l.path)), fields, (notes, as_new), None);
+            }
+            None => c.added(key, ItemKind::Key, name, missing.into_iter().collect(), None),
+        }
+    }
+
+    let (found, login_map) = match_items(
+        &local.logins,
+        &payload.logins,
+        |l| (l.id.as_str(), l.name.as_str()),
+        |l| (l.id.as_str(), l.name.as_str()),
+        |_, _| true,
+        |l, i, _| l.name == i.name && l.username == i.username,
+    );
+    c.login_map = login_map;
+    for (inc, found) in payload.logins.iter().zip(found) {
+        let key = ItemKind::Login.key(&inc.id);
+        match found {
+            Some(l) => {
+                let mut fields = vec![];
+                push(&mut fields, field::NAME, "Name", l.name.clone(), inc.name.clone());
+                push(&mut fields, field::USERNAME, "User", l.username.clone(), inc.username.clone());
+                push(&mut fields, field::AUTH_METHOD, "Sign in with", auth(l.auth_method), auth(inc.auth_method));
+                let mapped: Vec<String> =
+                    inc.key_ids.iter().map(|k| c.key_map.get(k).cloned().unwrap_or_else(|| k.clone())).collect();
+                if mapped != l.key_ids {
+                    let names = |ids: &[String], keys: &[SshKey]| {
+                        let n: Vec<&str> = ids
+                            .iter()
+                            .filter_map(|id| keys.iter().find(|k| &k.id == id))
+                            .map(|k| file_name(&k.path))
+                            .collect();
+                        if n.is_empty() { "(none)".to_string() } else { n.join(", ") }
+                    };
+                    fields.push(FieldDiff {
+                        field: field::KEYS.into(),
+                        label: "Keys".into(),
+                        local: names(&l.key_ids, &local.keys),
+                        incoming: names(&inc.key_ids, &payload.keys),
+                    });
                 }
-                if payload.profiles.iter().any(|p| p.id == j)
-                    || local.profiles.iter().any(|p| p.id == j)
-                {
-                    return Some(j.to_string());
-                }
-                notes.push("Its jump host isn't in the export; it will connect directly".into());
-                None
-            })
-        };
-        jump_ref(false, &mut as_new);
-        keys_field(None, &inc.keys, payload, env, &mut vec![], &mut as_new);
+                c.password_field(field::PASSWORD, "Password", l.secret_id.as_deref(), inc.secret_id.as_deref(), &mut fields);
+                c.matched(key, ItemKind::Login, inc.name.clone(), (&l.id, &l.name), fields, (vec![], vec![]), None);
+            }
+            None => c.added(key, ItemKind::Login, inc.name.clone(), vec![], None),
+        }
+    }
+
+    let local_hosts: Vec<&Host> = local.hosts.iter().filter(|h| h.id != THIS_COMPUTER).collect();
+    let incoming_hosts: Vec<&Host> = payload.hosts.iter().filter(|h| h.id != THIS_COMPUTER).collect();
+    let (found, _) = match_items(
+        &local_hosts,
+        &incoming_hosts,
+        |l| (l.id.as_str(), l.name.as_str()),
+        |h| (h.id.as_str(), h.name.as_str()),
+        |_, _| true,
+        |l, h, _| address_key(&l.address) == address_key(&h.address),
+    );
+    let pairs: Vec<(&Host, Option<&Host>)> = incoming_hosts.iter().copied().zip(found.into_iter().map(|f| f.copied())).collect();
+
+    // Connections first, so a jump host anywhere in the bundle maps to the connection it matched.
+    let mut conn_found: HashMap<&str, Vec<Option<&Connection>>> = HashMap::new();
+    for (inc, found) in &pairs {
+        if let Some(l) = found {
+            let (matched, map) = match_items(
+                &l.connections,
+                &inc.connections,
+                |c| (c.id.as_str(), c.label.as_deref().unwrap_or("")),
+                |c| (c.id.as_str(), c.label.as_deref().unwrap_or("")),
+                |a, b| same_type(&a.kind, &b.kind),
+                |a, b, _| {
+                    same_type(&a.kind, &b.kind)
+                        && port_and_user(&a.kind, &local.logins) == port_and_user(&b.kind, &payload.logins)
+                },
+            );
+            c.conn_map.extend(map);
+            conn_found.insert(&inc.id, matched);
+        }
+    }
+
+    for (inc, found) in pairs {
+        let key = ItemKind::Host.key(&inc.id);
+        let mut as_new = vec![];
+        c.folder_ref(inc.folder_id.as_deref(), &mut as_new);
         if matches!(&inc.icon, IconRef::Custom { path } if !env.icon_exists(path)) {
             as_new.push("The custom icon isn't on this machine; using the default icon".into());
         }
         match found {
             Some(l) => {
-                // A jump host the import leaves alone is not a change, even if it points nowhere.
-                let jump = jump_ref(l.jump_host_id == inc.jump_host_id, &mut notes);
-                let fields =
-                    c.ssh_fields(l, inc, group.as_deref(), jump.as_deref(), env, &mut notes);
-                c.matched(key, ItemKind::Ssh, &inc.name, (&l.id, &l.name), fields, (notes, as_new));
-            }
-            None => c.added(key, ItemKind::Ssh, &inc.name, as_new),
-        }
-    }
-
-    let (found, _) = match_items(
-        &local.sftp_profiles,
-        &payload.sftp_profiles,
-        |l| (l.id.as_str(), l.name.as_str()),
-        |p| (p.id.as_str(), p.name.as_str()),
-        |l, p, _| {
-            l.host.eq_ignore_ascii_case(&p.host) && l.port == p.port && l.username == p.username
-        },
-    );
-    for (inc, found) in payload.sftp_profiles.iter().zip(found) {
-        let key = ItemKind::Sftp.key(&inc.id);
-        let mut as_new = vec![];
-        keys_field(None, &inc.keys, payload, env, &mut vec![], &mut as_new);
-        match found {
-            Some(l) => {
                 let mut notes = vec![];
-                let fields = c.sftp_fields(l, inc, env, &mut notes);
-                c.matched(
-                    key,
-                    ItemKind::Sftp,
-                    &inc.name,
-                    (&l.id, &l.name),
-                    fields,
-                    (notes, as_new),
-                );
+                let fields = if payload.legacy { vec![] } else { c.host_fields(l, inc, &mut notes) };
+                let matched = conn_found.remove(inc.id.as_str()).unwrap_or_default();
+                let before = c.items.len();
+                let mut conn_items = vec![];
+                for (ic, lc) in inc.connections.iter().zip(matched) {
+                    let ckey = ItemKind::Connection.key(&ic.id);
+                    let name = connection_name(inc, ic, &payload.logins);
+                    match lc {
+                        Some(lc) => {
+                            let mut cnotes = vec![];
+                            let cfields = c.connection_fields(lc, ic, &mut cnotes);
+                            let cas_new = c.new_connection_notes(ic);
+                            let lname = connection_name(l, lc, &local.logins);
+                            c.matched(
+                                ckey,
+                                ItemKind::Connection,
+                                name,
+                                (&lc.id, &lname),
+                                cfields,
+                                (cnotes, cas_new),
+                                Some(key.clone()),
+                            );
+                        }
+                        None => {
+                            let notes = c.new_connection_notes(ic);
+                            c.added(ckey, ItemKind::Connection, name, notes, Some(key.clone()));
+                        }
+                    }
+                }
+                conn_items.extend(c.items.drain(before..));
+                c.matches.insert(key.clone(), l.id.clone());
+                if !fields.is_empty() {
+                    c.items.push(ReviewItem {
+                        key,
+                        kind: ItemKind::Host,
+                        name: inc.name.clone(),
+                        status: ItemStatus::Conflict,
+                        matched: Some(LocalMatch { id: l.id.clone(), name: l.name.clone() }),
+                        fields,
+                        notes,
+                        notes_as_new: as_new,
+                        parent: None,
+                    });
+                } else if conn_items.is_empty() {
+                    c.unchanged += 1;
+                }
+                // Changed connections on an otherwise unchanged host come without a host item.
+                c.items.extend(conn_items);
             }
-            None => c.added(key, ItemKind::Sftp, &inc.name, as_new),
-        }
-    }
-
-    let (found, _) = match_items(
-        &local.s3_profiles,
-        &payload.s3_profiles,
-        |l| (l.id.as_str(), l.name.as_str()),
-        |p| (p.id.as_str(), p.name.as_str()),
-        |l, p, _| {
-            l.endpoint.eq_ignore_ascii_case(&p.endpoint)
-                && l.port == p.port
-                && l.bucket == p.bucket
-                && l.access_key_id == p.access_key_id
-        },
-    );
-    for (inc, found) in payload.s3_profiles.iter().zip(found) {
-        let key = ItemKind::S3.key(&inc.id);
-        let as_new = vec![];
-        match found {
-            Some(l) => {
-                let mut notes = vec![];
-                let fields = c.s3_fields(l, inc, env, &mut notes);
-                c.matched(key, ItemKind::S3, &inc.name, (&l.id, &l.name), fields, (notes, as_new));
+            None => {
+                c.added(key.clone(), ItemKind::Host, inc.name.clone(), as_new, None);
+                for ic in &inc.connections {
+                    let notes = c.new_connection_notes(ic);
+                    let name = connection_name(inc, ic, &payload.logins);
+                    c.added(ItemKind::Connection.key(&ic.id), ItemKind::Connection, name, notes, Some(key.clone()));
+                }
             }
-            None => c.added(key, ItemKind::S3, &inc.name, as_new),
-        }
-    }
-
-    let (found, _) = match_items(
-        &local.vnc_profiles,
-        &payload.vnc_profiles,
-        |l| (l.id.as_str(), l.name.as_str()),
-        |p| (p.id.as_str(), p.name.as_str()),
-        |l, p, _| {
-            l.host.eq_ignore_ascii_case(&p.host)
-                && l.port == p.port
-                && l.username.as_deref().unwrap_or("") == p.username.as_deref().unwrap_or("")
-        },
-    );
-    for (inc, found) in payload.vnc_profiles.iter().zip(found) {
-        let key = ItemKind::Vnc.key(&inc.id);
-        let as_new = vec![];
-        match found {
-            Some(l) => {
-                let mut notes = vec![];
-                let fields = c.vnc_fields(l, inc, env, &mut notes);
-                c.matched(key, ItemKind::Vnc, &inc.name, (&l.id, &l.name), fields, (notes, as_new));
-            }
-            None => c.added(key, ItemKind::Vnc, &inc.name, as_new),
-        }
-    }
-
-    let (found, _) = match_items(
-        &local.rdp_profiles,
-        &payload.rdp_profiles,
-        |l| (l.id.as_str(), l.name.as_str()),
-        |p| (p.id.as_str(), p.name.as_str()),
-        |l, p, _| {
-            l.host.eq_ignore_ascii_case(&p.host)
-                && l.port == p.port
-                && l.username == p.username
-                && l.domain.as_deref().unwrap_or("") == p.domain.as_deref().unwrap_or("")
-        },
-    );
-    for (inc, found) in payload.rdp_profiles.iter().zip(found) {
-        let key = ItemKind::Rdp.key(&inc.id);
-        let mut as_new = vec![];
-        if let Some(path) = missing_folder(inc, env) {
-            as_new.push(format!("Shared folder left out; not on this machine: {path}"));
-        }
-        match found {
-            Some(l) => {
-                let mut notes = vec![];
-                let fields = c.rdp_fields(l, inc, env, &mut notes);
-                c.matched(key, ItemKind::Rdp, &inc.name, (&l.id, &l.name), fields, (notes, as_new));
-            }
-            None => c.added(key, ItemKind::Rdp, &inc.name, as_new),
         }
     }
 
@@ -972,25 +1120,36 @@ pub fn plan(local: &ProfileStore, payload: &Payload, env: &dyn Env) -> Plan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::model::{
-        AuthMethod, Group, IconRef, Profile, ProfileKey, RdpGateway, RdpProfile, SftpProfile,
-        SharedFolder, VncProfile,
-    };
+    use crate::store::hosts::fixtures::{conn, file, folder, host, own, ssh, vnc};
+    use crate::store::hosts::{OwnLogin, RdpConn, SshConn, VncConn};
+    use crate::store::model::{Group, Profile, ProfileKey};
     use crate::transfer::bundle::KeyFile;
     use crate::transfer::MapEnv;
     use zeroize::Zeroizing;
 
-    fn profile(id: &str, name: &str, host: &str) -> Profile {
+    fn rows(item: &ReviewItem) -> Vec<(&str, &str, &str)> {
+        item.fields.iter().map(|f| (f.field.as_str(), f.local.as_str(), f.incoming.as_str())).collect()
+    }
+
+    fn payload(hosts: Vec<Host>) -> PayloadV3 {
+        PayloadV3 { hosts, ..Default::default() }
+    }
+
+    fn item<'a>(plan: &'a Plan, key: &str) -> &'a ReviewItem {
+        plan.items.iter().find(|i| i.key == key).unwrap_or_else(|| panic!("no item {key}"))
+    }
+
+    fn profile(id: &str, name: &str, host: &str, port: u16) -> Profile {
         Profile {
             id: id.into(),
             name: name.into(),
-            group_id: None,
+            group_id: Some("g1".into()),
             host: host.into(),
-            port: 22,
+            port,
             username: "me".into(),
-            auth_method: AuthMethod::Password,
+            auth_method: AuthMethod::Key,
             key_path: None,
-            keys: vec![],
+            keys: vec![ProfileKey { path: "/k/id".into(), secret_id: None }],
             secret_id: None,
             icon: IconRef::default(),
             order: 0,
@@ -1001,662 +1160,332 @@ mod tests {
         }
     }
 
-    fn local(profiles: Vec<Profile>) -> ProfileStore {
-        ProfileStore {
+    #[test]
+    fn a_v2_bundle_of_this_machine_is_unchanged() {
+        let mut jumped = profile("p2", "web", "10.0.0.2", 22);
+        jumped.jump_host_id = Some("p1".into());
+        let old = ProfileStore {
             version: 1,
-            groups: vec![],
-            profiles,
-            sftp_profiles: vec![],
-            s3_profiles: vec![],
-            vnc_profiles: vec![],
-            rdp_profiles: vec![],
-            unknown: Default::default(),
-        }
-    }
-
-    fn incoming(profiles: Vec<Profile>) -> Payload {
-        Payload { profiles, ..Default::default() }
-    }
-
-    fn vnc(id: &str, name: &str, host: &str) -> VncProfile {
-        VncProfile {
-            id: id.into(),
-            name: name.into(),
-            host: host.into(),
-            port: 5900,
-            username: None,
-            secret_id: None,
-            icon: IconRef::default(),
-            order: 0,
-            extra: Default::default(),
-        }
-    }
-
-    fn rdp(id: &str, name: &str, host: &str) -> RdpProfile {
-        RdpProfile {
-            id: id.into(),
-            name: name.into(),
-            host: host.into(),
-            port: 3389,
-            username: "faye".into(),
-            domain: None,
-            secret_id: None,
-            keyboard_layout: None,
-            audio: true,
-            shared_folder: None,
-            gateway: None,
-            icon: IconRef::default(),
-            order: 0,
-            extra: Default::default(),
-        }
-    }
-
-    fn gateway(same_login: bool, secret: Option<&str>) -> RdpGateway {
-        RdpGateway {
-            host: "gw.corp".into(),
-            port: 443,
-            same_login,
-            username: if same_login { "" } else { "CORP\\gw" }.into(),
-            secret_id: secret.map(Into::into),
-            extra: Default::default(),
-        }
-    }
-
-    fn folder(path: &str, name: &str) -> SharedFolder {
-        SharedFolder { path: path.into(), name: name.into(), extra: Default::default() }
-    }
-
-    fn rows(item: &ReviewItem) -> Vec<(&str, &str, &str, &str)> {
-        item.fields
-            .iter()
-            .map(|f| (f.field.as_str(), f.label.as_str(), f.local.as_str(), f.incoming.as_str()))
-            .collect()
-    }
-
-    fn local_rdp(rdp_profiles: Vec<RdpProfile>) -> ProfileStore {
-        ProfileStore { rdp_profiles, ..local(vec![]) }
-    }
-
-    fn incoming_rdp(rdp_profiles: Vec<RdpProfile>) -> Payload {
-        Payload { rdp_profiles, ..Default::default() }
-    }
-
-    fn local_vnc(vnc_profiles: Vec<VncProfile>) -> ProfileStore {
-        ProfileStore { vnc_profiles, ..local(vec![]) }
-    }
-
-    fn incoming_vnc(vnc_profiles: Vec<VncProfile>) -> Payload {
-        Payload { vnc_profiles, ..Default::default() }
-    }
-
-    #[test]
-    fn reimporting_own_export_is_all_unchanged() {
-        let l = local(vec![profile("a", "web", "h1"), profile("b", "db", "h2")]);
-        let p = plan(&l, &incoming(l.profiles.clone()), &MapEnv::default());
-        assert!(p.items.is_empty());
-        assert_eq!(p.unchanged, 2);
-    }
-
-    #[test]
-    fn different_id_same_server_is_a_conflict_with_only_changed_fields() {
-        let l = local(vec![profile("pc-id", "web", "h1")]);
-        let mut mac = profile("mac-id", "web (mac)", "h1");
-        mac.auth_method = AuthMethod::Agent;
-        let p = plan(&l, &incoming(vec![mac]), &MapEnv::default());
-        assert_eq!(p.items.len(), 1);
-        let item = &p.items[0];
-        assert_eq!(item.status, ItemStatus::Conflict);
-        assert_eq!(item.matched.as_ref().unwrap().id, "pc-id");
-        let fields: Vec<_> = item.fields.iter().map(|f| f.field.as_str()).collect();
-        assert_eq!(fields, ["name", "authMethod"]);
-        assert_eq!(p.matches.get("ssh:mac-id").map(String::as_str), Some("pc-id"));
-    }
-
-    #[test]
-    fn ambiguous_same_server_without_name_match_is_new() {
-        let l = local(vec![profile("a", "test", "h1"), profile("b", "test", "h1")]);
-        let p = plan(&l, &incoming(vec![profile("x", "prod", "h1")]), &MapEnv::default());
-        assert_eq!(p.items[0].status, ItemStatus::New);
-    }
-
-    #[test]
-    fn ambiguous_same_server_prefers_the_same_name() {
-        let l = local(vec![profile("a", "test", "h1"), profile("b", "prod", "h1")]);
-        let mut inc = profile("x", "prod", "h1");
-        inc.auth_method = AuthMethod::Agent;
-        let p = plan(&l, &incoming(vec![inc]), &MapEnv::default());
-        assert_eq!(p.items[0].matched.as_ref().unwrap().id, "b");
-    }
-
-    #[test]
-    fn missing_key_path_keeps_local_keys_with_a_note() {
-        let mut pc = profile("pc", "web", "h1");
-        pc.auth_method = AuthMethod::Key;
-        pc.keys = vec![ProfileKey { path: "C:\\keys\\id".into(), secret_id: None }];
-        let mut mac = pc.clone();
-        mac.id = "mac".into();
-        mac.keys = vec![ProfileKey { path: "/Users/me/.ssh/id".into(), secret_id: None }];
+            groups: vec![Group {
+                id: "g1".into(),
+                name: "Work".into(),
+                parent_id: None,
+                icon: IconRef::default(),
+                order: 0,
+                extra: Default::default(),
+            }],
+            profiles: vec![profile("p1", "bastion", "bastion.corp", 22), jumped],
+            vnc_profiles: vec![crate::store::model::VncProfile {
+                id: "v1".into(),
+                name: "web screen".into(),
+                host: "10.0.0.2".into(),
+                port: 5900,
+                username: None,
+                secret_id: None,
+                icon: IconRef::default(),
+                order: 0,
+                extra: Default::default(),
+            }],
+            ..Default::default()
+        };
+        let (local, _) = migrate(&old, &[]);
+        let bundle = LegacyPayload {
+            groups: old.groups.clone(),
+            profiles: old.profiles.clone(),
+            vnc_profiles: old.vnc_profiles.clone(),
+            ..Default::default()
+        };
         let mut env = MapEnv::default();
-        env.files.insert("C:\\keys\\id".into(), b"PC".to_vec());
-        let p = plan(&local(vec![pc]), &incoming(vec![mac]), &env);
-        assert!(p.items.is_empty(), "keys kept, nothing else differs");
-        assert_eq!(p.unchanged, 1);
+        env.files.insert("/k/id".into(), b"KEY".to_vec());
+        let planned = plan(&local, &from_legacy(bundle), &env);
+        assert!(planned.items.is_empty(), "{:?}", planned.items);
+        let expected = local.hosts.len() + local.folders.len() + local.keys.len();
+        assert_eq!(planned.unchanged as usize, expected);
     }
 
+    // 0.5.0 exported per kind, so a v2 bundle can hold only some of a host's profiles: the host's
+    // name, folder and the connection labels then come out different without anything having changed.
     #[test]
-    fn missing_key_note_depends_on_whether_the_match_is_added_as_new() {
-        let mut pc = profile("pc", "web", "h1");
-        pc.auth_method = AuthMethod::Key;
-        pc.keys = vec![ProfileKey { path: "C:\\keys\\id".into(), secret_id: None }];
-        let mut mac = pc.clone();
-        mac.id = "mac".into();
-        mac.name = "web (mac)".into();
-        mac.keys = vec![ProfileKey { path: "/Users/me/.ssh/id".into(), secret_id: None }];
-        let mut env = MapEnv::default();
-        env.files.insert("C:\\keys\\id".into(), b"PC".to_vec());
-        let p = plan(&local(vec![pc]), &incoming(vec![mac]), &env);
-        assert_eq!(p.items[0].status, ItemStatus::Conflict);
-        assert_eq!(
-            p.items[0].notes,
-            ["Kept your local keys; not on this machine: /Users/me/.ssh/id"]
-        );
-        assert_eq!(p.items[0].notes_as_new, ["Key file not on this machine: /Users/me/.ssh/id"]);
-    }
-
-    #[test]
-    fn matched_sftp_profile_gets_the_new_item_key_note_too() {
-        let pc = SftpProfile {
-            id: "pc".into(),
-            name: "files".into(),
-            host: "h1".into(),
-            port: 22,
-            username: "me".into(),
-            auth_method: AuthMethod::Key,
-            keys: vec![ProfileKey { path: "C:\\keys\\id".into(), secret_id: None }],
-            secret_id: None,
-            icon: IconRef::default(),
-            order: 0,
-            extra: Default::default(),
+    fn a_partial_v2_bundle_of_this_machine_is_unchanged() {
+        let old = ProfileStore {
+            version: 1,
+            groups: vec![Group {
+                id: "g1".into(),
+                name: "Work".into(),
+                parent_id: None,
+                icon: IconRef::default(),
+                order: 0,
+                extra: Default::default(),
+            }],
+            profiles: vec![profile("p1", "nas", "nas.local", 22)],
+            vnc_profiles: vec![crate::store::model::VncProfile {
+                id: "v1".into(),
+                name: "nas desk".into(),
+                host: "nas.local".into(),
+                port: 5900,
+                username: None,
+                secret_id: None,
+                icon: IconRef::default(),
+                order: 0,
+                extra: Default::default(),
+            }],
+            ..Default::default()
         };
-        let mac = SftpProfile {
-            id: "mac".into(),
-            name: "files (mac)".into(),
-            keys: vec![ProfileKey { path: "/Users/me/.ssh/id".into(), secret_id: None }],
-            ..pc.clone()
-        };
-        let l = ProfileStore { sftp_profiles: vec![pc], ..local(vec![]) };
-        let payload = Payload { sftp_profiles: vec![mac], ..Default::default() };
-        let p = plan(&l, &payload, &MapEnv::default());
-        assert_eq!(
-            p.items[0].notes,
-            ["Kept your local keys; not on this machine: /Users/me/.ssh/id"]
-        );
-        assert_eq!(p.items[0].notes_as_new, ["Key file not on this machine: /Users/me/.ssh/id"]);
+        let (local, _) = migrate(&old, &[]);
+        let bundle = LegacyPayload { vnc_profiles: old.vnc_profiles.clone(), ..Default::default() };
+        let planned = plan(&local, &from_legacy(bundle), &MapEnv::default());
+        assert!(planned.items.is_empty(), "{:?}", planned.items);
     }
 
     #[test]
-    fn unmatched_item_has_the_same_notes_either_way() {
-        let mut mac = profile("mac", "web", "h9");
-        mac.group_id = Some("nowhere".into());
-        mac.keys = vec![ProfileKey { path: "/Users/me/.ssh/id".into(), secret_id: None }];
-        let p = plan(&local(vec![]), &incoming(vec![mac]), &MapEnv::default());
-        assert_eq!(p.items[0].status, ItemStatus::New);
-        assert_eq!(p.items[0].notes.len(), 2);
-        assert_eq!(p.items[0].notes_as_new, p.items[0].notes);
-    }
-
-    #[test]
-    fn embedded_key_with_different_content_is_a_keys_row() {
-        let mut pc = profile("pc", "web", "h1");
-        pc.auth_method = AuthMethod::Key;
-        pc.keys = vec![ProfileKey { path: "C:\\keys\\id".into(), secret_id: None }];
-        let mut mac = pc.clone();
-        mac.id = "mac".into();
-        mac.keys = vec![ProfileKey { path: "/Users/me/.ssh/id".into(), secret_id: None }];
-        let mut payload = incoming(vec![mac.clone()]);
-        payload.key_files.insert(
-            "/Users/me/.ssh/id".into(),
-            KeyFile { file_name: "id".into(), data: Zeroizing::new(STANDARD.encode(b"MAC")) },
-        );
-        let mut env = MapEnv::default();
-        env.files.insert("C:\\keys\\id".into(), b"PC".to_vec());
-        let p = plan(&local(vec![pc.clone()]), &payload, &env);
-        assert_eq!(p.items[0].fields[0].field, "keys");
-
-        // Same bytes under a different path: not a change.
-        env.files.insert("C:\\keys\\id".into(), b"MAC".to_vec());
-        assert!(plan(&local(vec![pc]), &payload, &env).items.is_empty());
-    }
-
-    #[test]
-    fn password_row_only_when_bundle_carries_a_different_one() {
-        let mut pc = profile("pc", "web", "h1");
-        pc.secret_id = Some("local-sec".into());
-        let mut mac = pc.clone();
-        mac.id = "mac".into();
-        mac.secret_id = Some("mac-sec".into());
-        let mut env = MapEnv::default();
-        env.secrets.insert("local-sec".into(), b"same".to_vec());
-
-        assert!(plan(&local(vec![pc.clone()]), &incoming(vec![mac.clone()]), &env)
-            .items
-            .is_empty());
-
-        let mut payload = incoming(vec![mac]);
-        payload.secrets.insert("mac-sec".into(), Zeroizing::new("same".into()));
-        assert!(plan(&local(vec![pc.clone()]), &payload, &env).items.is_empty());
-
-        payload.secrets.insert("mac-sec".into(), Zeroizing::new("other".into()));
-        let p = plan(&local(vec![pc.clone()]), &payload, &env);
-        let row = &p.items[0].fields[0];
-        assert_eq!(row.field, "password");
-        assert_eq!((row.local.as_str(), row.incoming.as_str()), ("••••", "•••• (different)"));
-
-        pc.secret_id = None;
-        let p = plan(&local(vec![pc]), &payload, &env);
-        let row = &p.items[0].fields[0];
-        assert_eq!((row.local.as_str(), row.incoming.as_str()), ("(none)", "••••"));
-    }
-
-    #[test]
-    fn groups_match_by_name_and_references_are_remapped() {
-        let mut l = local(vec![profile("pc", "web", "h1")]);
-        l.groups = vec![Group {
-            id: "g-pc".into(),
-            name: "Prod".into(),
-            parent_id: None,
-            icon: IconRef::default(),
-            order: 0,
-            extra: Default::default(),
-        }];
-        l.profiles[0].group_id = Some("g-pc".into());
-        let mut mac = profile("mac", "web", "h1");
-        mac.group_id = Some("g-mac".into());
-        let mut payload = incoming(vec![mac]);
-        payload.groups = vec![Group {
-            id: "g-mac".into(),
-            name: "Prod".into(),
-            parent_id: None,
-            icon: IconRef::default(),
-            order: 3,
-            extra: Default::default(),
-        }];
-        let p = plan(&l, &payload, &MapEnv::default());
-        assert!(p.items.is_empty());
-        assert_eq!(p.unchanged, 2);
-        assert_eq!(p.matches.get("group:g-mac").map(String::as_str), Some("g-pc"));
-    }
-
-    #[test]
-    fn dangling_group_is_noted_and_ungrouped() {
-        let mut mac = profile("mac", "web", "h9");
-        mac.group_id = Some("nowhere".into());
-        let p = plan(&local(vec![]), &incoming(vec![mac]), &MapEnv::default());
-        assert_eq!(p.items[0].status, ItemStatus::New);
-        assert!(p.items[0].notes.iter().any(|n| n.contains("ungrouped")));
-    }
-
-    #[test]
-    fn tunnel_ids_alone_are_not_a_change() {
-        use crate::store::model::{Tunnel, TunnelKind};
-        let t = |id: &str| Tunnel {
-            id: id.into(),
-            kind: TunnelKind::Local,
-            bind_host: "127.0.0.1".into(),
-            bind_port: 8080,
-            target_host: Some("db".into()),
-            target_port: Some(5432),
-            auto_start: false,
-        };
-        let mut pc = profile("pc", "web", "h1");
-        pc.tunnels = vec![t("t1")];
-        let mut mac = pc.clone();
-        mac.id = "mac".into();
-        mac.tunnels = vec![t("t2")];
-        assert!(plan(&local(vec![pc]), &incoming(vec![mac]), &MapEnv::default()).items.is_empty());
-    }
-
-    #[test]
-    fn tunnels_that_differ_only_in_auto_start_read_differently() {
-        use crate::store::model::{Tunnel, TunnelKind};
-        let t = |auto_start: bool| Tunnel {
-            id: "t".into(),
-            kind: TunnelKind::Local,
-            bind_host: "127.0.0.1".into(),
-            bind_port: 8080,
-            target_host: Some("db".into()),
-            target_port: Some(5432),
-            auto_start,
-        };
-        let mut pc = profile("pc", "web", "h1");
-        pc.tunnels = vec![t(false)];
-        let mut mac = pc.clone();
-        mac.id = "mac".into();
-        mac.tunnels = vec![t(true)];
-        let p = plan(&local(vec![pc]), &incoming(vec![mac]), &MapEnv::default());
-        let row = &p.items[0].fields[0];
-        assert_eq!(row.field, "tunnels");
-        assert_eq!(row.local, "L 127.0.0.1:8080 -> db:5432");
-        assert_eq!(row.incoming, "L 127.0.0.1:8080 -> db:5432 (auto-start)");
-    }
-
-    #[test]
-    fn id_match_is_not_lost_to_an_earlier_same_server_item() {
-        let l = local(vec![profile("x", "web", "h1")]);
-        let bundle = incoming(vec![profile("a", "web", "h1"), profile("x", "web", "h1")]);
-        let p = plan(&l, &bundle, &MapEnv::default());
-        assert_eq!(p.matches.get("ssh:x").map(String::as_str), Some("x"));
-        assert_eq!(p.items.len(), 1);
-        assert_eq!(p.items[0].key, "ssh:a");
-        assert_eq!(p.items[0].status, ItemStatus::New);
-        for item in p.items.iter().filter(|i| i.status == ItemStatus::New) {
-            assert!(l.profiles.iter().all(|lp| ItemKind::Ssh.key(&lp.id) != item.key));
-        }
-    }
-
-    #[test]
-    fn same_name_match_is_not_lost_to_an_earlier_same_server_item() {
-        let l = local(vec![profile("pc", "web", "h1")]);
-        let bundle = incoming(vec![profile("m1", "foo", "h1"), profile("m2", "web", "h1")]);
-        let p = plan(&l, &bundle, &MapEnv::default());
-        assert_eq!(p.matches.get("ssh:m2").map(String::as_str), Some("pc"));
-        assert_eq!(p.items.len(), 1);
-        assert_eq!(p.items[0].key, "ssh:m1");
-        assert_eq!(p.items[0].status, ItemStatus::New);
-    }
-
-    #[test]
-    fn nested_groups_match_through_the_mapped_parent() {
-        let group = |id: &str, name: &str, parent: Option<&str>| Group {
-            id: id.into(),
-            name: name.into(),
-            parent_id: parent.map(Into::into),
-            icon: IconRef::default(),
-            order: 0,
-            extra: Default::default(),
-        };
-        let mut l = local(vec![]);
-        l.groups = vec![group("pc-prod", "Prod", None), group("pc-web", "Web", Some("pc-prod"))];
-        let mut payload = incoming(vec![]);
-        payload.groups =
-            vec![group("mac-web", "Web", Some("mac-prod")), group("mac-prod", "Prod", None)];
-        let p = plan(&l, &payload, &MapEnv::default());
-        assert!(p.items.is_empty());
-        assert_eq!(p.unchanged, 2);
-        assert_eq!(p.matches.get("group:mac-prod").map(String::as_str), Some("pc-prod"));
-        assert_eq!(p.matches.get("group:mac-web").map(String::as_str), Some("pc-web"));
-    }
-
-    #[test]
-    fn untouched_dangling_jump_host_is_not_a_change() {
-        let mut pc = profile("pc", "web", "h1");
-        pc.jump_host_id = Some("gone".into());
-        let l = local(vec![pc.clone()]);
-        let p = plan(&l, &incoming(vec![pc.clone()]), &MapEnv::default());
-        assert!(p.items.is_empty());
-        assert_eq!(p.unchanged, 1);
-
-        pc.name = "web 2".into();
-        let p = plan(&l, &incoming(vec![pc]), &MapEnv::default());
-        let fields: Vec<_> = p.items[0].fields.iter().map(|f| f.field.as_str()).collect();
-        assert_eq!(fields, ["name"]);
-        assert!(p.items[0].notes.is_empty());
-        assert_eq!(
-            p.items[0].notes_as_new,
-            ["Its jump host isn't in the export; it will connect directly"]
-        );
-    }
-
-    #[test]
-    fn vnc_profile_is_new_until_it_is_here_and_then_unchanged() {
-        let desk = VncProfile { username: Some("faye".into()), ..vnc("v1", "desk", "h1") };
-        let payload = incoming_vnc(vec![desk.clone()]);
-
-        let p = plan(&local_vnc(vec![]), &payload, &MapEnv::default());
-        assert_eq!(p.unchanged, 0);
-        assert_eq!(p.items.len(), 1);
-        let item = &p.items[0];
-        assert_eq!(
-            (item.key.as_str(), item.kind, item.name.as_str(), item.status),
-            ("vnc:v1", ItemKind::Vnc, "desk", ItemStatus::New)
-        );
-        assert!(item.matched.is_none() && item.fields.is_empty());
-        assert!(item.notes.is_empty() && item.notes_as_new.is_empty());
-
-        let p = plan(&local_vnc(vec![desk]), &payload, &MapEnv::default());
-        assert!(p.items.is_empty());
-        assert_eq!(p.unchanged, 1);
-        assert_eq!(p.matches.get("vnc:v1").map(String::as_str), Some("v1"));
-    }
-
-    #[test]
-    fn changed_vnc_profile_lists_its_fields_in_order() {
-        let pc = VncProfile { secret_id: Some("local-sec".into()), ..vnc("v1", "desk", "h1") };
-        let mac = VncProfile {
-            name: "desk (mac)".into(),
-            host: "h2".into(),
-            port: 5901,
-            username: Some("faye".into()),
-            secret_id: Some("mac-sec".into()),
-            icon: IconRef::Builtin { name: "monitor".into() },
-            ..pc.clone()
-        };
-        let mut payload = incoming_vnc(vec![mac]);
-        payload.secrets.insert("mac-sec".into(), Zeroizing::new("other".into()));
-        let mut env = MapEnv::default();
-        env.secrets.insert("local-sec".into(), b"mine".to_vec());
-
-        let p = plan(&local_vnc(vec![pc]), &payload, &env);
-        let item = &p.items[0];
-        assert_eq!((item.kind, item.status), (ItemKind::Vnc, ItemStatus::Conflict));
-        assert_eq!(item.matched, Some(LocalMatch { id: "v1".into(), name: "desk".into() }));
-        let rows: Vec<_> = item
-            .fields
-            .iter()
-            .map(|f| (f.field.as_str(), f.label.as_str(), f.local.as_str(), f.incoming.as_str()))
-            .collect();
-        assert_eq!(
-            rows,
-            [
-                ("name", "Name", "desk", "desk (mac)"),
-                ("host", "Host", "h1", "h2"),
-                ("port", "Port", "5900", "5901"),
-                ("username", "Username", "(none)", "faye"),
-                ("icon", "Icon", "server", "monitor"),
-                ("password", "Password", "••••", "•••• (different)"),
-            ]
-        );
-    }
-
-    #[test]
-    fn vnc_password_row_only_when_bundle_carries_a_different_one() {
-        let mut pc = vnc("pc", "desk", "h1");
-        let mut payload = incoming_vnc(vec![pc.clone()]);
-        let mut env = MapEnv::default();
-        env.secrets.insert("local-sec".into(), b"same".to_vec());
-        let unchanged = |pc: &VncProfile, payload: &Payload| {
-            let p = plan(&local_vnc(vec![pc.clone()]), payload, &env);
-            p.items.is_empty() && p.unchanged == 1
-        };
-
-        assert!(unchanged(&pc, &payload), "neither side has a password");
-        pc.secret_id = Some("local-sec".into());
-        assert!(unchanged(&pc, &payload), "only this machine has one");
-        payload.vnc_profiles[0].secret_id = Some("mac-sec".into());
-        assert!(unchanged(&pc, &payload), "exported without passwords");
-        payload.secrets.insert("mac-sec".into(), Zeroizing::new("same".into()));
-        assert!(unchanged(&pc, &payload), "the same password");
-
-        payload.secrets.insert("mac-sec".into(), Zeroizing::new("other".into()));
-        let p = plan(&local_vnc(vec![pc.clone()]), &payload, &env);
-        let row = &p.items[0].fields[0];
-        assert_eq!(row.field, "password");
-        assert_eq!((row.local.as_str(), row.incoming.as_str()), ("••••", "•••• (different)"));
-
-        pc.secret_id = None;
-        let p = plan(&local_vnc(vec![pc]), &payload, &env);
-        let row = &p.items[0].fields[0];
-        assert_eq!((row.local.as_str(), row.incoming.as_str()), ("(none)", "••••"));
-    }
-
-    #[test]
-    fn vnc_profile_with_another_id_matches_on_the_same_server() {
-        let l = local_vnc(vec![
-            VncProfile { username: Some(String::new()), ..vnc("pc", "desk", "Desk.Lan") },
-            VncProfile { username: Some("Faye".into()), ..vnc("pc2", "tower", "tower.lan") },
+    fn hosts_match_by_address_and_name_then_address() {
+        let local = file(vec![
+            host("l1", "nas", "nas.local", vec![vnc("lc1", None)]),
+            host("l2", "other", "nas.local", vec![vnc("lc2", None)]),
+            host("l3", "box", "10.0.0.9", vec![vnc("lc3", None)]),
         ]);
-        let mac = vnc("mac", "desk (mac)", "desk.lan");
+        let incoming = payload(vec![
+            host("i1", "nas", "NAS.local.", vec![vnc("ic1", None)]),
+            host("i2", "renamed", "10.0.0.9", vec![vnc("ic2", None)]),
+        ]);
+        let planned = plan(&local, &incoming, &MapEnv::default());
+        assert_eq!(planned.matches.get("host:i1").map(String::as_str), Some("l1"));
+        assert_eq!(planned.matches.get("host:i2").map(String::as_str), Some("l3"));
+        assert_eq!(rows(item(&planned, "host:i2")), [("name", "box", "renamed")]);
+    }
 
-        let p = plan(&l, &incoming_vnc(vec![mac.clone()]), &MapEnv::default());
-        assert_eq!(p.matches.get("vnc:mac").map(String::as_str), Some("pc"));
-        assert_eq!(p.items[0].matched.as_ref().unwrap().id, "pc");
-        let fields: Vec<_> = p.items[0].fields.iter().map(|f| f.field.as_str()).collect();
-        assert_eq!(fields, ["name", "host"]);
+    #[test]
+    fn an_ambiguous_address_without_a_name_match_is_new() {
+        let local = file(vec![
+            host("l1", "a", "nas.local", vec![]),
+            host("l2", "b", "nas.local", vec![]),
+        ]);
+        let planned = plan(&local, &payload(vec![host("i1", "c", "nas.local", vec![])]), &MapEnv::default());
+        assert_eq!(item(&planned, "host:i1").status, ItemStatus::New);
+    }
 
-        for other in [
-            VncProfile { port: 5901, ..mac.clone() },
-            VncProfile { username: Some("faye".into()), ..mac.clone() },
-            VncProfile { host: "desk2.lan".into(), ..mac.clone() },
-            VncProfile { username: Some("faye".into()), ..vnc("mac2", "tower", "tower.lan") },
-        ] {
-            let p = plan(&l, &incoming_vnc(vec![other.clone()]), &MapEnv::default());
-            assert_eq!(p.items[0].status, ItemStatus::New, "{other:?}");
-            assert!(p.matches.is_empty(), "{other:?}");
+    #[test]
+    fn connections_match_by_type_port_and_user_inside_a_host() {
+        let local = file(vec![host(
+            "l",
+            "nas",
+            "nas.local",
+            vec![ssh("ls-admin", 22, own("admin", None)), ssh("ls-root", 22, own("root", None))],
+        )]);
+        let incoming = payload(vec![host(
+            "i",
+            "nas",
+            "nas.local",
+            vec![ssh("is-root", 22, own("root", None)), ssh("is-deploy", 22, own("deploy", None))],
+        )]);
+        let planned = plan(&local, &incoming, &MapEnv::default());
+        assert_eq!(planned.matches.get("conn:is-root").map(String::as_str), Some("ls-root"));
+        let new = item(&planned, "conn:is-deploy");
+        assert_eq!(new.status, ItemStatus::New);
+        assert_eq!(new.parent.as_deref(), Some("host:i"));
+        assert_eq!(new.name, "nas · SSH · deploy");
+        assert!(planned.items.iter().all(|i| i.key != "host:i"));
+    }
+
+    #[test]
+    fn an_id_match_never_crosses_connection_types() {
+        let local = file(vec![host("h", "nas", "nas.local", vec![vnc("same", None)])]);
+        let incoming = payload(vec![host("h", "nas", "nas.local", vec![ssh("same", 22, own("u", None))])]);
+        let planned = plan(&local, &incoming, &MapEnv::default());
+        assert_eq!(item(&planned, "conn:same").status, ItemStatus::New);
+    }
+
+    #[test]
+    fn a_new_hosts_connections_are_new_children() {
+        let incoming = payload(vec![host(
+            "i",
+            "nas",
+            "nas.local",
+            vec![ssh("c1", 22, own("admin", None)), vnc("c2", None)],
+        )]);
+        let planned = plan(&file(vec![]), &incoming, &MapEnv::default());
+        let keys: Vec<_> = planned.items.iter().map(|i| (i.key.as_str(), i.parent.as_deref())).collect();
+        assert_eq!(keys, [("host:i", None), ("conn:c1", Some("host:i")), ("conn:c2", Some("host:i"))]);
+    }
+
+    #[test]
+    fn incoming_this_computer_is_skipped() {
+        let incoming = payload(vec![host(THIS_COMPUTER, "This computer", "", vec![])]);
+        let planned = plan(&file(vec![]), &incoming, &MapEnv::default());
+        assert!(planned.items.is_empty());
+        assert_eq!(planned.unchanged, 0);
+    }
+
+    #[test]
+    fn a_changed_connection_lists_its_fields() {
+        let mut lc = vnc("c", Some("old"));
+        lc.label = Some("desk".into());
+        let local = file(vec![host("h", "nas", "nas.local", vec![lc])]);
+        let mut ic = vnc("c", Some("new"));
+        if let ConnectionKind::Vnc(VncConn { port, username, .. }) = &mut ic.kind {
+            *port = 5901;
+            *username = Some("faye".into());
         }
-    }
-
-    #[test]
-    fn vnc_profile_matches_by_id_first_then_by_name_on_a_shared_server() {
-        let l = local_vnc(vec![vnc("x", "desk", "h1")]);
-        let moved = incoming_vnc(vec![vnc("a", "desk", "h1"), vnc("x", "desk", "h2")]);
-        let p = plan(&l, &moved, &MapEnv::default());
-        assert_eq!(p.matches.get("vnc:x").map(String::as_str), Some("x"));
-        assert_eq!(p.matches.get("vnc:a"), None);
-        let items: Vec<_> = p.items.iter().map(|i| (i.key.as_str(), i.status)).collect();
-        assert_eq!(items, [("vnc:a", ItemStatus::New), ("vnc:x", ItemStatus::Conflict)]);
-
-        let l = local_vnc(vec![vnc("a", "test", "h1"), vnc("b", "prod", "h1")]);
-        let p = plan(&l, &incoming_vnc(vec![vnc("x", "prod", "h1")]), &MapEnv::default());
-        assert_eq!(p.matches.get("vnc:x").map(String::as_str), Some("b"));
-        assert_eq!(p.unchanged, 1);
-        let p = plan(&l, &incoming_vnc(vec![vnc("x", "staging", "h1")]), &MapEnv::default());
-        assert_eq!(p.items[0].status, ItemStatus::New);
-    }
-
-    #[test]
-    fn vnc_custom_icon_is_offered_only_when_it_is_on_this_machine() {
-        let path = "icons/6f1c2a9e-8d0b-4c57-9a3e-2b7d5e41f0c8.png";
-        let pc = vnc("v1", "desk", "h1");
-        let mac = VncProfile {
-            name: "desk (mac)".into(),
-            icon: IconRef::Custom { path: path.into() },
-            ..pc.clone()
-        };
-        let (l, payload) = (local_vnc(vec![pc]), incoming_vnc(vec![mac]));
-
-        let p = plan(&l, &payload, &MapEnv::default());
-        let fields: Vec<_> = p.items[0].fields.iter().map(|f| f.field.as_str()).collect();
-        assert_eq!(fields, ["name"]);
-        assert_eq!(p.items[0].notes, ["Kept your icon; the custom image isn't on this machine"]);
-
+        let mut incoming = payload(vec![host("h", "nas", "nas.local", vec![ic])]);
+        incoming.secrets.insert("new".into(), Zeroizing::new("pw".into()));
         let mut env = MapEnv::default();
-        env.icons.insert(path.into());
-        let p = plan(&l, &payload, &env);
-        let row = &p.items[0].fields[1];
+        env.secrets.insert("old".into(), b"other".to_vec());
+        let planned = plan(&local, &incoming, &env);
         assert_eq!(
-            (row.field.as_str(), row.local.as_str(), row.incoming.as_str()),
-            ("icon", "server", "custom image")
-        );
-        assert!(p.items[0].notes.is_empty());
-    }
-
-    #[test]
-    fn rdp_profile_is_new_until_it_is_here_and_then_unchanged() {
-        let office = RdpProfile { domain: Some("CORP".into()), ..rdp("r1", "office", "h1") };
-        let payload = incoming_rdp(vec![office.clone()]);
-
-        let p = plan(&local_rdp(vec![]), &payload, &MapEnv::default());
-        assert_eq!(p.unchanged, 0);
-        assert_eq!(p.items.len(), 1);
-        let item = &p.items[0];
-        assert_eq!(
-            (item.key.as_str(), item.kind, item.name.as_str(), item.status),
-            ("rdp:r1", ItemKind::Rdp, "office", ItemStatus::New)
-        );
-        assert!(item.matched.is_none() && item.fields.is_empty());
-        assert!(item.notes.is_empty() && item.notes_as_new.is_empty());
-
-        let p = plan(&local_rdp(vec![office]), &payload, &MapEnv::default());
-        assert!(p.items.is_empty());
-        assert_eq!(p.unchanged, 1);
-        assert_eq!(p.matches.get("rdp:r1").map(String::as_str), Some("r1"));
-    }
-
-    #[test]
-    fn changed_rdp_profile_lists_its_fields_in_order() {
-        let pc = RdpProfile { secret_id: Some("local-sec".into()), ..rdp("r1", "office", "h1") };
-        let mac = RdpProfile {
-            name: "office (mac)".into(),
-            host: "h2".into(),
-            port: 3390,
-            username: "CORP\\faye".into(),
-            domain: Some("CORP".into()),
-            keyboard_layout: Some(0x407),
-            secret_id: Some("mac-sec".into()),
-            icon: IconRef::Builtin { name: "monitor".into() },
-            ..pc.clone()
-        };
-        let mut payload = incoming_rdp(vec![mac]);
-        payload.secrets.insert("mac-sec".into(), Zeroizing::new("other".into()));
-        let mut env = MapEnv::default();
-        env.secrets.insert("local-sec".into(), b"mine".to_vec());
-
-        let p = plan(&local_rdp(vec![pc]), &payload, &env);
-        let item = &p.items[0];
-        assert_eq!((item.kind, item.status), (ItemKind::Rdp, ItemStatus::Conflict));
-        assert_eq!(item.matched, Some(LocalMatch { id: "r1".into(), name: "office".into() }));
-        let rows: Vec<_> = item
-            .fields
-            .iter()
-            .map(|f| (f.field.as_str(), f.label.as_str(), f.local.as_str(), f.incoming.as_str()))
-            .collect();
-        assert_eq!(
-            rows,
+            rows(item(&planned, "conn:c")),
             [
-                ("name", "Name", "office", "office (mac)"),
-                ("host", "Host", "h1", "h2"),
-                ("port", "Port", "3389", "3390"),
-                ("username", "Username", "faye", "CORP\\faye"),
-                ("domain", "Domain", "(none)", "CORP"),
-                ("keyboardLayout", "Keyboard layout", "Automatic", "German"),
-                ("icon", "Icon", "server", "monitor"),
-                ("password", "Password", "••••", "•••• (different)"),
+                ("label", "desk", "(none)"),
+                ("port", "5900", "5901"),
+                ("username", "(none)", "faye"),
+                ("password", "••••", "•••• (different)"),
             ]
         );
     }
 
     #[test]
-    fn rdp_keyboard_layout_is_shown_by_name() {
-        let pc = rdp("r1", "office", "h1");
-        let shown = |layout: Option<u32>, other: Option<u32>| {
-            let l = local_rdp(vec![RdpProfile { keyboard_layout: layout, ..pc.clone() }]);
-            let inc = RdpProfile { keyboard_layout: other, ..pc.clone() };
-            let p = plan(&l, &incoming_rdp(vec![inc]), &MapEnv::default());
-            let row = &p.items[0].fields[0];
-            assert_eq!(row.field, "keyboardLayout");
-            (row.local.clone(), row.incoming.clone())
-        };
-        assert_eq!(shown(None, Some(0x407)), ("Automatic".into(), "German".into()));
-        assert_eq!(
-            shown(Some(0x20409), Some(0x40d)),
-            ("English (US International)".into(), "0x40d".into())
+    fn password_row_only_when_the_bundle_carries_a_different_one() {
+        let local = file(vec![host("h", "nas", "a", vec![ssh("c", 22, own("u", Some("old")))])]);
+        let incoming = payload(vec![host("h", "nas", "a", vec![ssh("c", 22, own("u", Some("x")))])]);
+        let mut env = MapEnv::default();
+        env.secrets.insert("old".into(), b"pw".to_vec());
+        assert!(plan(&local, &incoming, &env).items.is_empty());
+
+        let mut same = incoming.clone();
+        same.secrets.insert("x".into(), Zeroizing::new("pw".into()));
+        assert!(plan(&local, &same, &env).items.is_empty());
+
+        let mut other = incoming;
+        other.secrets.insert("x".into(), Zeroizing::new("new".into()));
+        assert_eq!(rows(item(&plan(&local, &other, &env), "conn:c")), [("password", "••••", "•••• (different)")]);
+    }
+
+    #[test]
+    fn a_missing_key_file_keeps_the_local_one_with_a_note() {
+        let mut local = file(vec![]);
+        local.keys.push(SshKey { id: "k".into(), path: "C:\\keys\\id".into(), secret_id: None, extra: Default::default() });
+        let mut incoming = payload(vec![]);
+        incoming.keys.push(SshKey { id: "k".into(), path: "/Users/me/.ssh/id".into(), secret_id: None, extra: Default::default() });
+        let mut env = MapEnv::default();
+        env.files.insert("C:\\keys\\id".into(), b"KEY".to_vec());
+        let planned = plan(&local, &incoming, &env);
+        assert!(planned.items.is_empty());
+        assert_eq!(planned.unchanged, 1);
+
+        let mut with_note = incoming.clone();
+        with_note.keys[0].secret_id = Some("pp".into());
+        with_note.secrets.insert("pp".into(), Zeroizing::new("pass".into()));
+        let planned = plan(&local, &with_note, &env);
+        let key = item(&planned, "key:k");
+        assert_eq!(rows(key), [("passphrase", "(none)", "••••")]);
+        assert_eq!(key.notes, ["Kept your local key file; not on this machine: /Users/me/.ssh/id"]);
+        assert_eq!(key.notes_as_new, ["Key file not on this machine: /Users/me/.ssh/id"]);
+    }
+
+    #[test]
+    fn an_embedded_key_with_other_content_is_a_key_file_row() {
+        let mut local = file(vec![]);
+        local.keys.push(SshKey { id: "k".into(), path: "/k/id".into(), secret_id: None, extra: Default::default() });
+        let mut incoming = payload(vec![]);
+        incoming.keys = local.keys.clone();
+        incoming.key_files.insert(
+            "/k/id".into(),
+            KeyFile { file_name: "id".into(), data: Zeroizing::new(STANDARD.encode(b"NEW")) },
         );
-        assert_eq!(shown(Some(0x10407), None), ("0x10407".into(), "Automatic".into()));
+        let mut env = MapEnv::default();
+        env.files.insert("/k/id".into(), b"OLD".to_vec());
+        assert_eq!(rows(item(&plan(&local, &incoming, &env), "key:k")), [("keyFile", "/k/id", "/k/id (in export)")]);
+    }
+
+    #[test]
+    fn a_login_compares_keys_through_their_matches() {
+        let key_login = |key: &str| {
+            Login::Own(OwnLogin { username: "u".into(), auth_method: AuthMethod::Key, key_ids: vec![key.into()], secret_id: None, extra: Default::default() })
+        };
+        let mut local = file(vec![host("h", "nas", "a", vec![ssh("c", 22, key_login("lk"))])]);
+        local.keys.push(SshKey { id: "lk".into(), path: "/k/id".into(), secret_id: None, extra: Default::default() });
+        let mut incoming = payload(vec![host("h", "nas", "a", vec![ssh("c", 22, key_login("ik"))])]);
+        incoming.keys.push(SshKey { id: "ik".into(), path: "/k/id".into(), secret_id: None, extra: Default::default() });
+        let mut env = MapEnv::default();
+        env.files.insert("/k/id".into(), b"KEY".to_vec());
+        let planned = plan(&local, &incoming, &env);
+        assert!(planned.items.is_empty(), "{:?}", planned.items);
+    }
+
+    #[test]
+    fn folders_match_by_name_and_references_are_remapped() {
+        let mut lh = host("h", "nas", "a", vec![]);
+        lh.folder_id = Some("lf".into());
+        let mut local = file(vec![lh]);
+        local.folders = vec![folder("lf", None)];
+        local.folders[0].name = "Homelab".into();
+        let mut ih = host("h", "nas", "a", vec![]);
+        ih.folder_id = Some("if".into());
+        let mut incoming = payload(vec![ih]);
+        incoming.folders = vec![folder("if", None)];
+        incoming.folders[0].name = "Homelab".into();
+        let planned = plan(&local, &incoming, &MapEnv::default());
+        assert!(planned.items.is_empty(), "{:?}", planned.items);
+        assert_eq!(planned.matches.get("folder:if").map(String::as_str), Some("lf"));
+    }
+
+    #[test]
+    fn a_folder_not_in_the_export_is_noted() {
+        let mut ih = host("h", "nas", "a", vec![]);
+        ih.folder_id = Some("gone".into());
+        let planned = plan(&file(vec![]), &payload(vec![ih]), &MapEnv::default());
+        assert_eq!(item(&planned, "host:h").notes, ["Its folder isn't in the export; it will have no folder"]);
+    }
+
+    #[test]
+    fn a_jump_host_maps_to_the_connection_it_matched() {
+        let jumping = |id: &str, jump: &str| {
+            let mut c = ssh(id, 22, own("u", None));
+            if let ConnectionKind::Ssh(SshConn { jump_host_id, .. }) = &mut c.kind {
+                *jump_host_id = Some(jump.into());
+            }
+            c
+        };
+        let local = file(vec![
+            host("lb", "bastion", "bastion.corp", vec![ssh("l-bastion", 22, own("u", None))]),
+            host("lt", "target", "10.0.0.9", vec![jumping("l-target", "l-bastion")]),
+        ]);
+        let incoming = payload(vec![
+            host("ib", "bastion", "bastion.corp", vec![ssh("i-bastion", 22, own("u", None))]),
+            host("it", "target", "10.0.0.9", vec![jumping("i-target", "i-bastion")]),
+        ]);
+        let planned = plan(&local, &incoming, &MapEnv::default());
+        assert!(planned.items.is_empty(), "{:?}", planned.items);
+    }
+
+    #[test]
+    fn rdp_shared_folder_not_on_this_machine_is_never_offered() {
+        let rdp = |id: &str, share: Option<&str>| {
+            conn(
+                id,
+                ConnectionKind::Rdp(RdpConn {
+                    port: 3389,
+                    login: own("u", None),
+                    domain: None,
+                    keyboard_layout: None,
+                    audio: true,
+                    shared_folder: share.map(|p| SharedFolder { path: p.into(), name: "s".into(), extra: Default::default() }),
+                    gateway: None,
+                    extra: Default::default(),
+                }),
+            )
+        };
+        let local = file(vec![host("h", "office", "a", vec![rdp("c", None)])]);
+        let incoming = payload(vec![host("h", "office", "a", vec![rdp("c", Some("/Users/me/share"))])]);
+        let planned = plan(&local, &incoming, &MapEnv::default());
+        assert!(planned.items.is_empty());
+
+        let new = plan(&file(vec![]), &incoming, &MapEnv::default());
+        assert_eq!(item(&new, "conn:c").notes, ["Shared folder left out; not on this machine: /Users/me/share"]);
     }
 
     #[test]
     fn rdp_layout_names_are_the_ones_the_profile_dialog_offers() {
-        let dialog = include_str!("../../../src/features/remote/RdpProfileDialog.tsx");
+        let dialog = include_str!("../../../src/lib/rdpLayouts.ts");
         let table = dialog.split("const LAYOUTS").nth(1).unwrap().split("\n]\n").next().unwrap();
         let offered: Vec<(u32, &str)> = table
             .lines()
@@ -1668,358 +1497,5 @@ mod tests {
             .collect();
         assert_eq!(offered.len(), 24);
         assert_eq!(offered, RDP_LAYOUTS);
-    }
-
-    #[test]
-    fn rdp_password_row_only_when_bundle_carries_a_different_one() {
-        let mut pc = rdp("pc", "office", "h1");
-        let mut payload = incoming_rdp(vec![pc.clone()]);
-        let mut env = MapEnv::default();
-        env.secrets.insert("local-sec".into(), b"same".to_vec());
-        let unchanged = |pc: &RdpProfile, payload: &Payload| {
-            let p = plan(&local_rdp(vec![pc.clone()]), payload, &env);
-            p.items.is_empty() && p.unchanged == 1
-        };
-
-        assert!(unchanged(&pc, &payload), "neither side has a password");
-        pc.secret_id = Some("local-sec".into());
-        assert!(unchanged(&pc, &payload), "only this machine has one");
-        payload.rdp_profiles[0].secret_id = Some("mac-sec".into());
-        assert!(unchanged(&pc, &payload), "exported without passwords");
-        payload.secrets.insert("mac-sec".into(), Zeroizing::new("same".into()));
-        assert!(unchanged(&pc, &payload), "the same password");
-
-        payload.secrets.insert("mac-sec".into(), Zeroizing::new("other".into()));
-        let p = plan(&local_rdp(vec![pc.clone()]), &payload, &env);
-        let row = &p.items[0].fields[0];
-        assert_eq!(row.field, "password");
-        assert_eq!((row.local.as_str(), row.incoming.as_str()), ("••••", "•••• (different)"));
-
-        pc.secret_id = None;
-        let p = plan(&local_rdp(vec![pc]), &payload, &env);
-        let row = &p.items[0].fields[0];
-        assert_eq!((row.local.as_str(), row.incoming.as_str()), ("(none)", "••••"));
-    }
-
-    #[test]
-    fn rdp_profile_with_another_id_matches_on_the_same_server() {
-        let l = local_rdp(vec![
-            RdpProfile { domain: Some(String::new()), ..rdp("pc", "office", "Office.Lan") },
-            RdpProfile { domain: Some("CORP".into()), ..rdp("pc2", "tower", "tower.lan") },
-        ]);
-        let mac = rdp("mac", "office (mac)", "office.lan");
-
-        let p = plan(&l, &incoming_rdp(vec![mac.clone()]), &MapEnv::default());
-        assert_eq!(p.matches.get("rdp:mac").map(String::as_str), Some("pc"));
-        assert_eq!(p.items[0].matched.as_ref().unwrap().id, "pc");
-        let fields: Vec<_> = p.items[0].fields.iter().map(|f| f.field.as_str()).collect();
-        assert_eq!(fields, ["name", "host"]);
-
-        let tower = RdpProfile { domain: Some("CORP".into()), ..rdp("mac2", "tower", "tower.lan") };
-        let p = plan(&l, &incoming_rdp(vec![tower]), &MapEnv::default());
-        assert_eq!(p.matches.get("rdp:mac2").map(String::as_str), Some("pc2"));
-
-        for other in [
-            RdpProfile { port: 3390, ..mac.clone() },
-            RdpProfile { username: "Faye".into(), ..mac.clone() },
-            RdpProfile { domain: Some("CORP".into()), ..mac.clone() },
-            RdpProfile { host: "office2.lan".into(), ..mac.clone() },
-            rdp("mac3", "tower", "tower.lan"),
-        ] {
-            let p = plan(&l, &incoming_rdp(vec![other.clone()]), &MapEnv::default());
-            assert_eq!(p.items[0].status, ItemStatus::New, "{other:?}");
-            assert!(p.matches.is_empty(), "{other:?}");
-        }
-    }
-
-    #[test]
-    fn rdp_profile_matches_by_id_first_then_by_name_on_a_shared_server() {
-        let l = local_rdp(vec![rdp("x", "office", "h1")]);
-        let moved = incoming_rdp(vec![rdp("a", "office", "h1"), rdp("x", "office", "h2")]);
-        let p = plan(&l, &moved, &MapEnv::default());
-        assert_eq!(p.matches.get("rdp:x").map(String::as_str), Some("x"));
-        assert_eq!(p.matches.get("rdp:a"), None);
-        let items: Vec<_> = p.items.iter().map(|i| (i.key.as_str(), i.status)).collect();
-        assert_eq!(items, [("rdp:a", ItemStatus::New), ("rdp:x", ItemStatus::Conflict)]);
-
-        let l = local_rdp(vec![rdp("a", "test", "h1"), rdp("b", "prod", "h1")]);
-        let p = plan(&l, &incoming_rdp(vec![rdp("x", "prod", "h1")]), &MapEnv::default());
-        assert_eq!(p.matches.get("rdp:x").map(String::as_str), Some("b"));
-        assert_eq!(p.unchanged, 1);
-        let p = plan(&l, &incoming_rdp(vec![rdp("x", "staging", "h1")]), &MapEnv::default());
-        assert_eq!(p.items[0].status, ItemStatus::New);
-    }
-
-    #[test]
-    fn rdp_custom_icon_is_offered_only_when_it_is_on_this_machine() {
-        let path = "icons/6f1c2a9e-8d0b-4c57-9a3e-2b7d5e41f0c8.png";
-        let pc = rdp("r1", "office", "h1");
-        let mac = RdpProfile {
-            name: "office (mac)".into(),
-            icon: IconRef::Custom { path: path.into() },
-            ..pc.clone()
-        };
-        let (l, payload) = (local_rdp(vec![pc]), incoming_rdp(vec![mac]));
-
-        let p = plan(&l, &payload, &MapEnv::default());
-        let fields: Vec<_> = p.items[0].fields.iter().map(|f| f.field.as_str()).collect();
-        assert_eq!(fields, ["name"]);
-        assert_eq!(p.items[0].notes, ["Kept your icon; the custom image isn't on this machine"]);
-
-        let mut env = MapEnv::default();
-        env.icons.insert(path.into());
-        let p = plan(&l, &payload, &env);
-        let row = &p.items[0].fields[1];
-        assert_eq!(
-            (row.field.as_str(), row.local.as_str(), row.incoming.as_str()),
-            ("icon", "server", "custom image")
-        );
-        assert!(p.items[0].notes.is_empty());
-    }
-
-    #[test]
-    fn changed_rdp_profile_lists_sound_folder_and_gateway_in_order() {
-        let pc = RdpProfile {
-            secret_id: Some("local-sec".into()),
-            gateway: Some(gateway(true, None)),
-            ..rdp("r1", "office", "h1")
-        };
-        let mac = RdpProfile {
-            name: "office (mac)".into(),
-            host: "h2".into(),
-            port: 3390,
-            username: "CORP\\faye".into(),
-            domain: Some("CORP".into()),
-            keyboard_layout: Some(0x407),
-            audio: false,
-            shared_folder: Some(folder("/home/faye/share", "faye")),
-            gateway: Some(gateway(false, Some("mac-gw"))),
-            secret_id: Some("mac-sec".into()),
-            icon: IconRef::Builtin { name: "monitor".into() },
-            ..pc.clone()
-        };
-        let mut payload = incoming_rdp(vec![mac]);
-        payload.secrets.insert("mac-sec".into(), Zeroizing::new("other".into()));
-        payload.secrets.insert("mac-gw".into(), Zeroizing::new("gateway".into()));
-        let mut env = MapEnv::default();
-        env.secrets.insert("local-sec".into(), b"mine".to_vec());
-        env.dirs.insert("/home/faye/share".into());
-
-        let p = plan(&local_rdp(vec![pc]), &payload, &env);
-        assert_eq!(
-            rows(&p.items[0]),
-            [
-                ("name", "Name", "office", "office (mac)"),
-                ("host", "Host", "h1", "h2"),
-                ("port", "Port", "3389", "3390"),
-                ("username", "Username", "faye", "CORP\\faye"),
-                ("domain", "Domain", "(none)", "CORP"),
-                ("keyboardLayout", "Keyboard layout", "Automatic", "German"),
-                ("audio", "Sound", "On", "Off"),
-                ("sharedFolder", "Shared folder", "None", "/home/faye/share as faye"),
-                ("gateway", "RD Gateway", "gw.corp:443, same login", "gw.corp:443, CORP\\gw"),
-                ("icon", "Icon", "server", "monitor"),
-                ("password", "Password", "••••", "•••• (different)"),
-                ("gatewayPassword", "Gateway password", "(none)", "••••"),
-            ]
-        );
-        assert!(p.items[0].notes.is_empty() && p.items[0].notes_as_new.is_empty());
-    }
-
-    #[test]
-    fn rdp_sound_folder_and_gateway_are_shown_as_text() {
-        let pc = rdp("r1", "office", "h1");
-        let mut env = MapEnv::default();
-        env.dirs.insert("C:\\Users\\faye".into());
-        let shown = |local: RdpProfile, incoming: RdpProfile| {
-            let p = plan(&local_rdp(vec![local]), &incoming_rdp(vec![incoming]), &env);
-            assert_eq!(p.items[0].fields.len(), 1);
-            let row = &p.items[0].fields[0];
-            [row.field.clone(), row.label.clone(), row.local.clone(), row.incoming.clone()]
-        };
-
-        let off = RdpProfile { audio: false, ..pc.clone() };
-        assert_eq!(shown(pc.clone(), off.clone()), ["audio", "Sound", "On", "Off"]);
-        assert_eq!(shown(off, pc.clone()), ["audio", "Sound", "Off", "On"]);
-
-        let share = |f: SharedFolder| RdpProfile { shared_folder: Some(f), ..pc.clone() };
-        let faye = share(folder("C:\\Users\\faye", "faye"));
-        let label = "C:\\Users\\faye as faye";
-        let shared = "Shared folder";
-        assert_eq!(shown(pc.clone(), faye.clone()), ["sharedFolder", shared, "None", label]);
-        assert_eq!(shown(faye.clone(), pc.clone()), ["sharedFolder", shared, label, "None"]);
-        let docs = share(folder("C:\\Users\\faye", "docs"));
-        let renamed = "C:\\Users\\faye as docs";
-        assert_eq!(shown(faye, docs), ["sharedFolder", shared, label, renamed]);
-
-        let through = |g: RdpGateway| RdpProfile { gateway: Some(g), ..pc.clone() };
-        let same = through(gateway(true, None));
-        let own = through(gateway(false, Some("gw-1")));
-        let (same_label, own_label) = ("gw.corp:443, same login", "gw.corp:443, CORP\\gw");
-        assert_eq!(shown(pc.clone(), same.clone()), ["gateway", "RD Gateway", "None", same_label]);
-        assert_eq!(
-            shown(same.clone(), own.clone()),
-            ["gateway", "RD Gateway", same_label, own_label]
-        );
-        assert_eq!(shown(own.clone(), pc.clone()), ["gateway", "RD Gateway", own_label, "None"]);
-        let moved = through(RdpGateway { port: 8443, ..gateway(true, None) });
-        let moved_label = "gw.corp:8443, same login";
-        assert_eq!(shown(same, moved), ["gateway", "RD Gateway", same_label, moved_label]);
-
-        // The other machine keeps the gateway password under its own id.
-        let elsewhere = through(gateway(false, Some("gw-2")));
-        let p = plan(&local_rdp(vec![own]), &incoming_rdp(vec![elsewhere]), &env);
-        assert!(p.items.is_empty());
-        assert_eq!(p.unchanged, 1);
-    }
-
-    #[test]
-    fn rdp_gateway_password_row_only_when_bundle_carries_a_different_one() {
-        let mut pc =
-            RdpProfile { gateway: Some(gateway(false, None)), ..rdp("pc", "office", "h1") };
-        let mut payload = incoming_rdp(vec![pc.clone()]);
-        let mut env = MapEnv::default();
-        env.secrets.insert("local-gw".into(), b"same".to_vec());
-        let unchanged = |pc: &RdpProfile, payload: &Payload| {
-            let p = plan(&local_rdp(vec![pc.clone()]), payload, &env);
-            p.items.is_empty() && p.unchanged == 1
-        };
-
-        assert!(unchanged(&pc, &payload), "neither side has a gateway password");
-        pc.gateway = Some(gateway(false, Some("local-gw")));
-        assert!(unchanged(&pc, &payload), "only this machine has one");
-        payload.rdp_profiles[0].gateway = Some(gateway(false, Some("mac-gw")));
-        assert!(unchanged(&pc, &payload), "exported without passwords");
-        payload.secrets.insert("mac-gw".into(), Zeroizing::new("same".into()));
-        assert!(unchanged(&pc, &payload), "the same gateway password");
-
-        payload.secrets.insert("mac-gw".into(), Zeroizing::new("other".into()));
-        let p = plan(&local_rdp(vec![pc.clone()]), &payload, &env);
-        assert_eq!(
-            rows(&p.items[0]),
-            [("gatewayPassword", "Gateway password", "••••", "•••• (different)")]
-        );
-
-        pc.gateway = Some(gateway(false, None));
-        let p = plan(&local_rdp(vec![pc.clone()]), &payload, &env);
-        assert_eq!(
-            rows(&p.items[0]),
-            [("gatewayPassword", "Gateway password", "(none)", "••••")]
-        );
-
-        pc.gateway = None;
-        let p = plan(&local_rdp(vec![pc.clone()]), &payload, &env);
-        let fields: Vec<_> = rows(&p.items[0]).into_iter().map(|r| (r.0, r.2, r.3)).collect();
-        assert_eq!(
-            fields,
-            [
-                ("gateway", "None", "gw.corp:443, CORP\\gw"),
-                ("gatewayPassword", "(none)", "••••")
-            ]
-        );
-
-        // A gateway that takes the RDP login has no password of its own.
-        pc.gateway = Some(gateway(false, Some("local-gw")));
-        payload.rdp_profiles[0].gateway = Some(gateway(true, Some("mac-gw")));
-        let p = plan(&local_rdp(vec![pc]), &payload, &env);
-        let fields: Vec<_> = p.items[0].fields.iter().map(|f| f.field.as_str()).collect();
-        assert_eq!(fields, ["gateway"]);
-    }
-
-    #[test]
-    fn rdp_shared_folder_that_is_not_on_this_machine_is_never_offered() {
-        let pc = RdpProfile {
-            shared_folder: Some(folder("C:\\Users\\faye", "faye")),
-            ..rdp("pc", "office", "h1")
-        };
-        let mac = RdpProfile {
-            id: "mac".into(),
-            name: "office (mac)".into(),
-            shared_folder: Some(folder("/home/faye/share", "faye")),
-            ..pc.clone()
-        };
-        let (l, payload) = (local_rdp(vec![pc.clone()]), incoming_rdp(vec![mac.clone()]));
-        let left_out = "Shared folder left out; not on this machine: /home/faye/share";
-
-        let p = plan(&l, &payload, &MapEnv::default());
-        let item = &p.items[0];
-        assert_eq!(item.status, ItemStatus::Conflict);
-        let fields: Vec<_> = item.fields.iter().map(|f| f.field.as_str()).collect();
-        assert_eq!(fields, ["name"]);
-        assert_eq!(
-            item.notes,
-            ["Kept your local shared folder; not on this machine: /home/faye/share"]
-        );
-        assert_eq!(item.notes_as_new, [left_out]);
-
-        let mut env = MapEnv::default();
-        env.dirs.insert("/home/faye/share".into());
-        let p = plan(&l, &payload, &env);
-        let item = &p.items[0];
-        assert_eq!(
-            rows(item)[1],
-            (
-                "sharedFolder",
-                "Shared folder",
-                "C:\\Users\\faye as faye",
-                "/home/faye/share as faye"
-            )
-        );
-        assert!(item.notes.is_empty() && item.notes_as_new.is_empty());
-
-        // Nothing else differs, so nothing is left to review.
-        let only_folder = RdpProfile { name: pc.name.clone(), ..mac };
-        let p = plan(&l, &incoming_rdp(vec![only_folder]), &MapEnv::default());
-        assert!(p.items.is_empty());
-        assert_eq!(p.unchanged, 1);
-
-        // The same missing folder on both sides changes nothing and needs no note.
-        let renamed = RdpProfile { name: "office 2".into(), ..pc.clone() };
-        let p = plan(&l, &incoming_rdp(vec![renamed]), &MapEnv::default());
-        assert!(p.items[0].notes.is_empty());
-        assert_eq!(
-            p.items[0].notes_as_new,
-            ["Shared folder left out; not on this machine: C:\\Users\\faye"]
-        );
-    }
-
-    // Without a local shared folder there is nothing to keep.
-    #[test]
-    fn a_missing_incoming_folder_on_a_profile_here_without_one_is_left_out() {
-        let pc = rdp("pc", "office", "h1");
-        let mac = RdpProfile {
-            id: "mac".into(),
-            name: "office (mac)".into(),
-            shared_folder: Some(folder("/home/faye/share", "faye")),
-            ..pc.clone()
-        };
-        let p = plan(&local_rdp(vec![pc]), &incoming_rdp(vec![mac]), &MapEnv::default());
-        let item = &p.items[0];
-        let fields: Vec<_> = item.fields.iter().map(|f| f.field.as_str()).collect();
-        assert_eq!(fields, ["name"]);
-        let left_out = "Shared folder left out; not on this machine: /home/faye/share";
-        assert_eq!(item.notes, [left_out]);
-        assert_eq!(item.notes_as_new, [left_out]);
-    }
-
-    #[test]
-    fn new_rdp_profile_with_a_shared_folder_that_is_not_on_this_machine_is_noted() {
-        let inc = RdpProfile {
-            shared_folder: Some(folder("/home/faye/share", "faye")),
-            ..rdp("r1", "office", "h1")
-        };
-        let payload = incoming_rdp(vec![inc]);
-
-        let p = plan(&local_rdp(vec![]), &payload, &MapEnv::default());
-        let item = &p.items[0];
-        assert_eq!(item.status, ItemStatus::New);
-        let left_out = "Shared folder left out; not on this machine: /home/faye/share";
-        assert_eq!(item.notes, [left_out]);
-        assert_eq!(item.notes_as_new, [left_out]);
-
-        let mut env = MapEnv::default();
-        env.dirs.insert("/home/faye/share".into());
-        let p = plan(&local_rdp(vec![]), &payload, &env);
-        assert!(p.items[0].notes.is_empty() && p.items[0].notes_as_new.is_empty());
     }
 }

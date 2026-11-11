@@ -8,13 +8,14 @@ export function listShells(): Promise<ShellInfo[]> {
 
 export async function openLocal(
   program: string | null,
+  startFolder: string | null,
   cols: number,
   rows: number,
   onBytes: (bytes: Uint8Array) => void,
 ): Promise<string> {
   const channel = new Channel<string>()
   channel.onmessage = (msg) => onBytes(Uint8Array.from(atob(msg), (c) => c.charCodeAt(0)))
-  return unwrap(await commands.localOpen(program, cols, rows, channel))
+  return unwrap(await commands.localOpen(program, startFolder, cols, rows, channel))
 }
 
 export async function writeLocal(id: string, data: string): Promise<void> {

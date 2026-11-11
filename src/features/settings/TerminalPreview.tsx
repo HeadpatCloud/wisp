@@ -2,8 +2,9 @@ import { FitAddon } from '@xterm/addon-fit'
 import { type FontWeight, Terminal } from '@xterm/xterm'
 import '@xterm/xterm/css/xterm.css'
 import { useEffect, useMemo, useRef } from 'react'
-import { applyTerminalSettings, resolveTerminalTheme } from '@/features/sessions/terminalTheme'
+import { applyTerminalSettings } from '@/features/sessions/terminalTheme'
 import { appearanceOf, useSettingsStore } from '@/stores/settingsStore'
+import { useThemeStore } from '@/stores/themeStore'
 
 const SAMPLE = [
   '\x1b[1;32muser@remote\x1b[0m:\x1b[1;34m~/project\x1b[0m$ ls --color',
@@ -16,7 +17,10 @@ const SAMPLE = [
 
 export function TerminalPreview() {
   const raw = useSettingsStore((s) => s.settings)
-  const settings = useMemo(() => appearanceOf(raw), [raw])
+  const userThemes = useThemeStore((s) => s.userThemes)
+  const schemes = useThemeStore((s) => s.schemes)
+  // biome-ignore lint/correctness/useExhaustiveDependencies: themes and schemes change what the colour ids resolve to
+  const settings = useMemo(() => appearanceOf(raw), [raw, userThemes, schemes])
   const initial = useRef(settings)
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
@@ -36,7 +40,7 @@ export function TerminalPreview() {
       scrollback: 0,
       disableStdin: true,
       convertEol: true,
-      theme: { ...resolveTerminalTheme(s.theme, s.colorScheme) },
+      theme: { ...s.colors },
     })
     termRef.current = term
     const fit = new FitAddon()

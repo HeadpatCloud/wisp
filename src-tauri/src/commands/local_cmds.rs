@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use base64::engine::general_purpose::STANDARD;
@@ -8,7 +9,7 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri::ipc::Channel;
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 use crate::error::{AppError, AppResult};
 
@@ -25,6 +26,24 @@ fn edit_root() -> std::path::PathBuf {
 
 // Wipes leftovers from previous runs. Called at startup rather than on close so a file the
 // user is still editing is never pulled out from under them mid-session.
+// Theme and scheme files are small; anything bigger is not one, and isn't read into memory.
+const TEXT_FILE_LIMIT: u64 = 1024 * 1024;
+
+#[tauri::command]
+#[specta::specta]
+pub fn read_text_file(path: String) -> AppResult<String> {
+    if std::fs::metadata(&path)?.len() > TEXT_FILE_LIMIT {
+        return Err(AppError::Invalid("That file is larger than 1 MB.".into()));
+    }
+    Ok(std::fs::read_to_string(&path)?)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn write_text_file(path: String, text: String) -> AppResult<()> {
+    Ok(std::fs::write(&path, text)?)
+}
+
 #[tauri::command]
 #[specta::specta]
 pub fn clear_edit_temp() -> AppResult<()> {
@@ -85,6 +104,10 @@ fn find_git_bash() -> Option<String> {
 #[tauri::command]
 #[specta::specta]
 pub fn list_shells() -> Vec<ShellInfo> {
+    detect_shells()
+}
+
+pub fn detect_shells() -> Vec<ShellInfo> {
     let mut shells = Vec::new();
     #[cfg(windows)]
     {
@@ -133,22 +156,56 @@ fn poisoned() -> AppError {
     AppError::Internal("local lock poisoned".into())
 }
 
+// WSL is told the folder with --cd: it may be a Linux path, which only WSL can check.
+pub(crate) fn shell_command(
+    program: Option<&str>,
+    start_folder: Option<&str>,
+    home: &Path,
+) -> AppResult<CommandBuilder> {
+    let program = program.filter(|p| !p.is_empty());
+    let mut cmd = match program {
+        Some(p) => CommandBuilder::new(p),
+        None => CommandBuilder::new_default_prog(),
+    };
+    let Some(folder) = start_folder.filter(|f| !f.is_empty()) else { return Ok(cmd) };
+    let wsl = program
+        .and_then(|p| Path::new(p).file_stem())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("wsl"));
+    if wsl {
+        cmd.arg("--cd");
+        cmd.arg(folder);
+        return Ok(cmd);
+    }
+    let dir = if folder == "~" {
+        home.to_path_buf()
+    } else if let Some(rest) = folder.strip_prefix("~/").or_else(|| folder.strip_prefix("~\\")) {
+        home.join(rest)
+    } else {
+        PathBuf::from(folder)
+    };
+    if !dir.is_dir() {
+        return Err(AppError::Invalid(format!("The start folder {folder} doesn't exist.")));
+    }
+    cmd.cwd(dir);
+    Ok(cmd)
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn local_open(
+    app: AppHandle,
     locals: State<'_, LocalSessions>,
     program: Option<String>,
+    start_folder: Option<String>,
     cols: u16,
     rows: u16,
     on_output: Channel<String>,
 ) -> AppResult<String> {
+    let home = app.path().home_dir().map_err(|e| AppError::Io(e.to_string()))?;
+    let cmd = shell_command(program.as_deref(), start_folder.as_deref(), &home)?;
     let pair = native_pty_system()
         .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
         .map_err(pty_err)?;
-    let cmd = match program {
-        Some(p) if !p.is_empty() => CommandBuilder::new(p),
-        _ => CommandBuilder::new_default_prog(),
-    };
     let child = pair.slave.spawn_command(cmd).map_err(pty_err)?;
     drop(pair.slave);
     let mut reader = pair.master.try_clone_reader().map_err(pty_err)?;
@@ -208,4 +265,33 @@ pub async fn local_close(locals: State<'_, LocalSessions>, id: String) -> AppRes
         let _ = pty.child.kill();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(cmd: &CommandBuilder) -> Vec<String> {
+        cmd.get_argv().iter().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn shell_command_starts_wsl_in_the_folder_and_expands_home_elsewhere() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("src")).unwrap();
+        let wsl = shell_command(Some("wsl.exe"), Some("/srv/app"), home.path()).unwrap();
+        assert_eq!(argv(&wsl), ["wsl.exe", "--cd", "/srv/app"]);
+        assert_eq!(wsl.get_cwd(), None);
+        let pwsh = shell_command(Some("pwsh.exe"), Some("~/src"), home.path()).unwrap();
+        assert_eq!(pwsh.get_cwd().map(std::path::PathBuf::from), Some(home.path().join("src")));
+    }
+
+    #[test]
+    fn a_missing_start_folder_is_named() {
+        let home = tempfile::tempdir().unwrap();
+        let missing = home.path().join("nope");
+        let missing = missing.to_str().unwrap();
+        let err = shell_command(Some("pwsh.exe"), Some(missing), home.path()).err().unwrap();
+        assert!(matches!(err, AppError::Invalid(m) if m == format!("The start folder {missing} doesn't exist.")));
+    }
 }

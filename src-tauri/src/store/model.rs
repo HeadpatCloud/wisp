@@ -251,6 +251,38 @@ pub struct Settings {
     pub hotkeys: std::collections::HashMap<String, String>,
     #[serde(default = "default_true")]
     pub restore_session: bool,
+    #[serde(default = "default_hosts_view")]
+    pub hosts_view: String,
+    // Empty until a 0.5.0 file has been migrated to themes.
+    #[serde(default)]
+    pub light_theme: String,
+    #[serde(default)]
+    pub dark_theme: String,
+    #[serde(default = "default_density")]
+    pub density: String,
+    #[serde(default = "default_ui_font")]
+    pub ui_font: String,
+    #[serde(default = "default_host_list_side")]
+    pub host_list_side: String,
+    #[serde(default = "default_host_list_width")]
+    pub host_list_width: u32,
+    // Fields a newer version wrote, kept through a save.
+    #[serde(flatten)]
+    #[specta(skip)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+fn default_density() -> String {
+    "comfortable".into()
+}
+fn default_ui_font() -> String {
+    "inter".into()
+}
+fn default_host_list_side() -> String {
+    "left".into()
+}
+fn default_host_list_width() -> u32 {
+    240
 }
 
 fn default_accent() -> String {
@@ -277,6 +309,9 @@ fn default_scrollback() -> u32 {
 fn default_max_transfers() -> u32 {
     3
 }
+fn default_hosts_view() -> String {
+    "cards".into()
+}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -299,6 +334,14 @@ impl Default for Settings {
             right_click_paste: false,
             hotkeys: Default::default(),
             restore_session: true,
+            hosts_view: default_hosts_view(),
+            light_theme: "paper".into(),
+            dark_theme: "graphite".into(),
+            density: default_density(),
+            ui_font: default_ui_font(),
+            host_list_side: default_host_list_side(),
+            host_list_width: default_host_list_width(),
+            extra: Default::default(),
         }
     }
 }
@@ -322,10 +365,6 @@ pub struct ProfileStore {
     #[serde(flatten)]
     #[specta(skip)]
     pub unknown: serde_json::Map<String, serde_json::Value>,
-}
-
-impl ProfileStore {
-    pub const CURRENT_VERSION: u32 = 1;
 }
 
 #[cfg(test)]

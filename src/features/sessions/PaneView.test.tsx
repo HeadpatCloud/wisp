@@ -27,9 +27,8 @@ vi.mock('./TerminalView', async () => {
   }
 })
 vi.mock('../sftp/SftpPanel', () => ({ SftpPanel: () => <div data-testid="sftp" /> }))
-vi.mock('../tunnels/TunnelsPanel', () => ({ TunnelsPanel: () => <div data-testid="tunnels" /> }))
 
-import type { SessionTab } from '@/stores/sessionStore'
+import type { PanesTab } from '@/stores/sessionStore'
 import { useSessionStore } from '@/stores/sessionStore'
 import { PaneView } from './PaneView'
 
@@ -39,44 +38,51 @@ beforeEach(() => {
     tabs: [
       {
         id: 't1',
-        kind: 'session',
-        sessionIds: ['s1'],
+        kind: 'panes',
+        paneIds: ['s1'],
         direction: 'horizontal',
         activePaneId: 's1',
       },
     ],
-    sessions: {
-      s1: { id: 's1', profileId: 'p1', title: 'web-01', status: 'connected', reconnectNonce: 0 },
+    panes: {
+      s1: {
+        id: 's1',
+        kind: 'ssh',
+        connectionId: 'p1',
+        title: 'web-01',
+        status: 'connected',
+        reconnectNonce: 0,
+      },
     },
     activeTabId: 't1',
   })
 })
 
 test('connects using the terminal fitted size, not a hardcoded default', async () => {
-  render(<PaneView tabId="t1" sessionId="s1" />)
+  render(<PaneView tabId="t1" paneId="s1" />)
   await waitFor(() => expect(ssh.connectSession).toHaveBeenCalled())
   expect(ssh.connectSession).toHaveBeenCalledWith('p1', 120, 40, expect.any(Function))
 })
 
 test('renders the terminal and splits right', async () => {
   const user = userEvent.setup()
-  render(<PaneView tabId="t1" sessionId="s1" />)
+  render(<PaneView tabId="t1" paneId="s1" />)
   expect(screen.getByTestId('terminal')).toBeInTheDocument()
   await user.click(screen.getByRole('button', { name: /split right/i }))
-  expect((useSessionStore.getState().tabs[0] as SessionTab).sessionIds).toHaveLength(2)
-  expect((useSessionStore.getState().tabs[0] as SessionTab).direction).toBe('horizontal')
+  expect((useSessionStore.getState().tabs[0] as PanesTab).paneIds).toHaveLength(2)
+  expect((useSessionStore.getState().tabs[0] as PanesTab).direction).toBe('horizontal')
 })
 
 test('split down sets vertical direction', async () => {
   const user = userEvent.setup()
-  render(<PaneView tabId="t1" sessionId="s1" />)
+  render(<PaneView tabId="t1" paneId="s1" />)
   await user.click(screen.getByRole('button', { name: /split down/i }))
-  expect((useSessionStore.getState().tabs[0] as SessionTab).direction).toBe('vertical')
+  expect((useSessionStore.getState().tabs[0] as PanesTab).direction).toBe('vertical')
 })
 
 test('close pane removes the now-empty tab', async () => {
   const user = userEvent.setup()
-  render(<PaneView tabId="t1" sessionId="s1" />)
+  render(<PaneView tabId="t1" paneId="s1" />)
   await user.click(screen.getByRole('button', { name: /close pane/i }))
   expect(useSessionStore.getState().tabs).toHaveLength(0)
 })
@@ -91,22 +97,29 @@ test('host-key-unknown error opens the dialog; Trust records and reconnects', as
     tabs: [
       {
         id: 't1',
-        kind: 'session',
-        sessionIds: ['s1'],
+        kind: 'panes',
+        paneIds: ['s1'],
         direction: 'horizontal',
         activePaneId: 's1',
       },
     ],
-    sessions: {
-      s1: { id: 's1', profileId: 'p1', title: 'web-01', status: 'connecting', reconnectNonce: 0 },
+    panes: {
+      s1: {
+        id: 's1',
+        kind: 'ssh',
+        connectionId: 'p1',
+        title: 'web-01',
+        status: 'connecting',
+        reconnectNonce: 0,
+      },
     },
     activeTabId: 't1',
   })
-  render(<PaneView tabId="t1" sessionId="s1" />)
+  render(<PaneView tabId="t1" paneId="s1" />)
   expect(await screen.findByText('SHA256:zzz')).toBeInTheDocument()
   await user.click(screen.getByRole('button', { name: /trust/i }))
   expect(ssh.trustHostKey).toHaveBeenCalledWith('h', 22, 'SHA256:zzz')
-  expect(useSessionStore.getState().sessions.s1.reconnectNonce).toBe(1)
+  expect(useSessionStore.getState().panes.s1.reconnectNonce).toBe(1)
 })
 
 test('wrong-passphrase error surfaces an actionable message', async () => {
@@ -115,42 +128,56 @@ test('wrong-passphrase error surfaces an actionable message', async () => {
     tabs: [
       {
         id: 't1',
-        kind: 'session',
-        sessionIds: ['s1'],
+        kind: 'panes',
+        paneIds: ['s1'],
         direction: 'horizontal',
         activePaneId: 's1',
       },
     ],
-    sessions: {
-      s1: { id: 's1', profileId: 'p1', title: 'web-01', status: 'connecting', reconnectNonce: 0 },
+    panes: {
+      s1: {
+        id: 's1',
+        kind: 'ssh',
+        connectionId: 'p1',
+        title: 'web-01',
+        status: 'connecting',
+        reconnectNonce: 0,
+      },
     },
     activeTabId: 't1',
   })
-  render(<PaneView tabId="t1" sessionId="s1" />)
+  render(<PaneView tabId="t1" paneId="s1" />)
   expect(await screen.findByText(/passphrase/i)).toBeInTheDocument()
-  expect(useSessionStore.getState().sessions.s1.status).toBe('error')
+  expect(useSessionStore.getState().panes.s1.status).toBe('error')
 })
 
-test('shows Reconnect when closed and reconnect bumps the session', async () => {
+test('shows Reconnect when closed and reconnect bumps the pane', async () => {
   ssh.connectSession.mockReturnValue(new Promise(() => undefined))
   const user = userEvent.setup()
   useSessionStore.setState({
     tabs: [
       {
         id: 't1',
-        kind: 'session',
-        sessionIds: ['s1'],
+        kind: 'panes',
+        paneIds: ['s1'],
         direction: 'horizontal',
         activePaneId: 's1',
       },
     ],
-    sessions: {
-      s1: { id: 's1', profileId: 'p1', title: 'web-01', status: 'closed', reconnectNonce: 0 },
+    panes: {
+      s1: {
+        id: 's1',
+        kind: 'ssh',
+        connectionId: 'p1',
+        title: 'web-01',
+        status: 'closed',
+        reconnectNonce: 0,
+      },
     },
     activeTabId: 't1',
   })
-  render(<PaneView tabId="t1" sessionId="s1" />)
+  render(<PaneView tabId="t1" paneId="s1" />)
   await user.click(screen.getByRole('button', { name: /reconnect/i }))
-  expect(useSessionStore.getState().sessions.s1.status).toBe('connecting')
-  expect(useSessionStore.getState().sessions.s1.reconnectNonce).toBe(1)
+  expect(useSessionStore.getState().panes.s1.status).toBe('connecting')
+  expect(useSessionStore.getState().panes.s1.reconnectNonce).toBe(1)
 })

@@ -1,26 +1,37 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { AppError } from '@/bindings'
+import { sshView } from '@/lib/hosts'
+import { connectErrorText } from '@/lib/ipc'
 import {
+  type AdhocParams,
   connectSftp,
   connectSftpAdhoc,
   connectSftpProfile,
   disconnectSftp,
-  type SftpAdhocParams,
 } from '@/lib/sftp'
 import { trustHostKey } from '@/lib/ssh'
-import { useProfileStore } from '@/stores/profileStore'
+import { useHostStore } from '@/stores/hostStore'
+import type { SessionStatus } from '@/stores/sessionStore'
 import { SftpPanel } from '../sftp/SftpPanel'
+import { ConnectError } from './ConnectError'
 import { HostKeyDialog, type HostKeyPrompt } from './HostKeyDialog'
 
 export function SftpConnectionView({
+  name,
   profileId,
   sftpProfileId,
   adhoc,
+  viaSession = null,
   active,
+  onStatus,
 }: {
+  name: string
+  onStatus: (status: SessionStatus) => void
   profileId: string | null
   sftpProfileId?: string | null
-  adhoc?: SftpAdhocParams | null
+  adhoc?: AdhocParams | null
+  // A live terminal's SSH session: files open on it without a connection of their own.
+  viaSession?: string | null
   active?: boolean
 }) {
   const [sessionId, setSessionId] = useState<string | null>(null)
@@ -28,10 +39,15 @@ export function SftpConnectionView({
   const [hostKeyPrompt, setHostKeyPrompt] = useState<HostKeyPrompt | null>(null)
   const [nonce, setNonce] = useState(0)
   const idRef = useRef<string | null>(null)
-  const profile = useProfileStore((s) => s.profiles.find((p) => p.id === profileId))
+  const hosts = useHostStore((s) => s.hosts)
+  const logins = useHostStore((s) => s.logins)
+  const profile = useMemo(
+    () => sshView(hosts, logins, profileId ?? undefined),
+    [hosts, logins, profileId],
+  )
   const origin = useMemo(() => {
     if (adhoc) return { user: adhoc.username, host: adhoc.host, port: adhoc.port }
-    return profile ? { user: profile.username, host: profile.host, port: profile.port } : undefined
+    return profile ? { user: profile.user, host: profile.host, port: profile.port } : undefined
   }, [adhoc, profile])
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: nonce bump retries the connect
@@ -40,6 +56,7 @@ export function SftpConnectionView({
     idRef.current = null
     setSessionId(null)
     setError(null)
+    if (viaSession) return
     const connect = adhoc
       ? connectSftpAdhoc(adhoc)
       : sftpProfileId
@@ -69,34 +86,25 @@ export function SftpConnectionView({
             setHostKeyPrompt({ kind: 'mismatch', host, port, stored, offered })
             return
           }
-          if ('message' in err && typeof err.message === 'string') {
-            setError(err.message)
-            return
-          }
         }
-        setError(String(e))
+        setError(connectErrorText(e, !adhoc))
       })
     return () => {
       disposed = true
       if (idRef.current) disconnectSftp(idRef.current).catch(() => {})
     }
-  }, [profileId, sftpProfileId, adhoc, nonce])
+  }, [profileId, sftpProfileId, adhoc, viaSession, nonce])
 
-  if (sessionId) return <SftpPanel sessionId={sessionId} active={active} origin={origin} />
+  const live = viaSession ?? sessionId
+  const status: SessionStatus = live ? 'connected' : error ? 'error' : 'connecting'
+  useEffect(() => onStatus(status), [onStatus, status])
+
+  if (live) return <SftpPanel sessionId={live} active={active} origin={origin} />
 
   return (
     <div className="flex h-full flex-col items-center justify-center gap-2 text-sm">
       {error ? (
-        <>
-          <p className="max-w-xs text-center text-destructive">{error}</p>
-          <button
-            type="button"
-            onClick={() => setNonce((n) => n + 1)}
-            className="rounded border border-border px-3 py-1.5 hover:bg-muted"
-          >
-            Retry
-          </button>
-        </>
+        <ConnectError name={name} reason={error} onRetry={() => setNonce((n) => n + 1)} />
       ) : hostKeyPrompt ? null : (
         <p className="text-muted-foreground">Connecting…</p>
       )}

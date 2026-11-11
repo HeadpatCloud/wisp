@@ -4,7 +4,7 @@ import type { AuthMethod, ProfileKey, SftpEntry, TransferProgress } from '@/bind
 import { commands } from '@/bindings'
 import { unwrap } from '@/lib/ipc'
 
-export interface SftpAdhocParams {
+export interface AdhocParams {
   host: string
   port: number
   username: string
@@ -22,7 +22,7 @@ export async function connectSftp(profileId: string): Promise<string> {
 
 // Throws the raw AppError, same as connectSftp. `keys` is defaulted because snapshots
 // written by an older build predate it.
-export async function connectSftpAdhoc(p: SftpAdhocParams): Promise<string> {
+export async function connectSftpAdhoc(p: AdhocParams): Promise<string> {
   const res = await commands.sftpConnectAdhoc(
     p.host,
     p.port,

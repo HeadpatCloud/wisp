@@ -3,10 +3,7 @@ import userEvent from '@testing-library/user-event'
 import { StrictMode } from 'react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
-const listVncProfiles = vi.hoisted(() => vi.fn())
-const listRdpProfiles = vi.hoisted(() => vi.fn())
-
-vi.mock('@/bindings', () => ({ commands: { listVncProfiles, listRdpProfiles } }))
+vi.mock('@/bindings', () => ({ commands: {} }))
 vi.mock('@/lib/transfer', () => ({
   readBundle: vi.fn(),
   validateImport: vi.fn().mockResolvedValue([]),
@@ -14,7 +11,7 @@ vi.mock('@/lib/transfer', () => ({
   discardImport: vi.fn().mockResolvedValue(undefined),
 }))
 
-import type { ImportReview, ItemProblem, RdpProfile, VncProfile } from '@/bindings'
+import type { ImportReview, ItemProblem } from '@/bindings'
 import {
   applyImport,
   discardImport,
@@ -22,12 +19,7 @@ import {
   readBundle,
   validateImport,
 } from '@/lib/transfer'
-import { useProfileStore } from '@/stores/profileStore'
-import { useRdpProfileStore } from '@/stores/rdpProfileStore'
-import { useS3ProfileStore } from '@/stores/s3ProfileStore'
-import { useSessionStore } from '@/stores/sessionStore'
-import { useSftpProfileStore } from '@/stores/sftpProfileStore'
-import { useVncProfileStore } from '@/stores/vncProfileStore'
+import { useHostStore } from '@/stores/hostStore'
 import { ImportReviewPage } from './ImportReviewPage'
 
 const review: ImportReview = {
@@ -36,7 +28,8 @@ const review: ImportReview = {
   items: [
     {
       key: 'ssh:a',
-      kind: 'ssh',
+      kind: 'connection',
+      parent: null,
       name: 'web',
       status: 'conflict',
       matched: { id: 'pc', name: 'web' },
@@ -49,7 +42,8 @@ const review: ImportReview = {
     },
     {
       key: 'ssh:n',
-      kind: 'ssh',
+      kind: 'connection',
+      parent: null,
       name: 'fresh',
       status: 'new',
       matched: null,
@@ -61,7 +55,7 @@ const review: ImportReview = {
 }
 
 const load = vi.fn().mockResolvedValue(undefined)
-const removeTab = vi.fn()
+const onClose = vi.fn()
 
 function deferred<T>() {
   let resolve: (value: T) => void = () => {}
@@ -75,12 +69,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   vi.mocked(readBundle).mockReset()
   vi.mocked(validateImport).mockResolvedValue([])
-  useProfileStore.setState({ load } as never)
-  useSftpProfileStore.setState({ load } as never)
-  useS3ProfileStore.setState({ load } as never)
-  useVncProfileStore.setState({ load } as never)
-  useRdpProfileStore.setState({ load } as never)
-  useSessionStore.setState({ removeTab } as never)
+  useHostStore.setState({ load } as never)
 })
 
 afterEach(() => {
@@ -93,7 +82,7 @@ test('asks for the password, reports a wrong one, then shows the review', async 
     .mockResolvedValueOnce({ kind: 'wrongPassword' })
     .mockResolvedValueOnce({ kind: 'review', review })
   const user = userEvent.setup()
-  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  render(<ImportReviewPage path="C:/in.json" onClose={onClose} />)
   await user.type(await screen.findByLabelText('Export password'), 'x')
   await user.click(screen.getByRole('button', { name: 'Open' }))
   expect(await screen.findByText('Wrong password.')).toBeInTheDocument()
@@ -106,7 +95,7 @@ test('asks for the password, reports a wrong one, then shows the review', async 
 test('field toggles, apply payload, reload and summary', async () => {
   vi.mocked(readBundle).mockResolvedValue({ kind: 'review', review })
   const user = userEvent.setup()
-  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  render(<ImportReviewPage path="C:/in.json" onClose={onClose} />)
   expect(
     await screen.findByText('Kept your local keys; not on this machine: /Users/me/id'),
   ).toBeInTheDocument()
@@ -117,7 +106,7 @@ test('field toggles, apply payload, reload and summary', async () => {
     { key: 'ssh:n', accept: true, asNew: false, fields: [] },
   ])
   expect(await screen.findByText('Imported: 1 added, 1 updated.')).toBeInTheDocument()
-  expect(load).toHaveBeenCalledTimes(5)
+  expect(load).toHaveBeenCalledTimes(1)
 })
 
 test('a VNC profile is labelled VNC in the list and in its details', async () => {
@@ -128,7 +117,8 @@ test('a VNC profile is labelled VNC in the list and in its details', async () =>
       items: [
         {
           key: 'vnc:m',
-          kind: 'vnc',
+          kind: 'connection',
+          parent: null,
           name: 'desk',
           status: 'conflict',
           matched: { id: 'pc', name: 'tower' },
@@ -138,47 +128,16 @@ test('a VNC profile is labelled VNC in the list and in its details', async () =>
           notes: [],
           notesAsNew: [],
         },
-        { ...review.items[1], key: 'vnc:n', kind: 'vnc', name: 'lab' },
+        { ...review.items[1], key: 'vnc:n', kind: 'connection', parent: null, name: 'lab' },
       ],
     },
   })
   const user = userEvent.setup()
-  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
-  expect(await screen.findByText('Matches your VNC "tower"')).toBeInTheDocument()
-  expect(screen.getAllByText('VNC')).toHaveLength(2)
+  render(<ImportReviewPage path="C:/in.json" onClose={onClose} />)
+  expect(await screen.findByText('Matches your Connection "tower"')).toBeInTheDocument()
+  expect(screen.getAllByText('Connection')).toHaveLength(2)
   await user.click(screen.getByRole('button', { name: 'lab' }))
-  expect(screen.getByText('New VNC')).toBeInTheDocument()
-})
-
-test('an imported VNC profile is in the VNC store once the import is applied', async () => {
-  const desk: VncProfile = {
-    id: 'v',
-    name: 'desk',
-    host: 'h',
-    port: 5900,
-    username: null,
-    secretId: null,
-    icon: { kind: 'builtin', name: 'server' },
-    order: 0,
-  }
-  vi.mocked(readBundle).mockResolvedValue({
-    kind: 'review',
-    review: { ...review, items: [{ ...review.items[1], key: 'vnc:v', kind: 'vnc', name: 'desk' }] },
-  })
-  vi.mocked(applyImport).mockResolvedValueOnce({ added: 1, updated: 0 })
-  listVncProfiles.mockResolvedValueOnce({ status: 'ok', data: [desk] })
-  useVncProfileStore.setState(useVncProfileStore.getInitialState())
-  const user = userEvent.setup()
-  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
-  const apply = await screen.findByRole('button', { name: 'Apply' })
-  expect(useVncProfileStore.getState().profiles).toEqual([])
-  await user.click(apply)
-  expect(applyImport).toHaveBeenCalledWith('r1', [
-    { key: 'vnc:v', accept: true, asNew: false, fields: [] },
-  ])
-  expect(await screen.findByText('Imported: 1 added, 0 updated.')).toBeInTheDocument()
-  await waitFor(() => expect(useVncProfileStore.getState().profiles).toEqual([desk]))
-  expect(listVncProfiles).toHaveBeenCalledTimes(1)
+  expect(screen.getByText('New Connection')).toBeInTheDocument()
 })
 
 test('an RDP profile is labelled RDP in the list and in its details', async () => {
@@ -189,7 +148,8 @@ test('an RDP profile is labelled RDP in the list and in its details', async () =
       items: [
         {
           key: 'rdp:m',
-          kind: 'rdp',
+          kind: 'connection',
+          parent: null,
           name: 'office',
           status: 'conflict',
           matched: { id: 'pc', name: 'tower' },
@@ -204,17 +164,17 @@ test('an RDP profile is labelled RDP in the list and in its details', async () =
           notes: [],
           notesAsNew: [],
         },
-        { ...review.items[1], key: 'rdp:n', kind: 'rdp', name: 'lab' },
+        { ...review.items[1], key: 'rdp:n', kind: 'connection', parent: null, name: 'lab' },
       ],
     },
   })
   const user = userEvent.setup()
-  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
-  expect(await screen.findByText('Matches your RDP "tower"')).toBeInTheDocument()
-  expect(screen.getAllByText('RDP')).toHaveLength(2)
+  render(<ImportReviewPage path="C:/in.json" onClose={onClose} />)
+  expect(await screen.findByText('Matches your Connection "tower"')).toBeInTheDocument()
+  expect(screen.getAllByText('Connection')).toHaveLength(2)
   expect(screen.getByText('German')).toBeInTheDocument()
   await user.click(screen.getByRole('button', { name: 'lab' }))
-  expect(screen.getByText('New RDP')).toBeInTheDocument()
+  expect(screen.getByText('New Connection')).toBeInTheDocument()
 })
 
 test('RDP sound, shared folder and gateway rows show with the shared folder notes', async () => {
@@ -227,7 +187,8 @@ test('RDP sound, shared folder and gateway rows show with the shared folder note
       items: [
         {
           key: 'rdp:m',
-          kind: 'rdp',
+          kind: 'connection',
+          parent: null,
           name: 'office',
           status: 'conflict',
           matched: { id: 'pc', name: 'office' },
@@ -251,7 +212,8 @@ test('RDP sound, shared folder and gateway rows show with the shared folder note
         },
         {
           key: 'rdp:t',
-          kind: 'rdp',
+          kind: 'connection',
+          parent: null,
           name: 'tower',
           status: 'conflict',
           matched: { id: 't', name: 'tower' },
@@ -270,7 +232,7 @@ test('RDP sound, shared folder and gateway rows show with the shared folder note
     },
   })
   const user = userEvent.setup()
-  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  render(<ImportReviewPage path="C:/in.json" onClose={onClose} />)
   expect(await screen.findByText('Sound')).toBeInTheDocument()
   expect(screen.getByText('On')).toBeInTheDocument()
   expect(screen.getByText('Off')).toBeInTheDocument()
@@ -298,57 +260,21 @@ test('RDP sound, shared folder and gateway rows show with the shared folder note
   ])
 })
 
-test('an imported RDP profile is in the RDP store once the import is applied', async () => {
-  const office: RdpProfile = {
-    id: 'r',
-    name: 'office',
-    host: 'h',
-    port: 3389,
-    username: 'u',
-    domain: null,
-    secretId: null,
-    keyboardLayout: 0x407,
-    icon: { kind: 'builtin', name: 'server' },
-    order: 0,
-  }
-  vi.mocked(readBundle).mockResolvedValue({
-    kind: 'review',
-    review: {
-      ...review,
-      items: [{ ...review.items[1], key: 'rdp:r', kind: 'rdp', name: 'office' }],
-    },
-  })
-  vi.mocked(applyImport).mockResolvedValueOnce({ added: 1, updated: 0 })
-  listRdpProfiles.mockResolvedValueOnce({ status: 'ok', data: [office] })
-  useRdpProfileStore.setState(useRdpProfileStore.getInitialState())
-  const user = userEvent.setup()
-  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
-  const apply = await screen.findByRole('button', { name: 'Apply' })
-  expect(useRdpProfileStore.getState().profiles).toEqual([])
-  await user.click(apply)
-  expect(applyImport).toHaveBeenCalledWith('r1', [
-    { key: 'rdp:r', accept: true, asNew: false, fields: [] },
-  ])
-  expect(await screen.findByText('Imported: 1 added, 0 updated.')).toBeInTheDocument()
-  await waitFor(() => expect(useRdpProfileStore.getState().profiles).toEqual([office]))
-  expect(listRdpProfiles).toHaveBeenCalledTimes(1)
-})
-
 test('the first changed profile is selected even when a new one comes first', async () => {
   vi.mocked(readBundle).mockResolvedValue({
     kind: 'review',
     review: { ...review, items: [review.items[1], review.items[0]] },
   })
-  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
-  expect(await screen.findByText('Matches your SSH "web"')).toBeInTheDocument()
+  render(<ImportReviewPage path="C:/in.json" onClose={onClose} />)
+  expect(await screen.findByText('Matches your Connection "web"')).toBeInTheDocument()
   expect(screen.getByLabelText('Accept Host')).toBeInTheDocument()
-  expect(screen.queryByText('New SSH')).not.toBeInTheDocument()
+  expect(screen.queryByText('New Connection')).not.toBeInTheDocument()
 })
 
 test('decline all turns every row off', async () => {
   vi.mocked(readBundle).mockResolvedValue({ kind: 'review', review })
   const user = userEvent.setup()
-  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  render(<ImportReviewPage path="C:/in.json" onClose={onClose} />)
   await user.click(await screen.findByRole('button', { name: 'Decline all' }))
   expect(screen.getByLabelText('Import web')).not.toBeChecked()
   expect(screen.getByLabelText('Import fresh')).not.toBeChecked()
@@ -357,7 +283,7 @@ test('decline all turns every row off', async () => {
 test('accept all after decline all checks every row again', async () => {
   vi.mocked(readBundle).mockResolvedValue({ kind: 'review', review })
   const user = userEvent.setup()
-  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  render(<ImportReviewPage path="C:/in.json" onClose={onClose} />)
   await user.click(await screen.findByRole('button', { name: 'Decline all' }))
   expect(screen.getByLabelText('Import web')).not.toBeChecked()
   expect(screen.getByRole('button', { name: 'Apply' })).toBeDisabled()
@@ -372,7 +298,7 @@ test('accept all after decline all checks every row again', async () => {
 test('add as new instead is sent with the apply', async () => {
   vi.mocked(readBundle).mockResolvedValue({ kind: 'review', review })
   const user = userEvent.setup()
-  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  render(<ImportReviewPage path="C:/in.json" onClose={onClose} />)
   await user.click(await screen.findByLabelText('Add as new instead'))
   expect(screen.getByText('It will be added separately.')).toBeInTheDocument()
   await user.click(screen.getByRole('button', { name: 'Apply' }))
@@ -387,7 +313,7 @@ test('add as new instead shows the notes a new profile gets', async () => {
   const kept = 'Kept your local keys; not on this machine: /Users/me/id'
   const asNew = 'Key file not on this machine: /Users/me/id'
   const user = userEvent.setup()
-  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  render(<ImportReviewPage path="C:/in.json" onClose={onClose} />)
   const toggle = await screen.findByLabelText('Add as new instead')
   expect(screen.getByText(kept)).toBeInTheDocument()
   expect(screen.queryByText(asNew)).not.toBeInTheDocument()
@@ -404,7 +330,7 @@ test('validation problems are shown and block apply', async () => {
   vi.mocked(validateImport).mockResolvedValue([
     { key: 'ssh:n', message: 'Key login needs at least one private key' },
   ])
-  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  render(<ImportReviewPage path="C:/in.json" onClose={onClose} />)
   expect(await screen.findByText(/Key login needs at least one private key/)).toBeInTheDocument()
   expect(screen.getByRole('button', { name: 'Apply' })).toBeDisabled()
 })
@@ -414,7 +340,7 @@ test('a validation answer for outdated decisions is ignored', async () => {
   const first = deferred<ItemProblem[]>()
   vi.mocked(validateImport).mockReturnValueOnce(first.promise)
   const user = userEvent.setup()
-  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  render(<ImportReviewPage path="C:/in.json" onClose={onClose} />)
   await waitFor(() => expect(validateImport).toHaveBeenCalledTimes(1))
   await user.click(screen.getByLabelText('Accept Host'))
   await waitFor(() => expect(validateImport).toHaveBeenCalledTimes(2))
@@ -435,7 +361,7 @@ test('repeated notes and problems are listed once', async () => {
   const own = { key: 'ssh:a', message: 'Its jump hosts would form a loop' }
   const other = { key: 'ssh:n', message: 'Key login needs at least one private key' }
   vi.mocked(validateImport).mockResolvedValue([own, own, other, other])
-  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  render(<ImportReviewPage path="C:/in.json" onClose={onClose} />)
   expect(
     await screen.findAllByText('fresh: Key login needs at least one private key'),
   ).toHaveLength(1)
@@ -447,7 +373,7 @@ test('repeated notes and problems are listed once', async () => {
 test('a decision changed right before Apply is not validated after the apply', async () => {
   vi.mocked(readBundle).mockResolvedValue({ kind: 'review', review })
   const user = userEvent.setup()
-  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  render(<ImportReviewPage path="C:/in.json" onClose={onClose} />)
   await waitFor(() => expect(validateImport).toHaveBeenCalledTimes(1))
   vi.mocked(validateImport).mockRejectedValue(new Error('not found: import r1'))
   await user.click(screen.getByLabelText('Accept Host'))
@@ -460,7 +386,7 @@ test('a decision changed right before Apply is not validated after the apply', a
 
 test('discards the pending import on unmount', async () => {
   vi.mocked(readBundle).mockResolvedValue({ kind: 'review', review })
-  const { unmount } = render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  const { unmount } = render(<ImportReviewPage path="C:/in.json" onClose={onClose} />)
   await screen.findByText(/1 new/)
   unmount()
   await waitFor(() => expect(discardImport).toHaveBeenCalledWith('r1'))
@@ -469,7 +395,7 @@ test('discards the pending import on unmount', async () => {
 test('a read that finishes after unmount is discarded', async () => {
   const read = deferred<ReadResult>()
   vi.mocked(readBundle).mockReturnValueOnce(read.promise)
-  const { unmount } = render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  const { unmount } = render(<ImportReviewPage path="C:/in.json" onClose={onClose} />)
   unmount()
   expect(discardImport).not.toHaveBeenCalled()
   read.resolve({ kind: 'review', review: { ...review, reviewId: 'r2' } })
@@ -484,7 +410,7 @@ test('under StrictMode every review the page received is shown or discarded', as
     .mockResolvedValueOnce({ kind: 'review', review: shown })
   const { unmount } = render(
     <StrictMode>
-      <ImportReviewPage tabId="t" path="C:/in.json" />
+      <ImportReviewPage path="C:/in.json" onClose={onClose} />
     </StrictMode>,
   )
   expect(await screen.findByLabelText('Import shown')).toBeInTheDocument()
@@ -497,7 +423,7 @@ test('under StrictMode every review the page received is shown or discarded', as
 
 test('a file that cannot be read shows the message without an Error prefix', async () => {
   vi.mocked(readBundle).mockRejectedValueOnce(new Error('import error: not a wisp export'))
-  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  render(<ImportReviewPage path="C:/in.json" onClose={onClose} />)
   expect(await screen.findByText('import error: not a wisp export')).toBeInTheDocument()
   expect(screen.queryByText(/Error:/)).not.toBeInTheDocument()
 })
@@ -506,7 +432,7 @@ test('a failed apply shows the message and keeps the review open', async () => {
   vi.mocked(readBundle).mockResolvedValue({ kind: 'review', review })
   vi.mocked(applyImport).mockRejectedValueOnce(new Error('io: denied'))
   const user = userEvent.setup()
-  const { unmount } = render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  const { unmount } = render(<ImportReviewPage path="C:/in.json" onClose={onClose} />)
   await waitFor(() => expect(validateImport).toHaveBeenCalledTimes(1))
   const apply = screen.getByRole('button', { name: 'Apply' })
   await user.click(apply)
@@ -529,7 +455,7 @@ test('a failed apply refreshes the problems and its message goes once they are f
     new Error('import error: 1 item(s) still need attention'),
   )
   const user = userEvent.setup()
-  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  render(<ImportReviewPage path="C:/in.json" onClose={onClose} />)
   const apply = await screen.findByRole('button', { name: 'Apply' })
   vi.mocked(validateImport).mockResolvedValue([
     { key: 'ssh:n', message: 'Key login needs at least one private key' },
@@ -549,17 +475,17 @@ test('a failed apply refreshes the problems and its message goes once they are f
   expect(apply).toBeEnabled()
 })
 
-test('a failed profile reload still shows the import summary', async () => {
+test('a failed host list reload still shows the import summary', async () => {
   vi.mocked(readBundle).mockResolvedValue({ kind: 'review', review })
   load.mockRejectedValueOnce(new Error('io: denied'))
   const user = userEvent.setup()
-  const { unmount } = render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  const { unmount } = render(<ImportReviewPage path="C:/in.json" onClose={onClose} />)
   await user.click(await screen.findByRole('button', { name: 'Apply' }))
   expect(await screen.findByText('Imported: 1 added, 1 updated.')).toBeInTheDocument()
   expect(
-    await screen.findByText('The profile list could not be refreshed: io: denied'),
+    await screen.findByText('The host list could not be refreshed: io: denied'),
   ).toBeInTheDocument()
-  expect(load).toHaveBeenCalledTimes(5)
+  expect(load).toHaveBeenCalledTimes(1)
   expect(screen.queryByRole('button', { name: 'Apply' })).not.toBeInTheDocument()
   unmount()
   expect(discardImport).not.toHaveBeenCalled()
@@ -571,7 +497,7 @@ test('Open is disabled while the password is checked and Enter submits', async (
     .mockResolvedValueOnce({ kind: 'needsPassword' })
     .mockReturnValueOnce(read.promise)
   const user = userEvent.setup()
-  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  render(<ImportReviewPage path="C:/in.json" onClose={onClose} />)
   const open = await screen.findByRole('button', { name: 'Open' })
   expect(open).toBeDisabled()
   await user.type(screen.getByLabelText('Export password'), 'pw')
@@ -591,10 +517,10 @@ test('Open submits its own tab when another import tab also asks for a password'
   render(
     <>
       <div className="hidden">
-        <ImportReviewPage tabId="a" path="C:/a.json" />
+        <ImportReviewPage path="C:/a.json" onClose={onClose} />
       </div>
       <div data-testid="second">
-        <ImportReviewPage tabId="b" path="C:/b.json" />
+        <ImportReviewPage path="C:/b.json" onClose={onClose} />
       </div>
     </>,
   )
@@ -612,7 +538,7 @@ test('a failed password read shows its message and the next attempt clears it', 
     .mockRejectedValueOnce(new Error('io: C:/in.json: not found'))
     .mockReturnValueOnce(retry.promise)
   const user = userEvent.setup()
-  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  render(<ImportReviewPage path="C:/in.json" onClose={onClose} />)
   await user.type(await screen.findByLabelText('Export password'), 'pw')
   const open = screen.getByRole('button', { name: 'Open' })
   await user.click(open)
@@ -633,7 +559,7 @@ test('Wrong password. goes away while the next attempt is checked', async () => 
     .mockResolvedValueOnce({ kind: 'wrongPassword' })
     .mockReturnValueOnce(retry.promise)
   const user = userEvent.setup()
-  render(<ImportReviewPage tabId="t" path="C:/in.json" />)
+  render(<ImportReviewPage path="C:/in.json" onClose={onClose} />)
   await user.type(await screen.findByLabelText('Export password'), 'x')
   const open = screen.getByRole('button', { name: 'Open' })
   await user.click(open)
@@ -642,4 +568,28 @@ test('Wrong password. goes away while the next attempt is checked', async () => 
   expect(screen.queryByText('Wrong password.')).not.toBeInTheDocument()
   await act(async () => retry.resolve({ kind: 'review', review }))
   expect(screen.getByText(/1 new/)).toBeInTheDocument()
+})
+
+test('a new host lists its connections under it, and declining it declines them', async () => {
+  const item = review.items[1]
+  vi.mocked(readBundle).mockResolvedValue({
+    kind: 'review',
+    review: {
+      ...review,
+      items: [
+        { ...item, key: 'host:h', kind: 'host', name: 'nas' },
+        { ...item, key: 'conn:a', kind: 'connection', name: 'nas · SSH · admin', parent: 'host:h' },
+      ],
+    },
+  })
+  const user = userEvent.setup()
+  render(<ImportReviewPage path="C:/in.json" onClose={onClose} />)
+  const host = await screen.findByRole('button', { name: 'nas' })
+  const connection = screen.getByRole('button', { name: 'nas · SSH · admin' })
+  const nested = connection.closest('ul')?.parentElement
+  expect(nested?.tagName).toBe('LI')
+  expect(nested?.previousElementSibling).toContainElement(host)
+  await user.click(screen.getByLabelText('Import nas'))
+  await user.click(screen.getByRole('button', { name: 'Apply' }))
+  expect(applyImport).not.toHaveBeenCalled()
 })

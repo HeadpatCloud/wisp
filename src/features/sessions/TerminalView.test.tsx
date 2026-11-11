@@ -78,10 +78,10 @@ vi.mock('@xterm/addon-webgl', () => ({
 vi.mock('@xterm/xterm/css/xterm.css', () => ({}))
 
 import { type TerminalSearch, TerminalView } from './TerminalView'
+import { DARK_THEME } from './terminalTheme'
 
 const settings: AppearanceSettings = {
-  theme: 'dark',
-  colorScheme: 'default',
+  colors: DARK_THEME,
   fontFamily: 'monospace',
   fontSize: 14,
   fontWeight: 'normal',

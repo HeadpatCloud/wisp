@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useId, useRef, useState } from 'react'
 import type { ApplySummary, ImportReview, ItemKind, ItemProblem, ReviewItem } from '@/bindings'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -12,12 +12,7 @@ import {
   validateImport,
 } from '@/lib/transfer'
 import { cn } from '@/lib/utils'
-import { useProfileStore } from '@/stores/profileStore'
-import { useRdpProfileStore } from '@/stores/rdpProfileStore'
-import { useS3ProfileStore } from '@/stores/s3ProfileStore'
-import { useSessionStore } from '@/stores/sessionStore'
-import { useSftpProfileStore } from '@/stores/sftpProfileStore'
-import { useVncProfileStore } from '@/stores/vncProfileStore'
+import { useHostStore } from '@/stores/hostStore'
 import {
   type Decisions,
   initialDecisions,
@@ -26,30 +21,26 @@ import {
   setAsNew,
   setField,
   setItem,
+  toggleItem,
   toPayload,
 } from './review'
 import { TriCheckbox } from './TriCheckbox'
 
 const KIND: Record<ItemKind, string> = {
-  group: 'Group',
-  ssh: 'SSH',
-  sftp: 'SFTP',
-  s3: 'S3',
-  vnc: 'VNC',
-  rdp: 'RDP',
+  folder: 'Folder',
+  host: 'Host',
+  connection: 'Connection',
+  login: 'Saved login',
+  key: 'Key',
+  tag: 'Tag',
 }
 
 function errorText(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
 }
 
-export function ImportReviewPage({ tabId, path }: { tabId: string; path: string }) {
-  const removeTab = useSessionStore((s) => s.removeTab)
-  const reloadProfiles = useProfileStore((s) => s.load)
-  const reloadSftp = useSftpProfileStore((s) => s.load)
-  const reloadS3 = useS3ProfileStore((s) => s.load)
-  const reloadVnc = useVncProfileStore((s) => s.load)
-  const reloadRdp = useRdpProfileStore((s) => s.load)
+export function ImportReviewPage({ path, onClose }: { path: string; onClose: () => void }) {
+  const reloadHosts = useHostStore((s) => s.load)
   const [stage, setStage] = useState<'loading' | 'password' | 'review' | 'done'>('loading')
   const [password, setPassword] = useState('')
   const [wrongPassword, setWrongPassword] = useState(false)
@@ -145,7 +136,7 @@ export function ImportReviewPage({ tabId, path }: { tabId: string; path: string 
       reviewIdRef.current = null
       setSummary(result)
       setStage('done')
-      await Promise.all([reloadProfiles(), reloadSftp(), reloadS3(), reloadVnc(), reloadRdp()])
+      await reloadHosts()
     } catch (e) {
       failedRef.current = decisions
       setError(errorText(e))
@@ -155,20 +146,20 @@ export function ImportReviewPage({ tabId, path }: { tabId: string; path: string 
   }
 
   const close = (
-    <Button type="button" onClick={() => removeTab(tabId)}>
+    <Button type="button" onClick={onClose}>
       Close
     </Button>
   )
 
   if (stage === 'done' && summary) {
     return (
-      <PageShell title="Import profiles" footer={close}>
+      <PageShell title="Import hosts" footer={close}>
         <div className="space-y-2 text-sm">
           <p>
             Imported: {summary.added} added, {summary.updated} updated.
           </p>
           {error && (
-            <p className="text-destructive">The profile list could not be refreshed: {error}</p>
+            <p className="text-destructive">The host list could not be refreshed: {error}</p>
           )}
         </div>
       </PageShell>
@@ -178,10 +169,10 @@ export function ImportReviewPage({ tabId, path }: { tabId: string; path: string 
   if (stage === 'password') {
     return (
       <PageShell
-        title="Import profiles"
+        title="Import hosts"
         footer={
           <>
-            <Button type="button" variant="ghost" onClick={() => removeTab(tabId)}>
+            <Button type="button" variant="ghost" onClick={onClose}>
               Cancel
             </Button>
             <Button type="submit" form={formId} disabled={!password || busy}>
@@ -218,7 +209,7 @@ export function ImportReviewPage({ tabId, path }: { tabId: string; path: string 
 
   if (!review) {
     return (
-      <PageShell title="Import profiles" footer={close}>
+      <PageShell title="Import hosts" footer={close}>
         {error ? (
           <p className="text-destructive text-sm">{error}</p>
         ) : (
@@ -250,7 +241,7 @@ export function ImportReviewPage({ tabId, path }: { tabId: string; path: string 
         <TriCheckbox
           state={itemState(item, decisions[item.key])}
           label={`Import ${item.name}`}
-          onChange={(on) => setDecisions((d) => setItem(d, item, on))}
+          onChange={(on) => setDecisions((d) => toggleItem(review, d, item, on))}
         />
         <button
           type="button"
@@ -268,12 +259,33 @@ export function ImportReviewPage({ tabId, path }: { tabId: string; path: string 
     </li>
   )
 
+  // Connections sit under their host; one whose host isn't listed stands on its own.
+  const tree = (list: ReviewItem[]) => (
+    <ul className="space-y-0.5">
+      {list
+        .filter((i) => !review.items.some((p) => p.key === i.parent))
+        .map((item) => {
+          const children = review.items.filter((c) => c.parent === item.key)
+          return (
+            <Fragment key={item.key}>
+              {row(item)}
+              {children.length > 0 && (
+                <li>
+                  <ul className="space-y-0.5 pl-5">{children.map(row)}</ul>
+                </li>
+              )}
+            </Fragment>
+          )
+        })}
+    </ul>
+  )
+
   return (
     <PageShell
-      title="Import profiles"
+      title="Import hosts"
       footer={
         <>
-          <Button type="button" variant="ghost" onClick={() => removeTab(tabId)}>
+          <Button type="button" variant="ghost" onClick={onClose}>
             Cancel
           </Button>
           <Button
@@ -317,13 +329,13 @@ export function ImportReviewPage({ tabId, path }: { tabId: string; path: string 
               {changed.length > 0 && (
                 <section>
                   <h3 className="mb-1 font-semibold">With changes</h3>
-                  <ul className="space-y-0.5">{changed.map(row)}</ul>
+                  {tree(changed)}
                 </section>
               )}
               {fresh.length > 0 && (
                 <section>
                   <h3 className="mb-1 font-semibold">New</h3>
-                  <ul className="space-y-0.5">{fresh.map(row)}</ul>
+                  {tree(fresh)}
                 </section>
               )}
             </div>

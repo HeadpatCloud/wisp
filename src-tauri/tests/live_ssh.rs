@@ -400,7 +400,7 @@ async fn key_login() {
     let (path, mut handle) = (key("id_ed25519_enc"), connected(PORT).await);
     let locked = within(WAIT, "login", auth_key(&mut handle, USER, &path, None)).await;
     let locked = locked.expect_err("logged in with a locked key");
-    assert!(matches!(locked, AppError::PassphraseRequired), "{locked:?}");
+    assert!(matches!(locked, AppError::PassphraseRequired(_)), "{locked:?}");
     assert_eq!(locked.to_string(), "key is encrypted - passphrase required");
     let wrong = within(WAIT, "login", auth_key(&mut handle, USER, &path, Some("wisptext"))).await;
     let wrong = wrong.expect_err("logged in with a wrong passphrase");
@@ -540,6 +540,7 @@ async fn local_forward_carries_bulk_both_ways() {
     let (app_handle, bind) = (app.handle().clone(), format!("{HOST}:{port}"));
     let tunnel =
         run_local(app_handle, "live".into(), "live".into(), handle, bind, HOST.into(), 7000)
+            .await
             .unwrap();
 
     let sent = noise(8, 8 * MIB);
@@ -568,7 +569,7 @@ async fn dynamic_forward() {
     let port = free_port();
     let bind = format!("{HOST}:{port}");
     let tunnel =
-        run_dynamic(app.handle().clone(), "live".into(), "live".into(), handle, bind).unwrap();
+        run_dynamic(app.handle().clone(), "live".into(), "live".into(), handle, bind).await.unwrap();
 
     let mut stream = dial(port).await;
     let started = Instant::now();
@@ -693,6 +694,7 @@ async fn shell_stays_responsive_while_a_tunnel_is_blocked() {
     let app_handle = app.handle().clone();
     let tunnel =
         run_local(app_handle, "live".into(), "live".into(), handle.clone(), bind, HOST.into(), 7001)
+            .await
             .unwrap();
     let mut stream = dial(port).await;
     let chunk = vec![0x55u8; 64 * 1024];
@@ -754,6 +756,7 @@ async fn shell_while_a_tunnel_download_is_blocked() {
     let (app_handle, bind) = (app.handle().clone(), format!("{HOST}:{port}"));
     let tunnel =
         run_local(app_handle, "live".into(), "live".into(), handle.clone(), bind, HOST.into(), 7002)
+            .await
             .unwrap();
     // A connection made before socat listens is closed again at once.
     let started = Instant::now();

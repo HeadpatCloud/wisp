@@ -1,6 +1,4 @@
-import { open as pickFile } from '@tauri-apps/plugin-dialog'
 import { useEffect, useState } from 'react'
-import type { AuthMethod } from '@/bindings'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -10,69 +8,60 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
+import { ProfileIcon } from '@/features/hosts/ProfileIcon'
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
-import { ProfileIcon } from '@/features/profiles/ProfileIcon'
-import { useProfileStore } from '@/stores/profileStore'
+  type AdhocForm,
+  type AdhocInitial,
+  AdhocLoginFields,
+  adhocForm,
+  adhocReady,
+} from '@/features/sessions/AdhocLoginFields'
+import { connectionLabel, effectiveAddress } from '@/lib/hosts'
+import { useHostStore } from '@/stores/hostStore'
 
-// What the form collects: the plaintext secret is exchanged for a vault id before it
-// reaches the session store.
-export interface SftpManualParams {
-  host: string
-  port: number
-  username: string
-  authMethod: AuthMethod
-  keyPath: string
-  secret: string
-}
-
+// With `initial` (connect once from an address) the dialog opens on the manual form, filled in.
 export function SftpConnectDialog({
   open,
   onOpenChange,
   onPick,
   onConnect,
+  initial,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
   onPick: (profileId: string, title: string) => void
-  onConnect: (params: SftpManualParams) => void
+  onConnect: (params: AdhocForm) => void
+  initial?: AdhocInitial
 }) {
-  const profiles = useProfileStore((s) => s.profiles)
+  const hosts = useHostStore((s) => s.hosts)
+  const logins = useHostStore((s) => s.logins)
+  const profiles = hosts
+    .slice()
+    .sort((a, b) => a.order - b.order)
+    .flatMap((h) => {
+      const ssh = h.connections.filter((c) => c.kind.type === 'ssh')
+      return ssh.map((c) => ({
+        id: c.id,
+        title: h.name,
+        name: ssh.length > 1 ? `${h.name} · ${connectionLabel(h, c, logins)}` : h.name,
+        host: effectiveAddress(h, c),
+        icon: h.icon,
+      }))
+    })
   const [query, setQuery] = useState('')
   const [manual, setManual] = useState(false)
-  const [host, setHost] = useState('')
-  const [port, setPort] = useState(22)
-  const [username, setUsername] = useState('')
-  const [authMethod, setAuthMethod] = useState<AuthMethod>('password')
-  const [keyPath, setKeyPath] = useState('')
-  const [secret, setSecret] = useState('')
+  const [form, setForm] = useState<AdhocForm>(() => adhocForm(22))
 
   useEffect(() => {
     if (!open) return
-    setManual(false)
-    setHost('')
-    setPort(22)
-    setUsername('')
-    setAuthMethod('password')
-    setKeyPath('')
-    setSecret('')
-  }, [open])
+    setManual(!!initial)
+    setForm(adhocForm(22, initial))
+  }, [open, initial])
 
-  const portValid = Number.isInteger(port) && port >= 1 && port <= 65535
   const q = query.trim().toLowerCase()
-  const filtered = (
-    q
-      ? profiles.filter((p) => p.name.toLowerCase().includes(q) || p.host.toLowerCase().includes(q))
-      : profiles
-  )
-    .slice()
-    .sort((a, b) => a.order - b.order)
+  const filtered = q
+    ? profiles.filter((p) => p.name.toLowerCase().includes(q) || p.host.toLowerCase().includes(q))
+    : profiles
 
   const pick = (id: string, name: string) => {
     onPick(id, name)
@@ -87,98 +76,16 @@ export function SftpConnectDialog({
         </DialogHeader>
         {manual ? (
           <>
-            <div className="space-y-2">
-              <div className="space-y-1">
-                <Label htmlFor="sftp-host">Host</Label>
-                <Input
-                  id="sftp-host"
-                  autoFocus
-                  value={host}
-                  onChange={(e) => setHost(e.target.value)}
-                />
-              </div>
-              <div className="space-y-1">
-                <Label htmlFor="sftp-port">Port</Label>
-                <Input
-                  id="sftp-port"
-                  type="number"
-                  value={port}
-                  onChange={(e) => setPort(Number(e.target.value) || 22)}
-                />
-              </div>
-              <div className="space-y-1">
-                <Label htmlFor="sftp-username">Username</Label>
-                <Input
-                  id="sftp-username"
-                  value={username}
-                  onChange={(e) => setUsername(e.target.value)}
-                />
-              </div>
-              <div className="space-y-1">
-                <Label htmlFor="sftp-auth">Auth method</Label>
-                <Select value={authMethod} onValueChange={(v) => setAuthMethod(v as AuthMethod)}>
-                  <SelectTrigger id="sftp-auth">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="password">Password</SelectItem>
-                    <SelectItem value="key">Private key</SelectItem>
-                    <SelectItem value="agent">SSH agent</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-              {authMethod === 'key' && (
-                <div className="space-y-1">
-                  <Label htmlFor="sftp-key-path">Key path</Label>
-                  <div className="flex gap-2">
-                    <Input
-                      id="sftp-key-path"
-                      value={keyPath}
-                      onChange={(e) => setKeyPath(e.target.value)}
-                    />
-                    <Button
-                      type="button"
-                      variant="secondary"
-                      onClick={async () => {
-                        const picked = await pickFile({ multiple: false, directory: false })
-                        if (typeof picked === 'string') setKeyPath(picked)
-                      }}
-                    >
-                      Browse
-                    </Button>
-                  </div>
-                </div>
-              )}
-              {authMethod !== 'agent' && (
-                <div className="space-y-1">
-                  <Label htmlFor="sftp-secret">
-                    {authMethod === 'key' ? 'Passphrase' : 'Password'}
-                  </Label>
-                  <Input
-                    id="sftp-secret"
-                    type="password"
-                    value={secret}
-                    onChange={(e) => setSecret(e.target.value)}
-                  />
-                </div>
-              )}
-            </div>
+            <AdhocLoginFields idPrefix="sftp" value={form} onChange={setForm} />
             <DialogFooter>
               <Button type="button" variant="ghost" onClick={() => setManual(false)}>
                 Back
               </Button>
               <Button
                 type="button"
-                disabled={!host || !username || !portValid || (authMethod === 'key' && !keyPath)}
+                disabled={!adhocReady(form)}
                 onClick={() => {
-                  onConnect({
-                    host,
-                    port,
-                    username,
-                    authMethod,
-                    keyPath: authMethod === 'key' ? keyPath : '',
-                    secret: authMethod === 'agent' ? '' : secret,
-                  })
+                  onConnect(form)
                   onOpenChange(false)
                 }}
               >
@@ -204,7 +111,7 @@ export function SftpConnectDialog({
                   <button
                     key={p.id}
                     type="button"
-                    onClick={() => pick(p.id, p.name)}
+                    onClick={() => pick(p.id, p.title)}
                     className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm hover:bg-muted"
                   >
                     <ProfileIcon icon={p.icon} className="size-4 text-muted-foreground" />

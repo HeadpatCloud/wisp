@@ -7,41 +7,70 @@ use same_file::is_same_file;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use super::bundle::{KeyFile, Payload};
-use super::plan::{digest, field, gateway_secret, group_depth, plan, same_tunnel, Plan};
+use super::bundle::{KeyFile, PayloadV3};
+use super::plan::{field, folder_depth, gateway_secret, own_secret, plan, same_tunnel, Plan};
 use super::{ApplySummary, Env, ItemDecision, ItemKind, ItemProblem, ReviewItem};
 use crate::error::{AppError, AppResult};
-use crate::store::model::{
-    AuthMethod, Group, IconRef, Profile, ProfileKey, ProfileStore, RdpGateway, Tunnel,
+use crate::store::hosts::{
+    Connection, ConnectionKind, Folder, Host, HostsFile, Login, OwnLogin, OwnSftp, RdpGatewayConn,
+    SavedLogin, SavedLoginRef, SshKey, Tag, THIS_COMPUTER,
 };
-use crate::store::{normalize_keys, Store};
+use crate::store::model::{AuthMethod, IconRef, Tunnel};
+use crate::store::Store;
 use crate::vault::Vault;
 
 pub const SECRET_PREFIX: &str = "pending-secret:";
 pub const KEY_PREFIX: &str = "pending-key:";
 
 pub struct Staged {
-    pub data: ProfileStore,
+    pub data: HostsFile,
     pub secrets: Vec<Zeroizing<String>>,
     pub key_files: Vec<KeyFile>,
-    pub replaced_secrets: Vec<String>,
     pub summary: ApplySummary,
 }
 
+type Ids = HashMap<String, Option<String>>;
+
 struct Stager<'a> {
-    payload: &'a Payload,
+    payload: &'a PayloadV3,
     plan: &'a Plan,
     env: &'a dyn Env,
     decisions: HashMap<&'a str, &'a ItemDecision>,
-    data: ProfileStore,
+    data: HostsFile,
     secrets: Vec<Zeroizing<String>>,
     key_files: Vec<KeyFile>,
-    replaced: Vec<String>,
     problems: Vec<ItemProblem>,
     summary: ApplySummary,
-    group_ids: HashMap<String, Option<String>>,
-    profile_ids: HashMap<String, Option<String>>,
+    folder_ids: Ids,
+    tag_ids: Ids,
+    key_ids: Ids,
+    login_ids: Ids,
+    conn_ids: Ids,
     touched: Vec<(String, String)>,
+}
+
+fn fresh() -> String {
+    Uuid::new_v4().to_string()
+}
+
+fn fresh_tunnels(local: &[Tunnel], incoming: &[Tunnel]) -> Vec<Tunnel> {
+    incoming
+        .iter()
+        .map(|t| Tunnel {
+            id: local.iter().find(|l| same_tunnel(l, t)).map(|l| l.id.clone()).unwrap_or_else(fresh),
+            ..t.clone()
+        })
+        .collect()
+}
+
+fn set_own_secret(login: &mut Login, secret: Option<String>) -> bool {
+    match login {
+        Login::Own(o) => {
+            o.secret_id = secret;
+            true
+        }
+        Login::Saved(_) => false,
+    }
 }
 
 impl<'a> Stager<'a> {
@@ -58,74 +87,81 @@ impl<'a> Stager<'a> {
         (d.accept, d.as_new, fields)
     }
 
-    // Final local id for an incoming item, or None when it won't exist after apply.
-    fn final_id(&self, kind: ItemKind, id: &str) -> Option<String> {
-        let key = kind.key(id);
-        let (accept, as_new, _) = self.decision(&key);
-        // An incoming id that already exists locally must not be reused for a separate item.
-        let taken = match kind {
-            ItemKind::Group => self.data.groups.iter().any(|g| g.id == id),
-            ItemKind::Ssh => self.data.profiles.iter().any(|p| p.id == id),
-            ItemKind::Sftp => self.data.sftp_profiles.iter().any(|p| p.id == id),
-            ItemKind::S3 => self.data.s3_profiles.iter().any(|p| p.id == id),
-            ItemKind::Vnc => self.data.vnc_profiles.iter().any(|p| p.id == id),
-            ItemKind::Rdp => self.data.rdp_profiles.iter().any(|p| p.id == id),
-        };
-        match self.plan.matches.get(&key) {
+    // Final local id for an incoming item, or None when it won't exist after apply. An incoming
+    // id that already exists locally is never reused for a separate item.
+    fn final_id(&self, key: &str, id: &str, taken: bool) -> Option<String> {
+        let (accept, as_new, _) = self.decision(key);
+        match self.plan.matches.get(key) {
             Some(local) if !(accept && as_new) => Some(local.clone()),
-            _ if accept => {
-                Some(if as_new || taken { Uuid::new_v4().to_string() } else { id.to_string() })
-            }
+            _ if accept => Some(if as_new || taken { fresh() } else { id.to_string() }),
             _ => None,
         }
+    }
+
+    // Where a match was taken as a separate copy, or nothing matched: the item is new.
+    fn is_new(&self, key: &str) -> bool {
+        let (accept, as_new, _) = self.decision(key);
+        !self.plan.matches.contains_key(key) || (accept && as_new)
     }
 
     fn problem(&mut self, key: &str, message: String) {
         self.problems.push(ItemProblem { key: key.into(), message });
     }
 
-    fn resolve(
-        &self,
-        map: &HashMap<String, Option<String>>,
-        id: Option<&str>,
-        exists_locally: bool,
-        name: impl Fn(&str) -> String,
-    ) -> Result<Option<String>, String> {
-        let Some(id) = id else { return Ok(None) };
+    fn resolve(map: &Ids, id: &str, here: bool, gone: impl FnOnce() -> String) -> Result<String, String> {
         match map.get(id) {
-            Some(Some(final_id)) => Ok(Some(final_id.clone())),
-            Some(None) => Err(name(id)),
-            None if exists_locally => Ok(Some(id.to_string())),
-            None => Ok(None),
+            Some(Some(final_id)) => Ok(final_id.clone()),
+            Some(None) => Err(gone()),
+            None if here => Ok(id.to_string()),
+            None => Err(gone()),
         }
     }
 
-    fn group(&self, id: Option<&str>) -> Result<Option<String>, String> {
-        let local = id.is_some_and(|id| self.data.groups.iter().any(|g| g.id == id));
-        self.resolve(&self.group_ids, id, local, |id| {
-            let name = self
-                .payload
-                .groups
-                .iter()
-                .find(|g| g.id == id)
-                .map(|g| g.name.as_str())
-                .unwrap_or(id);
-            format!("Its group \"{name}\" isn't being imported")
+    fn folder(&self, id: Option<&str>) -> Result<Option<String>, String> {
+        let Some(id) = id else { return Ok(None) };
+        let here = self.data.folders.iter().any(|f| f.id == id);
+        if !here && !self.folder_ids.contains_key(id) {
+            return Ok(None);
+        }
+        Self::resolve(&self.folder_ids, id, here, || {
+            let name = self.payload.folders.iter().find(|f| f.id == id).map(|f| f.name.as_str()).unwrap_or(id);
+            format!("Its folder \"{name}\" isn't being imported")
         })
+        .map(Some)
+    }
+
+    fn tags(&self, ids: &[String]) -> Result<Vec<String>, String> {
+        ids.iter()
+            .map(|id| {
+                let here = self.data.tags.iter().any(|t| &t.id == id);
+                Self::resolve(&self.tag_ids, id, here, || {
+                    let name = self.payload.tags.iter().find(|t| &t.id == id).map(|t| t.name.as_str()).unwrap_or(id);
+                    format!("Its tag \"{name}\" isn't being imported")
+                })
+            })
+            .collect()
+    }
+
+    fn keys(&self, ids: &[String]) -> Result<Vec<String>, String> {
+        ids.iter()
+            .map(|id| {
+                let here = self.data.keys.iter().any(|k| &k.id == id);
+                Self::resolve(&self.key_ids, id, here, || {
+                    let name = self.payload.keys.iter().find(|k| &k.id == id).map(|k| k.path.as_str()).unwrap_or(id);
+                    format!("Its key \"{name}\" isn't being imported")
+                })
+            })
+            .collect()
     }
 
     fn jump(&self, id: Option<&str>) -> Result<Option<String>, String> {
-        let local = id.is_some_and(|id| self.data.profiles.iter().any(|p| p.id == id));
-        self.resolve(&self.profile_ids, id, local, |id| {
-            let name = self
-                .payload
-                .profiles
-                .iter()
-                .find(|p| p.id == id)
-                .map(|p| p.name.as_str())
-                .unwrap_or(id);
-            format!("Its jump host \"{name}\" isn't being imported")
-        })
+        let Some(id) = id else { return Ok(None) };
+        let here = self.data.connections().any(|c| c.id == id);
+        // Neither exported nor here: the review told the user it connects directly.
+        if !here && !self.conn_ids.contains_key(id) {
+            return Ok(None);
+        }
+        Self::resolve(&self.conn_ids, id, here, || "Its jump host isn't being imported".into()).map(Some)
     }
 
     fn secret(&mut self, incoming: Option<&str>) -> Option<String> {
@@ -134,53 +170,31 @@ impl<'a> Stager<'a> {
         Some(format!("{SECRET_PREFIX}{}", self.secrets.len() - 1))
     }
 
-    fn keys(&mut self, local: &[ProfileKey], incoming: &[ProfileKey]) -> Vec<ProfileKey> {
-        let local_digests: Vec<(Option<String>, &ProfileKey)> =
-            local.iter().map(|k| (self.env.read_file(&k.path).map(|b| digest(&b)), k)).collect();
-        let mut out = Vec::new();
-        for k in incoming {
-            let embedded = self.payload.key_files.get(&k.path).cloned();
-            // A key path on a network share is never stored: opening it at connect time would
-            // send the user's credentials to whatever server the bundle named. Nor is a path
-            // spelled like a placeholder, which would alias another item's embedded key file.
-            if embedded.is_none()
-                && (super::is_network_path(&k.path) || k.path.starts_with(KEY_PREFIX))
-            {
-                continue;
+    // The incoming login in local terms. `secret` is what an own login's password becomes.
+    fn login(&self, inc: &Login, secret: Option<String>) -> Result<Login, String> {
+        match inc {
+            Login::Saved(s) => {
+                let here = self.data.logins.iter().any(|l| l.id == s.login_id);
+                let id = Self::resolve(&self.login_ids, &s.login_id, here, || {
+                    let name = self
+                        .payload
+                        .logins
+                        .iter()
+                        .find(|l| l.id == s.login_id)
+                        .map(|l| l.name.as_str())
+                        .unwrap_or(&s.login_id);
+                    format!("Its saved login \"{name}\" isn't being imported")
+                })?;
+                Ok(Login::Saved(SavedLoginRef { login_id: id, extra: Default::default() }))
             }
-            let content = match &embedded {
-                Some(f) => STANDARD.decode(f.data.as_bytes()).ok().map(|b| digest(&b)),
-                None => self.env.read_file(&k.path).map(|b| digest(&b)),
-            };
-            let same =
-                local_digests.iter().find(|(d, _)| d.is_some() && *d == content).map(|(_, l)| *l);
-            let path = match (embedded, same) {
-                // The same key is already here, so the profile keeps following the user's own
-                // file instead of an app-managed copy.
-                (Some(_), Some(l)) => l.path.clone(),
-                (Some(f), None) => {
-                    self.key_files.push(f);
-                    format!("{KEY_PREFIX}{}", self.key_files.len() - 1)
-                }
-                (None, _) => k.path.clone(),
-            };
-            let kept = same.and_then(|l| l.secret_id.clone());
-            let incoming = k.secret_id.as_deref().and_then(|id| self.payload.secrets.get(id));
-            let current = kept.as_deref().and_then(|id| self.env.secret(id));
-            let secret_id = match (incoming, current) {
-                (Some(new), Some(old)) if old.as_slice() == new.as_bytes() => kept,
-                _ => self.secret(k.secret_id.as_deref()).or(kept),
-            };
-            out.push(ProfileKey { path, secret_id });
+            Login::Own(o) => Ok(Login::Own(OwnLogin {
+                username: o.username.clone(),
+                auth_method: o.auth_method,
+                key_ids: self.keys(&o.key_ids)?,
+                secret_id: secret,
+                extra: Default::default(),
+            })),
         }
-        let kept: HashSet<&str> = out.iter().filter_map(|k| k.secret_id.as_deref()).collect();
-        let replaced: Vec<String> = local
-            .iter()
-            .filter_map(|k| k.secret_id.clone())
-            .filter(|id| !kept.contains(id.as_str()))
-            .collect();
-        self.replaced.extend(replaced);
-        out
     }
 
     fn icon(&self, icon: &IconRef) -> IconRef {
@@ -189,25 +203,603 @@ impl<'a> Stager<'a> {
             other => other.clone(),
         }
     }
-}
 
-fn fresh_tunnels(local: &[Tunnel], incoming: &[Tunnel]) -> Vec<Tunnel> {
-    incoming
-        .iter()
-        .map(|t| Tunnel {
-            id: local
-                .iter()
-                .find(|l| same_tunnel(l, t))
-                .map(|l| l.id.clone())
-                .unwrap_or_else(|| Uuid::new_v4().to_string()),
-            ..t.clone()
-        })
-        .collect()
+    fn new_connection(&mut self, inc: &Connection, id: String) -> Result<Connection, String> {
+        let kind = match &inc.kind {
+            ConnectionKind::Ssh(s) => {
+                let secret = self.secret(own_secret(&s.login));
+                let mut next = s.clone();
+                next.login = self.login(&s.login, secret)?;
+                next.jump_host_id = self.jump(s.jump_host_id.as_deref())?;
+                next.tunnels = fresh_tunnels(&[], &s.tunnels);
+                next.extra = Default::default();
+                ConnectionKind::Ssh(next)
+            }
+            ConnectionKind::Sftp(s) => {
+                let mut next = s.clone();
+                next.own = match &s.own {
+                    None => None,
+                    Some(o) => {
+                        let secret = self.secret(own_secret(&o.login));
+                        Some(OwnSftp { port: o.port, login: self.login(&o.login, secret)?, extra: Default::default() })
+                    }
+                };
+                next.extra = Default::default();
+                ConnectionKind::Sftp(next)
+            }
+            ConnectionKind::Ftp(f) => {
+                let secret = self.secret(own_secret(&f.login));
+                let mut next = f.clone();
+                next.login = self.login(&f.login, secret)?;
+                next.extra = Default::default();
+                ConnectionKind::Ftp(next)
+            }
+            ConnectionKind::S3(s) => {
+                let mut next = s.clone();
+                next.secret_id = self.secret(s.secret_id.as_deref());
+                next.extra = Default::default();
+                ConnectionKind::S3(next)
+            }
+            ConnectionKind::Rdp(r) => {
+                let secret = self.secret(own_secret(&r.login));
+                let mut next = r.clone();
+                next.login = self.login(&r.login, secret)?;
+                next.shared_folder = r.shared_folder.clone().filter(|f| self.env.dir_exists(&f.path));
+                next.gateway = match &r.gateway {
+                    None => None,
+                    Some(g) => {
+                        let login = match &g.login {
+                            None => None,
+                            Some(l) => {
+                                let secret = self.secret(own_secret(l));
+                                Some(self.login(l, secret)?)
+                            }
+                        };
+                        Some(RdpGatewayConn { host: g.host.clone(), port: g.port, login, extra: Default::default() })
+                    }
+                };
+                next.extra = Default::default();
+                ConnectionKind::Rdp(next)
+            }
+            ConnectionKind::Vnc(v) => {
+                let mut next = v.clone();
+                next.secret_id = self.secret(v.secret_id.as_deref());
+                next.extra = Default::default();
+                ConnectionKind::Vnc(next)
+            }
+            ConnectionKind::Local(_) => return Err("Local shells can't be imported".into()),
+        };
+        Ok(Connection { id, label: inc.label.clone(), address: inc.address.clone(), kind, extra: Default::default() })
+    }
+
+    // Applies the accepted rows of a matched connection, in a fixed order: a login before its
+    // password, a gateway before its password.
+    fn update_connection(&mut self, key: &str, next: &mut Connection, inc: &Connection, fields: &HashSet<&str>) {
+        let has = |f: &str| fields.contains(f);
+        if has(field::LABEL) {
+            next.label = inc.label.clone();
+        }
+        if has(field::ADDRESS) {
+            next.address = inc.address.clone();
+        }
+        let mut failed = vec![];
+        match (&mut next.kind, &inc.kind) {
+            (ConnectionKind::Ssh(n), ConnectionKind::Ssh(i)) => {
+                if has(field::PORT) {
+                    n.port = i.port;
+                }
+                if has(field::LOGIN) {
+                    let kept = own_secret(&n.login).map(str::to_string);
+                    match self.login(&i.login, kept) {
+                        Ok(l) => n.login = l,
+                        Err(m) => failed.push(m),
+                    }
+                }
+                if has(field::PASSWORD) {
+                    let secret = self.secret(own_secret(&i.login));
+                    if !set_own_secret(&mut n.login, secret) {
+                        failed.push("The password needs a login of its own".into());
+                    }
+                }
+                if has(field::JUMP_HOST_ID) {
+                    match self.jump(i.jump_host_id.as_deref()) {
+                        Ok(j) => n.jump_host_id = j,
+                        Err(m) => failed.push(m),
+                    }
+                }
+                if has(field::TUNNELS) {
+                    n.tunnels = fresh_tunnels(&n.tunnels, &i.tunnels);
+                }
+                if has(field::APPEARANCE) {
+                    n.appearance = i.appearance.clone();
+                }
+            }
+            (ConnectionKind::Sftp(n), ConnectionKind::Sftp(i)) => {
+                if has(field::SFTP_LOGIN) {
+                    let kept = n.own.as_ref().and_then(|o| own_secret(&o.login)).map(str::to_string);
+                    n.own = match &i.own {
+                        None => None,
+                        Some(o) => match self.login(&o.login, kept) {
+                            Ok(login) => Some(OwnSftp { port: o.port, login, extra: Default::default() }),
+                            Err(m) => {
+                                failed.push(m);
+                                n.own.clone()
+                            }
+                        },
+                    };
+                }
+                if has(field::PASSWORD) {
+                    let secret = self.secret(i.own.as_ref().and_then(|o| own_secret(&o.login)));
+                    if !n.own.as_mut().is_some_and(|o| set_own_secret(&mut o.login, secret)) {
+                        failed.push("The password needs a login of its own".into());
+                    }
+                }
+                if has(field::START_FOLDER) {
+                    n.start_folder = i.start_folder.clone();
+                }
+            }
+            (ConnectionKind::Ftp(n), ConnectionKind::Ftp(i)) => {
+                if has(field::PORT) {
+                    n.port = i.port;
+                }
+                if has(field::LOGIN) {
+                    let kept = own_secret(&n.login).map(str::to_string);
+                    match self.login(&i.login, kept) {
+                        Ok(l) => n.login = l,
+                        Err(m) => failed.push(m),
+                    }
+                }
+                if has(field::PASSWORD) {
+                    let secret = self.secret(own_secret(&i.login));
+                    if !set_own_secret(&mut n.login, secret) {
+                        failed.push("The password needs a login of its own".into());
+                    }
+                }
+                if has(field::SECURE) {
+                    n.secure = i.secure;
+                }
+                if has(field::ALLOW_INVALID_CERT) {
+                    n.allow_invalid_cert = i.allow_invalid_cert;
+                }
+                if has(field::IGNORE_HOSTNAME) {
+                    n.ignore_hostname = i.ignore_hostname;
+                }
+            }
+            (ConnectionKind::S3(n), ConnectionKind::S3(i)) => {
+                if has(field::PORT) {
+                    n.port = i.port;
+                }
+                if has(field::REGION) {
+                    n.region = i.region.clone();
+                }
+                if has(field::USE_TLS) {
+                    n.use_tls = i.use_tls;
+                }
+                if has(field::PATH_STYLE) {
+                    n.path_style = i.path_style;
+                }
+                if has(field::ACCESS_KEY_ID) {
+                    n.access_key_id = i.access_key_id.clone();
+                }
+                if has(field::BUCKET) {
+                    n.bucket = i.bucket.clone();
+                }
+                if has(field::PASSWORD) {
+                    n.secret_id = self.secret(i.secret_id.as_deref());
+                }
+            }
+            (ConnectionKind::Rdp(n), ConnectionKind::Rdp(i)) => {
+                if has(field::PORT) {
+                    n.port = i.port;
+                }
+                if has(field::LOGIN) {
+                    let kept = own_secret(&n.login).map(str::to_string);
+                    match self.login(&i.login, kept) {
+                        Ok(l) => n.login = l,
+                        Err(m) => failed.push(m),
+                    }
+                }
+                if has(field::PASSWORD) {
+                    let secret = self.secret(own_secret(&i.login));
+                    if !set_own_secret(&mut n.login, secret) {
+                        failed.push("The password needs a login of its own".into());
+                    }
+                }
+                if has(field::DOMAIN) {
+                    n.domain = i.domain.clone();
+                }
+                if has(field::KEYBOARD_LAYOUT) {
+                    n.keyboard_layout = i.keyboard_layout;
+                }
+                if has(field::AUDIO) {
+                    n.audio = i.audio;
+                }
+                if has(field::SHARED_FOLDER) {
+                    n.shared_folder = i.shared_folder.clone();
+                }
+                if has(field::GATEWAY) {
+                    let kept = gateway_secret(&n.gateway).map(str::to_string);
+                    n.gateway = match &i.gateway {
+                        None => None,
+                        Some(g) => {
+                            let login = match &g.login {
+                                None => Ok(None),
+                                Some(l) => self.login(l, kept).map(Some),
+                            };
+                            match login {
+                                Ok(login) => Some(RdpGatewayConn {
+                                    host: g.host.clone(),
+                                    port: g.port,
+                                    login,
+                                    extra: Default::default(),
+                                }),
+                                Err(m) => {
+                                    failed.push(m);
+                                    n.gateway.clone()
+                                }
+                            }
+                        }
+                    };
+                }
+                if has(field::GATEWAY_PASSWORD) {
+                    let secret = self.secret(gateway_secret(&i.gateway));
+                    let login = n.gateway.as_mut().and_then(|g| g.login.as_mut());
+                    if !login.is_some_and(|l| set_own_secret(l, secret)) {
+                        failed.push("Gateway password needs the incoming RD Gateway".into());
+                    }
+                }
+            }
+            (ConnectionKind::Vnc(n), ConnectionKind::Vnc(i)) => {
+                if has(field::PORT) {
+                    n.port = i.port;
+                }
+                if has(field::USERNAME) {
+                    n.username = i.username.clone();
+                }
+                if has(field::PASSWORD) {
+                    n.secret_id = self.secret(i.secret_id.as_deref());
+                }
+            }
+            _ => {}
+        }
+        for m in failed {
+            self.problem(key, m);
+        }
+    }
+
+    fn order_in(&self, folder: &Option<String>) -> u32 {
+        self.data.hosts.iter().filter(|h| &h.folder_id == folder).map(|h| h.order + 1).max().unwrap_or(0)
+    }
+
+    fn stage_folders(&mut self) {
+        let mut folders: Vec<&Folder> = self.payload.folders.iter().collect();
+        folders.sort_by_key(|f| folder_depth(f, &self.payload.folders));
+        for f in folders {
+            let key = ItemKind::Folder.key(&f.id);
+            let (accept, _, fields) = self.decision(&key);
+            if !accept {
+                continue;
+            }
+            let parent = self.folder(f.parent_id.as_deref());
+            if self.is_new(&key) {
+                let id = self.folder_ids.get(&f.id).cloned().flatten().expect("accepted folder has an id");
+                let parent_id = parent.unwrap_or_else(|m| {
+                    self.problem(&key, m);
+                    None
+                });
+                let order = self.data.folders.iter().filter(|x| x.parent_id == parent_id).map(|x| x.order + 1).max().unwrap_or(0);
+                let icon = self.icon(&f.icon);
+                self.data.folders.push(Folder { id: id.clone(), name: f.name.clone(), parent_id, icon, order, extra: Default::default() });
+                self.summary.added += 1;
+                self.touched.push((key, id));
+            } else if !fields.is_empty() {
+                let local = self.plan.matches[&key].clone();
+                let at = self.data.folders.iter().position(|x| x.id == local).expect("matched folder exists");
+                if fields.contains(field::NAME) {
+                    self.data.folders[at].name = f.name.clone();
+                }
+                if fields.contains(field::PARENT_ID) {
+                    match parent {
+                        Ok(p) => self.data.folders[at].parent_id = p,
+                        Err(m) => self.problem(&key, m),
+                    }
+                }
+                if fields.contains(field::ICON) {
+                    self.data.folders[at].icon = f.icon.clone();
+                }
+                self.summary.updated += 1;
+                self.touched.push((key, local));
+            }
+        }
+    }
+
+    fn stage_tags(&mut self) {
+        for t in self.payload.tags.iter() {
+            let key = ItemKind::Tag.key(&t.id);
+            let (accept, _, fields) = self.decision(&key);
+            if !accept {
+                continue;
+            }
+            if self.is_new(&key) {
+                let id = self.tag_ids.get(&t.id).cloned().flatten().expect("accepted tag has an id");
+                self.data.tags.push(Tag { id, extra: Default::default(), ..t.clone() });
+                self.summary.added += 1;
+            } else if !fields.is_empty() {
+                let local = self.plan.matches[&key].clone();
+                let next = self.data.tags.iter_mut().find(|x| x.id == local).expect("matched tag exists");
+                for f in &fields {
+                    match *f {
+                        field::NAME => next.name = t.name.clone(),
+                        field::COLOR => next.color = t.color.clone(),
+                        field::SHOW_COLOR => next.show_color = t.show_color,
+                        field::ASK_BEFORE_CLOSE => next.ask_before_close = t.ask_before_close,
+                        field::ASK_BEFORE_PASTE => next.ask_before_paste = t.ask_before_paste,
+                        field::TERMINAL_COLORS => next.terminal_colors = t.terminal_colors.clone(),
+                        _ => {}
+                    }
+                }
+                self.summary.updated += 1;
+            }
+        }
+    }
+
+    fn key_path(&mut self, k: &SshKey) -> Result<String, String> {
+        if let Some(f) = self.payload.key_files.get(&k.path).cloned() {
+            self.key_files.push(f);
+            return Ok(format!("{KEY_PREFIX}{}", self.key_files.len() - 1));
+        }
+        // A key path on a network share is never stored: opening it at connect time would send
+        // the user's credentials to whatever server the bundle named. Nor is a path spelled like
+        // a placeholder, which would alias another item's embedded key file.
+        if super::is_network_path(&k.path) || k.path.starts_with(KEY_PREFIX) {
+            return Err("Its key file is on a network share; Wisp won't open it".into());
+        }
+        Ok(k.path.clone())
+    }
+
+    fn stage_keys(&mut self) {
+        for k in self.payload.keys.iter() {
+            let key = ItemKind::Key.key(&k.id);
+            let (accept, _, fields) = self.decision(&key);
+            if !accept {
+                continue;
+            }
+            if self.is_new(&key) {
+                let id = self.key_ids.get(&k.id).cloned().flatten().expect("accepted key has an id");
+                let path = self.key_path(k).unwrap_or_else(|m| {
+                    self.problem(&key, m);
+                    k.path.clone()
+                });
+                let secret_id = self.secret(k.secret_id.as_deref());
+                self.data.keys.push(SshKey { id: id.clone(), path, secret_id, extra: Default::default() });
+                self.summary.added += 1;
+                self.touched.push((key, id));
+            } else if !fields.is_empty() {
+                let local = self.plan.matches[&key].clone();
+                let at = self.data.keys.iter().position(|x| x.id == local).expect("matched key exists");
+                if fields.contains(field::KEY_FILE) {
+                    match self.key_path(k) {
+                        Ok(path) => self.data.keys[at].path = path,
+                        Err(m) => self.problem(&key, m),
+                    }
+                }
+                if fields.contains(field::PASSPHRASE) {
+                    self.data.keys[at].secret_id = self.secret(k.secret_id.as_deref());
+                }
+                self.summary.updated += 1;
+                self.touched.push((key, local));
+            }
+        }
+    }
+
+    fn stage_logins(&mut self) {
+        for l in self.payload.logins.iter() {
+            let key = ItemKind::Login.key(&l.id);
+            let (accept, _, fields) = self.decision(&key);
+            if !accept {
+                continue;
+            }
+            if self.is_new(&key) {
+                let id = self.login_ids.get(&l.id).cloned().flatten().expect("accepted login has an id");
+                let key_ids = self.keys(&l.key_ids).unwrap_or_else(|m| {
+                    self.problem(&key, m);
+                    vec![]
+                });
+                let secret_id = self.secret(l.secret_id.as_deref());
+                self.data.logins.push(SavedLogin { id: id.clone(), key_ids, secret_id, extra: Default::default(), ..l.clone() });
+                self.summary.added += 1;
+                self.touched.push((key, id));
+            } else if !fields.is_empty() {
+                let local = self.plan.matches[&key].clone();
+                let at = self.data.logins.iter().position(|x| x.id == local).expect("matched login exists");
+                if fields.contains(field::NAME) {
+                    self.data.logins[at].name = l.name.clone();
+                }
+                if fields.contains(field::USERNAME) {
+                    self.data.logins[at].username = l.username.clone();
+                }
+                if fields.contains(field::AUTH_METHOD) {
+                    self.data.logins[at].auth_method = l.auth_method;
+                }
+                if fields.contains(field::KEYS) {
+                    match self.keys(&l.key_ids) {
+                        Ok(ids) => self.data.logins[at].key_ids = ids,
+                        Err(m) => self.problem(&key, m),
+                    }
+                }
+                if fields.contains(field::PASSWORD) {
+                    self.data.logins[at].secret_id = self.secret(l.secret_id.as_deref());
+                }
+                self.summary.updated += 1;
+                self.touched.push((key, local));
+            }
+        }
+    }
+
+    fn stage_hosts(&mut self) {
+        let hosts: Vec<&Host> = self.payload.hosts.iter().filter(|h| h.id != THIS_COMPUTER).collect();
+        for h in hosts {
+            let key = ItemKind::Host.key(&h.id);
+            let (accept, _, fields) = self.decision(&key);
+            if self.is_new(&key) {
+                if !accept {
+                    continue;
+                }
+                let taken = self.data.hosts.iter().any(|x| x.id == h.id);
+                let id = self.final_id(&key, &h.id, taken).expect("accepted host has an id");
+                let folder_id = self.folder(h.folder_id.as_deref()).unwrap_or_else(|m| {
+                    self.problem(&key, m);
+                    None
+                });
+                let tag_ids = self.tags(&h.tag_ids).unwrap_or_else(|m| {
+                    self.problem(&key, m);
+                    vec![]
+                });
+                let mut connections = vec![];
+                for c in &h.connections {
+                    let Some(Some(cid)) = self.conn_ids.get(&c.id).cloned() else { continue };
+                    let ckey = ItemKind::Connection.key(&c.id);
+                    match self.new_connection(c, cid.clone()) {
+                        Ok(conn) => connections.push(conn),
+                        Err(m) => self.problem(&ckey, m),
+                    }
+                    self.touched.push((ckey, cid));
+                }
+                let order = self.order_in(&folder_id);
+                let icon = self.icon(&h.icon);
+                self.data.hosts.push(Host {
+                    id: id.clone(),
+                    name: h.name.clone(),
+                    address: h.address.clone(),
+                    folder_id,
+                    tag_ids,
+                    icon,
+                    color: h.color.clone(),
+                    order,
+                    connections,
+                    extra: Default::default(),
+                });
+                self.summary.added += 1;
+                self.touched.push((key, id));
+                continue;
+            }
+
+            let local = self.plan.matches[&key].clone();
+            let at = self.data.hosts.iter().position(|x| x.id == local).expect("matched host exists");
+            if accept && !fields.is_empty() {
+                if fields.contains(field::NAME) {
+                    self.data.hosts[at].name = h.name.clone();
+                }
+                if fields.contains(field::ADDRESS) {
+                    self.data.hosts[at].address = h.address.clone();
+                }
+                if fields.contains(field::FOLDER_ID) {
+                    match self.folder(h.folder_id.as_deref()) {
+                        Ok(f) => self.data.hosts[at].folder_id = f,
+                        Err(m) => self.problem(&key, m),
+                    }
+                }
+                if fields.contains(field::TAGS) {
+                    match self.tags(&h.tag_ids) {
+                        Ok(t) => self.data.hosts[at].tag_ids = t,
+                        Err(m) => self.problem(&key, m),
+                    }
+                }
+                if fields.contains(field::ICON) {
+                    self.data.hosts[at].icon = h.icon.clone();
+                }
+                if fields.contains(field::COLOR) {
+                    self.data.hosts[at].color = h.color.clone();
+                }
+                self.summary.updated += 1;
+                self.touched.push((key.clone(), local.clone()));
+            }
+            for c in &h.connections {
+                let ckey = ItemKind::Connection.key(&c.id);
+                let (caccept, _, cfields) = self.decision(&ckey);
+                if !caccept {
+                    continue;
+                }
+                let Some(Some(cid)) = self.conn_ids.get(&c.id).cloned() else { continue };
+                if self.is_new(&ckey) {
+                    match self.new_connection(c, cid.clone()) {
+                        Ok(conn) => {
+                            let at = self.data.hosts.iter().position(|x| x.id == local).expect("matched host exists");
+                            self.data.hosts[at].connections.push(conn);
+                        }
+                        Err(m) => self.problem(&ckey, m),
+                    }
+                    self.summary.added += 1;
+                } else if !cfields.is_empty() {
+                    let at = self.data.hosts.iter().position(|x| x.id == local).expect("matched host exists");
+                    let ci = self.data.hosts[at].connections.iter().position(|x| x.id == cid).expect("matched connection exists");
+                    let mut next = self.data.hosts[at].connections[ci].clone();
+                    self.update_connection(&ckey, &mut next, c, &cfields);
+                    self.data.hosts[at].connections[ci] = next;
+                    self.summary.updated += 1;
+                }
+                self.touched.push((ckey, cid));
+            }
+        }
+    }
+
+    fn check(&mut self) {
+        let mut found: Vec<(String, String)> = vec![];
+        for (key, id) in &self.touched {
+            let key_login_without_keys = |l: &Login| {
+                matches!(l, Login::Own(o) if o.auth_method == AuthMethod::Key && o.key_ids.is_empty())
+            };
+            if let Some(l) = self.data.logins.iter().find(|l| &l.id == id) {
+                if l.auth_method == AuthMethod::Key && l.key_ids.is_empty() {
+                    found.push((key.clone(), "Key login needs at least one private key".into()));
+                }
+            }
+            if let Some(c) = self.data.connections().find(|c| &c.id == id) {
+                if c.kind.logins().into_iter().any(key_login_without_keys) {
+                    found.push((key.clone(), "Key login needs at least one private key".into()));
+                }
+                let jump = |id: &str| {
+                    self.data.connections().find(|c| c.id == id).and_then(|c| match &c.kind {
+                        ConnectionKind::Ssh(s) => s.jump_host_id.clone(),
+                        _ => None,
+                    })
+                };
+                let mut seen = HashSet::new();
+                let mut hop = jump(id);
+                while let Some(h) = hop {
+                    if &h == id || !seen.insert(h.clone()) {
+                        found.push((key.clone(), "Its jump hosts would form a loop".into()));
+                        break;
+                    }
+                    hop = jump(&h);
+                }
+            }
+            if let Some(f) = self.data.folders.iter().find(|f| &f.id == id) {
+                let mut seen = HashSet::new();
+                let mut parent = f.parent_id.clone();
+                while let Some(p) = parent {
+                    if &p == id || !seen.insert(p.clone()) {
+                        found.push((key.clone(), "Its parent folders would form a loop".into()));
+                        break;
+                    }
+                    parent = self.data.folders.iter().find(|f| f.id == p).and_then(|f| f.parent_id.clone());
+                }
+            }
+        }
+        for (key, message) in found {
+            self.problem(&key, message);
+        }
+        if self.problems.is_empty() {
+            if let Err(AppError::Invalid(m)) = self.data.validate() {
+                self.problem("", m);
+            }
+        }
+    }
 }
 
 pub fn stage(
-    local: &ProfileStore,
-    payload: &Payload,
+    local: &HostsFile,
+    payload: &PayloadV3,
     plan: &Plan,
     decisions: &[ItemDecision],
     env: &dyn Env,
@@ -220,533 +812,86 @@ pub fn stage(
         data: local.clone(),
         secrets: vec![],
         key_files: vec![],
-        replaced: vec![],
         problems: vec![],
         summary: ApplySummary { added: 0, updated: 0 },
-        group_ids: HashMap::new(),
-        profile_ids: HashMap::new(),
+        folder_ids: HashMap::new(),
+        tag_ids: HashMap::new(),
+        key_ids: HashMap::new(),
+        login_ids: HashMap::new(),
+        conn_ids: HashMap::new(),
         touched: vec![],
     };
-    for g in &payload.groups {
-        let id = s.final_id(ItemKind::Group, &g.id);
-        s.group_ids.insert(g.id.clone(), id);
+    for f in &payload.folders {
+        let taken = local.folders.iter().any(|x| x.id == f.id);
+        let id = s.final_id(&ItemKind::Folder.key(&f.id), &f.id, taken);
+        s.folder_ids.insert(f.id.clone(), id);
     }
-    for p in &payload.profiles {
-        let id = s.final_id(ItemKind::Ssh, &p.id);
-        s.profile_ids.insert(p.id.clone(), id);
+    for t in &payload.tags {
+        let taken = local.tags.iter().any(|x| x.id == t.id);
+        let id = s.final_id(&ItemKind::Tag.key(&t.id), &t.id, taken);
+        s.tag_ids.insert(t.id.clone(), id);
     }
-
-    let mut groups: Vec<&Group> = payload.groups.iter().collect();
-    groups.sort_by_key(|g| group_depth(g, &payload.groups));
-    for g in groups {
-        let key = ItemKind::Group.key(&g.id);
-        let (accept, as_new, fields) = s.decision(&key);
-        if !accept {
-            continue;
-        }
-        let matched = plan.matches.get(&key).filter(|_| !as_new).cloned();
-        let parent = s.group(g.parent_id.as_deref());
-        match matched {
-            Some(local_id) => {
-                if fields.is_empty() {
-                    continue;
-                }
-                let mut next = s
-                    .data
-                    .groups
-                    .iter()
-                    .find(|x| x.id == local_id)
-                    .cloned()
-                    .expect("matched group exists");
-                if fields.contains(field::NAME) {
-                    next.name = g.name.clone();
-                }
-                if fields.contains(field::PARENT_ID) {
-                    match parent {
-                        Ok(p) => next.parent_id = p,
-                        Err(m) => s.problem(&key, m),
-                    }
-                }
-                if fields.contains(field::ICON) {
-                    next.icon = g.icon.clone();
-                }
-                if let Some(slot) = s.data.groups.iter_mut().find(|x| x.id == local_id) {
-                    *slot = next;
-                }
-                s.summary.updated += 1;
-                s.touched.push((key, local_id));
-            }
-            None => {
-                let id =
-                    s.group_ids.get(&g.id).cloned().flatten().expect("accepted group has an id");
-                let parent_id = match parent {
-                    Ok(p) => p,
-                    Err(m) => {
-                        s.problem(&key, m);
-                        None
-                    }
-                };
-                let order = s
-                    .data
-                    .groups
-                    .iter()
-                    .filter(|x| x.parent_id == parent_id)
-                    .map(|x| x.order + 1)
-                    .max()
-                    .unwrap_or(0);
-                let icon = s.icon(&g.icon);
-                s.data.groups.push(Group {
-                    id: id.clone(),
-                    name: g.name.clone(),
-                    parent_id,
-                    icon,
-                    order,
-                    extra: Default::default(),
-                });
-                s.summary.added += 1;
-                s.touched.push((key, id));
-            }
+    for k in &payload.keys {
+        let taken = local.keys.iter().any(|x| x.id == k.id);
+        let id = s.final_id(&ItemKind::Key.key(&k.id), &k.id, taken);
+        s.key_ids.insert(k.id.clone(), id);
+    }
+    for l in &payload.logins {
+        let taken = local.logins.iter().any(|x| x.id == l.id);
+        let id = s.final_id(&ItemKind::Login.key(&l.id), &l.id, taken);
+        s.login_ids.insert(l.id.clone(), id);
+    }
+    for h in payload.hosts.iter().filter(|h| h.id != THIS_COMPUTER) {
+        let hkey = ItemKind::Host.key(&h.id);
+        let (host_accept, host_as_new, _) = s.decision(&hkey);
+        let host_matched = plan.matches.contains_key(&hkey);
+        for c in &h.connections {
+            let ckey = ItemKind::Connection.key(&c.id);
+            let taken = local.connections().any(|x| x.id == c.id);
+            let id = if host_matched && host_as_new && host_accept {
+                Some(fresh())
+            } else if host_matched {
+                s.final_id(&ckey, &c.id, taken)
+            } else {
+                let (accept, _, _) = s.decision(&ckey);
+                (host_accept && accept).then(|| if taken { fresh() } else { c.id.clone() })
+            };
+            s.conn_ids.insert(c.id.clone(), id);
         }
     }
 
-    for p in &payload.profiles {
-        let mut inc = p.clone();
-        normalize_keys(&mut inc);
-        let key = ItemKind::Ssh.key(&inc.id);
-        let (accept, as_new, fields) = s.decision(&key);
-        if !accept {
-            continue;
-        }
-        let matched = plan.matches.get(&key).filter(|_| !as_new).cloned();
-        match matched {
-            Some(local_id) => {
-                if fields.is_empty() {
-                    continue;
-                }
-                let mut next = s
-                    .data
-                    .profiles
-                    .iter()
-                    .find(|x| x.id == local_id)
-                    .cloned()
-                    .expect("matched profile exists");
-                for f in &fields {
-                    match *f {
-                        field::NAME => next.name = inc.name.clone(),
-                        field::HOST => next.host = inc.host.clone(),
-                        field::PORT => next.port = inc.port,
-                        field::USERNAME => next.username = inc.username.clone(),
-                        field::AUTH_METHOD => next.auth_method = inc.auth_method,
-                        field::GROUP_ID => match s.group(inc.group_id.as_deref()) {
-                            Ok(g) => next.group_id = g,
-                            Err(m) => s.problem(&key, m),
-                        },
-                        field::JUMP_HOST_ID => match s.jump(inc.jump_host_id.as_deref()) {
-                            Ok(j) => next.jump_host_id = j,
-                            Err(m) => s.problem(&key, m),
-                        },
-                        field::ICON => next.icon = inc.icon.clone(),
-                        field::APPEARANCE => next.appearance = inc.appearance.clone(),
-                        field::TUNNELS => next.tunnels = fresh_tunnels(&next.tunnels, &inc.tunnels),
-                        field::KEYS => next.keys = s.keys(&next.keys.clone(), &inc.keys),
-                        field::PASSWORD => {
-                            s.replaced.extend(next.secret_id.take());
-                            next.secret_id = s.secret(inc.secret_id.as_deref());
-                        }
-                        _ => {}
-                    }
-                }
-                if let Some(slot) = s.data.profiles.iter_mut().find(|x| x.id == local_id) {
-                    *slot = next;
-                }
-                s.summary.updated += 1;
-                s.touched.push((key, local_id));
-            }
-            None => {
-                let id = s
-                    .profile_ids
-                    .get(&inc.id)
-                    .cloned()
-                    .flatten()
-                    .expect("accepted profile has an id");
-                let group_id = s.group(inc.group_id.as_deref()).unwrap_or_else(|m| {
-                    s.problem(&key, m);
-                    None
-                });
-                let jump_host_id = s.jump(inc.jump_host_id.as_deref()).unwrap_or_else(|m| {
-                    s.problem(&key, m);
-                    None
-                });
-                let keys = s.keys(&[], &inc.keys);
-                let secret_id = s.secret(inc.secret_id.as_deref());
-                let order = s
-                    .data
-                    .profiles
-                    .iter()
-                    .filter(|x| x.group_id == group_id)
-                    .map(|x| x.order + 1)
-                    .max()
-                    .unwrap_or(0);
-                let profile = Profile {
-                    id: id.clone(),
-                    group_id,
-                    jump_host_id,
-                    keys,
-                    secret_id,
-                    icon: s.icon(&inc.icon),
-                    tunnels: fresh_tunnels(&[], &inc.tunnels),
-                    order,
-                    ..inc
-                };
-                s.data.profiles.push(profile);
-                s.summary.added += 1;
-                s.touched.push((key, id));
-            }
-        }
-    }
-
-    for inc in &payload.sftp_profiles {
-        let key = ItemKind::Sftp.key(&inc.id);
-        let (accept, as_new, fields) = s.decision(&key);
-        if !accept {
-            continue;
-        }
-        match plan.matches.get(&key).filter(|_| !as_new).cloned() {
-            Some(local_id) => {
-                if fields.is_empty() {
-                    continue;
-                }
-                let mut next = s
-                    .data
-                    .sftp_profiles
-                    .iter()
-                    .find(|x| x.id == local_id)
-                    .cloned()
-                    .expect("matched sftp profile exists");
-                for f in &fields {
-                    match *f {
-                        field::NAME => next.name = inc.name.clone(),
-                        field::HOST => next.host = inc.host.clone(),
-                        field::PORT => next.port = inc.port,
-                        field::USERNAME => next.username = inc.username.clone(),
-                        field::AUTH_METHOD => next.auth_method = inc.auth_method,
-                        field::ICON => next.icon = inc.icon.clone(),
-                        field::KEYS => next.keys = s.keys(&next.keys.clone(), &inc.keys),
-                        field::PASSWORD => {
-                            s.replaced.extend(next.secret_id.take());
-                            next.secret_id = s.secret(inc.secret_id.as_deref());
-                        }
-                        _ => {}
-                    }
-                }
-                if let Some(slot) = s.data.sftp_profiles.iter_mut().find(|x| x.id == local_id) {
-                    *slot = next;
-                }
-                s.summary.updated += 1;
-                s.touched.push((key, local_id));
-            }
-            None => {
-                let id =
-                    s.final_id(ItemKind::Sftp, &inc.id).expect("accepted sftp profile has an id");
-                let keys = s.keys(&[], &inc.keys);
-                let secret_id = s.secret(inc.secret_id.as_deref());
-                let order = s.data.sftp_profiles.iter().map(|x| x.order + 1).max().unwrap_or(0);
-                let icon = s.icon(&inc.icon);
-                s.data.sftp_profiles.push(crate::store::model::SftpProfile {
-                    id: id.clone(),
-                    keys,
-                    secret_id,
-                    icon,
-                    order,
-                    ..inc.clone()
-                });
-                s.summary.added += 1;
-                s.touched.push((key, id));
-            }
-        }
-    }
-
-    for inc in &payload.s3_profiles {
-        let key = ItemKind::S3.key(&inc.id);
-        let (accept, as_new, fields) = s.decision(&key);
-        if !accept {
-            continue;
-        }
-        match plan.matches.get(&key).filter(|_| !as_new).cloned() {
-            Some(local_id) => {
-                if fields.is_empty() {
-                    continue;
-                }
-                let mut next = s
-                    .data
-                    .s3_profiles
-                    .iter()
-                    .find(|x| x.id == local_id)
-                    .cloned()
-                    .expect("matched s3 profile exists");
-                for f in &fields {
-                    match *f {
-                        field::NAME => next.name = inc.name.clone(),
-                        field::ENDPOINT => next.endpoint = inc.endpoint.clone(),
-                        field::PORT => next.port = inc.port,
-                        field::REGION => next.region = inc.region.clone(),
-                        field::USE_TLS => next.use_tls = inc.use_tls,
-                        field::PATH_STYLE => next.path_style = inc.path_style,
-                        field::ACCESS_KEY_ID => next.access_key_id = inc.access_key_id.clone(),
-                        field::BUCKET => next.bucket = inc.bucket.clone(),
-                        field::ICON => next.icon = inc.icon.clone(),
-                        field::PASSWORD => {
-                            s.replaced.extend(next.secret_id.take());
-                            next.secret_id = s.secret(inc.secret_id.as_deref());
-                        }
-                        _ => {}
-                    }
-                }
-                if let Some(slot) = s.data.s3_profiles.iter_mut().find(|x| x.id == local_id) {
-                    *slot = next;
-                }
-                s.summary.updated += 1;
-                s.touched.push((key, local_id));
-            }
-            None => {
-                let id = s.final_id(ItemKind::S3, &inc.id).expect("accepted s3 profile has an id");
-                let secret_id = s.secret(inc.secret_id.as_deref());
-                let order = s.data.s3_profiles.iter().map(|x| x.order + 1).max().unwrap_or(0);
-                let icon = s.icon(&inc.icon);
-                s.data.s3_profiles.push(crate::store::model::S3Profile {
-                    id: id.clone(),
-                    secret_id,
-                    icon,
-                    order,
-                    ..inc.clone()
-                });
-                s.summary.added += 1;
-                s.touched.push((key, id));
-            }
-        }
-    }
-
-    for inc in &payload.vnc_profiles {
-        let key = ItemKind::Vnc.key(&inc.id);
-        let (accept, as_new, fields) = s.decision(&key);
-        if !accept {
-            continue;
-        }
-        match plan.matches.get(&key).filter(|_| !as_new).cloned() {
-            Some(local_id) => {
-                if fields.is_empty() {
-                    continue;
-                }
-                let mut next = s
-                    .data
-                    .vnc_profiles
-                    .iter()
-                    .find(|x| x.id == local_id)
-                    .cloned()
-                    .expect("matched vnc profile exists");
-                for f in &fields {
-                    match *f {
-                        field::NAME => next.name = inc.name.clone(),
-                        field::HOST => next.host = inc.host.clone(),
-                        field::PORT => next.port = inc.port,
-                        field::USERNAME => next.username = inc.username.clone(),
-                        field::ICON => next.icon = inc.icon.clone(),
-                        field::PASSWORD => {
-                            s.replaced.extend(next.secret_id.take());
-                            next.secret_id = s.secret(inc.secret_id.as_deref());
-                        }
-                        _ => {}
-                    }
-                }
-                if let Some(slot) = s.data.vnc_profiles.iter_mut().find(|x| x.id == local_id) {
-                    *slot = next;
-                }
-                s.summary.updated += 1;
-                s.touched.push((key, local_id));
-            }
-            None => {
-                let id =
-                    s.final_id(ItemKind::Vnc, &inc.id).expect("accepted vnc profile has an id");
-                let secret_id = s.secret(inc.secret_id.as_deref());
-                let order = s.data.vnc_profiles.iter().map(|x| x.order + 1).max().unwrap_or(0);
-                let icon = s.icon(&inc.icon);
-                s.data.vnc_profiles.push(crate::store::model::VncProfile {
-                    id: id.clone(),
-                    secret_id,
-                    icon,
-                    order,
-                    ..inc.clone()
-                });
-                s.summary.added += 1;
-                s.touched.push((key, id));
-            }
-        }
-    }
-
-    for inc in &payload.rdp_profiles {
-        let key = ItemKind::Rdp.key(&inc.id);
-        let (accept, as_new, fields) = s.decision(&key);
-        if !accept {
-            continue;
-        }
-        match plan.matches.get(&key).filter(|_| !as_new).cloned() {
-            Some(local_id) => {
-                if fields.is_empty() {
-                    continue;
-                }
-                let mut next = s
-                    .data
-                    .rdp_profiles
-                    .iter()
-                    .find(|x| x.id == local_id)
-                    .cloned()
-                    .expect("matched rdp profile exists");
-                for f in &fields {
-                    match *f {
-                        field::NAME => next.name = inc.name.clone(),
-                        field::HOST => next.host = inc.host.clone(),
-                        field::PORT => next.port = inc.port,
-                        field::USERNAME => next.username = inc.username.clone(),
-                        field::DOMAIN => next.domain = inc.domain.clone(),
-                        field::KEYBOARD_LAYOUT => next.keyboard_layout = inc.keyboard_layout,
-                        field::AUDIO => next.audio = inc.audio,
-                        field::SHARED_FOLDER => next.shared_folder = inc.shared_folder.clone(),
-                        field::ICON => next.icon = inc.icon.clone(),
-                        field::PASSWORD => {
-                            s.replaced.extend(next.secret_id.take());
-                            next.secret_id = s.secret(inc.secret_id.as_deref());
-                        }
-                        _ => {}
-                    }
-                }
-                // The password lands on the gateway the profile ends up with, so it waits for the
-                // gateway row.
-                let old = next.gateway.as_ref().and_then(|g| g.secret_id.clone());
-                if fields.contains(field::GATEWAY) {
-                    let kept = gateway_secret(next.gateway.as_ref()).map(str::to_string);
-                    next.gateway = inc.gateway.clone().map(|g| RdpGateway {
-                        secret_id: if g.same_login { None } else { kept },
-                        ..g
-                    });
-                }
-                if fields.contains(field::GATEWAY_PASSWORD) {
-                    match next.gateway.as_mut().filter(|g| !g.same_login) {
-                        Some(g) => g.secret_id = s.secret(gateway_secret(inc.gateway.as_ref())),
-                        None => s.problem(
-                            &key,
-                            "Gateway password needs the incoming RD Gateway".into(),
-                        ),
-                    }
-                }
-                if old.as_deref() != next.gateway.as_ref().and_then(|g| g.secret_id.as_deref()) {
-                    s.replaced.extend(old);
-                }
-                if let Some(slot) = s.data.rdp_profiles.iter_mut().find(|x| x.id == local_id) {
-                    *slot = next;
-                }
-                s.summary.updated += 1;
-                s.touched.push((key, local_id));
-            }
-            None => {
-                let id =
-                    s.final_id(ItemKind::Rdp, &inc.id).expect("accepted rdp profile has an id");
-                let secret_id = s.secret(inc.secret_id.as_deref());
-                let gateway = inc.gateway.clone().map(|g| RdpGateway {
-                    secret_id: s.secret(gateway_secret(Some(&g))),
-                    ..g
-                });
-                let shared_folder =
-                    inc.shared_folder.clone().filter(|f| s.env.dir_exists(&f.path));
-                let order = s.data.rdp_profiles.iter().map(|x| x.order + 1).max().unwrap_or(0);
-                let icon = s.icon(&inc.icon);
-                s.data.rdp_profiles.push(crate::store::model::RdpProfile {
-                    id: id.clone(),
-                    secret_id,
-                    shared_folder,
-                    gateway,
-                    icon,
-                    order,
-                    ..inc.clone()
-                });
-                s.summary.added += 1;
-                s.touched.push((key, id));
-            }
-        }
-    }
-
-    let touched = std::mem::take(&mut s.touched);
-    let mut found: Vec<(String, String)> = Vec::new();
-    for (key, id) in &touched {
-        if let Some(p) = s.data.profiles.iter().find(|p| &p.id == id) {
-            if p.auth_method == AuthMethod::Key && p.keys.is_empty() {
-                found.push((key.clone(), "Key login needs at least one private key".into()));
-            }
-            let mut seen = HashSet::new();
-            let mut hop = p.jump_host_id.clone();
-            while let Some(h) = hop {
-                if &h == id || !seen.insert(h.clone()) {
-                    found.push((key.clone(), "Its jump hosts would form a loop".into()));
-                    break;
-                }
-                hop =
-                    s.data.profiles.iter().find(|x| x.id == h).and_then(|x| x.jump_host_id.clone());
-            }
-        }
-        if let Some(p) = s.data.sftp_profiles.iter().find(|p| &p.id == id) {
-            if p.auth_method == AuthMethod::Key && p.keys.is_empty() {
-                found.push((key.clone(), "Key login needs at least one private key".into()));
-            }
-        }
-        if let Some(g) = s.data.groups.iter().find(|g| &g.id == id) {
-            let mut seen = HashSet::new();
-            let mut parent = g.parent_id.clone();
-            while let Some(pid) = parent {
-                if &pid == id || !seen.insert(pid.clone()) {
-                    found.push((key.clone(), "Its parent groups would form a loop".into()));
-                    break;
-                }
-                parent =
-                    s.data.groups.iter().find(|g| g.id == pid).and_then(|g| g.parent_id.clone());
-            }
-        }
-    }
-    for (key, message) in found {
-        s.problem(&key, message);
-    }
+    s.stage_folders();
+    s.stage_tags();
+    s.stage_keys();
+    s.stage_logins();
+    s.stage_hosts();
+    s.check();
 
     if !s.problems.is_empty() {
         return Err(s.problems);
     }
-    Ok(Staged {
-        data: s.data,
-        secrets: s.secrets,
-        key_files: s.key_files,
-        replaced_secrets: s.replaced,
-        summary: s.summary,
-    })
+    Ok(Staged { data: s.data, secrets: s.secrets, key_files: s.key_files, summary: s.summary })
 }
 
 pub fn stage_reviewed(
-    local: &ProfileStore,
-    payload: &Payload,
+    local: &HostsFile,
+    payload: &PayloadV3,
     reviewed: &[ReviewItem],
     decisions: &[ItemDecision],
     env: &dyn Env,
 ) -> AppResult<Result<Staged, Vec<ItemProblem>>> {
     let planned = plan(local, payload, env);
     // The decisions were made on the stored review; on a different plan they could land on a
-    // profile the user never saw.
+    // host the user never saw.
     if planned.items != reviewed {
         return Err(AppError::Import(
-            "your profiles changed since this file was opened; close this tab and import the \
-             file again"
-                .into(),
+            "your hosts changed since this file was opened; import the file again".into(),
         ));
     }
     Ok(stage(local, payload, &planned, decisions, env))
 }
 
-fn safe_name(name: &str) -> String {
+pub(crate) fn safe_name(name: &str) -> String {
     let head: String = name.chars().take(64).collect();
     // Windows drops trailing dots and spaces from the name it creates; the stored path must be
     // the name the file really has.
@@ -792,57 +937,61 @@ fn create_private_dir(path: &Path) -> AppResult<()> {
 }
 
 fn placeholder(value: &str, prefix: &str, real: &[String]) -> Option<String> {
-    value
-        .strip_prefix(prefix)
-        .and_then(|i| i.parse::<usize>().ok())
-        .and_then(|i| real.get(i).cloned())
+    value.strip_prefix(prefix).and_then(|i| i.parse::<usize>().ok()).and_then(|i| real.get(i).cloned())
 }
 
-fn substitute(data: &mut ProfileStore, secrets: &[String], keys: &[String]) {
-    let fix = |id: &mut Option<String>| {
+fn for_each_secret(file: &mut HostsFile, mut f: impl FnMut(&mut Option<String>)) {
+    let own = |login: &mut Login, f: &mut dyn FnMut(&mut Option<String>)| {
+        if let Login::Own(o) = login {
+            f(&mut o.secret_id);
+        }
+    };
+    for l in file.logins.iter_mut() {
+        f(&mut l.secret_id);
+    }
+    for k in file.keys.iter_mut() {
+        f(&mut k.secret_id);
+    }
+    for c in file.hosts.iter_mut().flat_map(|h| h.connections.iter_mut()) {
+        match &mut c.kind {
+            ConnectionKind::Ssh(s) => own(&mut s.login, &mut f),
+            ConnectionKind::Sftp(s) => {
+                if let Some(o) = s.own.as_mut() {
+                    own(&mut o.login, &mut f);
+                }
+            }
+            ConnectionKind::Ftp(x) => own(&mut x.login, &mut f),
+            ConnectionKind::S3(x) => f(&mut x.secret_id),
+            ConnectionKind::Rdp(r) => {
+                own(&mut r.login, &mut f);
+                if let Some(l) = r.gateway.as_mut().and_then(|g| g.login.as_mut()) {
+                    own(l, &mut f);
+                }
+            }
+            ConnectionKind::Vnc(v) => f(&mut v.secret_id),
+            ConnectionKind::Local(_) => {}
+        }
+    }
+}
+
+fn substitute(file: &mut HostsFile, secrets: &[String], keys: &[String]) {
+    for_each_secret(file, |id| {
         if let Some(real) = id.as_deref().and_then(|v| placeholder(v, SECRET_PREFIX, secrets)) {
             *id = Some(real);
         }
-    };
-    for p in data.profiles.iter_mut() {
-        fix(&mut p.secret_id);
-        for k in p.keys.iter_mut() {
-            fix(&mut k.secret_id);
-            if let Some(real) = placeholder(&k.path, KEY_PREFIX, keys) {
-                k.path = real;
-            }
-        }
-    }
-    for p in data.sftp_profiles.iter_mut() {
-        fix(&mut p.secret_id);
-        for k in p.keys.iter_mut() {
-            fix(&mut k.secret_id);
-            if let Some(real) = placeholder(&k.path, KEY_PREFIX, keys) {
-                k.path = real;
-            }
-        }
-    }
-    for p in data.s3_profiles.iter_mut() {
-        fix(&mut p.secret_id);
-    }
-    for p in data.vnc_profiles.iter_mut() {
-        fix(&mut p.secret_id);
-    }
-    for p in data.rdp_profiles.iter_mut() {
-        fix(&mut p.secret_id);
-        if let Some(g) = p.gateway.as_mut() {
-            fix(&mut g.secret_id);
+    });
+    for k in file.keys.iter_mut() {
+        if let Some(real) = placeholder(&k.path, KEY_PREFIX, keys) {
+            k.path = real;
         }
     }
 }
 
-pub fn execute(
-    store: &mut Store,
-    vault: &mut Vault,
-    keys_dir: &Path,
-    staged: Staged,
-) -> AppResult<ApplySummary> {
-    let Staged { mut data, secrets, key_files, replaced_secrets, summary } = staged;
+// Everything is written or nothing: on any error the key files and vault entries this apply made
+// are removed again and the store is never swapped. Secrets the import replaced are deleted by
+// the caller once the new hosts are in (store_cmds::after_change).
+pub fn execute(store: &mut Store, vault: &mut Vault, keys_dir: &Path, staged: Staged) -> AppResult<ApplySummary> {
+    let Staged { mut data, secrets, key_files, summary } = staged;
     let mut written = Vec::new();
     let mut new_secrets = Vec::new();
     let result = (|| -> AppResult<()> {
@@ -866,10 +1015,9 @@ pub fn execute(
             new_secrets.push(vault.set_secret(value.as_bytes())?);
         }
         substitute(&mut data, &new_secrets, &key_paths);
-        store.commit(data)
+        store.replace_hosts(data)
     })();
     if let Err(e) = result {
-        // Undo everything this apply created; the store itself was never swapped.
         for path in &written {
             let _ = std::fs::remove_file(path);
         }
@@ -878,28 +1026,19 @@ pub fn execute(
         }
         return Err(e);
     }
-    for id in &replaced_secrets {
-        let _ = vault.delete_secret(id);
-    }
     Ok(summary)
 }
 
-// Removes the app-made key files that a changed profile used before (`previous`) and nothing
-// uses now. Never a sweep: a store that loaded empty must not cost the user every imported key.
-pub fn remove_unreferenced_keys(keys_dir: &Path, previous: &[ProfileKey], data: &ProfileStore) {
+// Removes the app-made key files that a change dropped (`previous`) and nothing uses now (`used`).
+// Never a sweep: a store that loaded empty must not cost the user every imported key.
+pub fn remove_unreferenced_key_files(keys_dir: &Path, previous: &[String], used: &[String]) {
     // Through a linked folder the app would be deleting files somewhere else.
     if !std::fs::symlink_metadata(keys_dir).is_ok_and(|m| m.is_dir()) {
         return;
     }
-    let used: Vec<&Path> = data
-        .profiles
-        .iter()
-        .flat_map(|p| &p.keys)
-        .chain(data.sftp_profiles.iter().flat_map(|p| &p.keys))
-        .map(|k| Path::new(&k.path))
-        .collect();
+    let used: Vec<&Path> = used.iter().map(Path::new).collect();
     for key in previous {
-        let path = Path::new(&key.path);
+        let path = Path::new(key);
         let Some(name) = path.file_name().filter(|_| path.parent() == Some(keys_dir)) else {
             continue;
         };
@@ -936,1528 +1075,262 @@ pub fn remove_unreferenced_keys(keys_dir: &Path, previous: &[ProfileKey], data: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::model::{
-        AuthMethod, Group, IconRef, Profile, ProfileKey, RdpGateway, RdpProfile, S3Profile,
-        SftpProfile, SharedFolder, VncProfile,
-    };
-    use crate::transfer::bundle::KeyFile;
-    use crate::transfer::plan::plan;
-    use crate::transfer::{LocalEnv, MapEnv};
-    use zeroize::Zeroizing;
+    use crate::store::hosts::fixtures::{file, host, own, ssh, vnc};
+    use crate::store::hosts::SshConn;
+    use crate::transfer::MapEnv;
 
-    fn profile(id: &str, name: &str, host: &str) -> Profile {
-        Profile {
-            id: id.into(),
-            name: name.into(),
-            group_id: None,
-            host: host.into(),
-            port: 22,
-            username: "me".into(),
-            auth_method: AuthMethod::Password,
-            key_path: None,
-            keys: vec![],
-            secret_id: None,
-            icon: IconRef::default(),
-            order: 0,
-            jump_host_id: None,
-            tunnels: vec![],
-            appearance: None,
-            extra: Default::default(),
-        }
-    }
-
-    fn sftp(id: &str, name: &str, host: &str) -> SftpProfile {
-        SftpProfile {
-            id: id.into(),
-            name: name.into(),
-            host: host.into(),
-            port: 22,
-            username: "me".into(),
-            auth_method: AuthMethod::Password,
-            keys: vec![],
-            secret_id: None,
-            icon: IconRef::default(),
-            order: 0,
-            extra: Default::default(),
-        }
-    }
-
-    fn s3(id: &str, name: &str) -> S3Profile {
-        S3Profile {
-            id: id.into(),
-            name: name.into(),
-            endpoint: "s3.example.com".into(),
-            port: None,
-            region: "us-east-1".into(),
-            use_tls: true,
-            path_style: false,
-            access_key_id: "AK".into(),
-            secret_id: None,
-            bucket: None,
-            icon: IconRef::default(),
-            order: 0,
-            extra: Default::default(),
-        }
-    }
-
-    fn vnc(id: &str, name: &str, host: &str) -> VncProfile {
-        VncProfile {
-            id: id.into(),
-            name: name.into(),
-            host: host.into(),
-            port: 5900,
-            username: None,
-            secret_id: None,
-            icon: IconRef::default(),
-            order: 0,
-            extra: Default::default(),
-        }
-    }
-
-    fn rdp(id: &str, name: &str, host: &str) -> RdpProfile {
-        RdpProfile {
-            id: id.into(),
-            name: name.into(),
-            host: host.into(),
-            port: 3389,
-            username: "faye".into(),
-            domain: None,
-            secret_id: None,
-            keyboard_layout: None,
-            audio: true,
-            shared_folder: None,
-            gateway: None,
-            icon: IconRef::default(),
-            order: 0,
-            extra: Default::default(),
-        }
-    }
-
-    fn store_of(profiles: Vec<Profile>) -> ProfileStore {
-        ProfileStore {
-            version: 1,
-            groups: vec![],
-            profiles,
-            sftp_profiles: vec![],
-            s3_profiles: vec![],
-            vnc_profiles: vec![],
-            rdp_profiles: vec![],
-            unknown: Default::default(),
-        }
-    }
-
-    fn group(id: &str, name: &str, parent: Option<&str>) -> Group {
-        Group {
-            id: id.into(),
-            name: name.into(),
-            parent_id: parent.map(Into::into),
-            icon: IconRef::default(),
-            order: 0,
-            extra: Default::default(),
-        }
-    }
-
-    fn accept(key: &str, fields: &[&str]) -> ItemDecision {
-        ItemDecision {
-            key: key.into(),
-            accept: true,
-            as_new: false,
-            fields: fields.iter().map(|s| s.to_string()).collect(),
-        }
-    }
-
-    fn run(
-        local: &ProfileStore,
-        payload: &Payload,
-        decisions: &[ItemDecision],
-    ) -> Result<Staged, Vec<ItemProblem>> {
-        let env = MapEnv::default();
-        stage(local, payload, &plan(local, payload, &env), decisions, &env)
-    }
-
-    #[test]
-    fn accepts_only_the_chosen_fields() {
-        let local = store_of(vec![profile("pc", "web", "h1")]);
-        let mut mac = profile("mac", "web (mac)", "h1");
-        mac.auth_method = AuthMethod::Agent;
-        let payload = Payload { profiles: vec![mac], ..Default::default() };
-        let staged = run(&local, &payload, &[accept("ssh:mac", &["authMethod"])]).unwrap();
-        let p = &staged.data.profiles[0];
-        assert_eq!(
-            (p.id.as_str(), p.name.as_str(), p.auth_method),
-            ("pc", "web", AuthMethod::Agent)
-        );
-        assert_eq!(staged.summary, ApplySummary { added: 0, updated: 1 });
-    }
-
-    #[test]
-    fn fields_the_plan_did_not_offer_are_ignored() {
-        let local = store_of(vec![profile("pc", "web", "h1")]);
-        let mut mac = profile("mac", "web (mac)", "h1");
-        mac.icon = IconRef::Custom { path: "C:\\Windows\\win.ini".into() };
-        let payload = Payload { profiles: vec![mac], ..Default::default() };
-        let staged =
-            run(&local, &payload, &[accept("ssh:mac", &["name", "icon", "host"])]).unwrap();
-        let p = &staged.data.profiles[0];
-        assert_eq!(p.name, "web (mac)");
-        assert_eq!(p.icon, IconRef::default());
-    }
-
-    #[test]
-    fn declined_items_leave_everything_untouched() {
-        let local = store_of(vec![profile("pc", "web", "h1")]);
-        let mut mac = profile("mac", "web", "h1");
-        mac.port = 2222;
-        let payload =
-            Payload { profiles: vec![mac, profile("n", "new", "h9")], ..Default::default() };
-        let staged = run(&local, &payload, &[]).unwrap();
-        assert_eq!(staged.data, local);
-    }
-
-    #[test]
-    fn add_as_new_creates_a_separate_profile() {
-        let local = store_of(vec![profile("pc", "web", "h1")]);
-        let mut mac = profile("pc", "web", "h1");
-        mac.port = 2222;
-        let payload = Payload { profiles: vec![mac], ..Default::default() };
-        let d = ItemDecision { key: "ssh:pc".into(), accept: true, as_new: true, fields: vec![] };
-        let staged = run(&local, &payload, &[d]).unwrap();
-        assert_eq!(staged.data.profiles.len(), 2);
-        assert_ne!(staged.data.profiles[1].id, "pc");
-        assert_eq!(staged.data.profiles[0].port, 22);
-    }
-
-    #[test]
-    fn new_profile_gets_bundle_secrets_and_embedded_keys_as_placeholders() {
-        let mut inc = profile("n", "new", "h9");
-        inc.auth_method = AuthMethod::Key;
-        inc.secret_id = Some("mac-pw".into());
-        inc.keys =
-            vec![ProfileKey { path: "/Users/me/id".into(), secret_id: Some("mac-pp".into()) }];
-        let mut payload = Payload { profiles: vec![inc], ..Default::default() };
-        payload.secrets.insert("mac-pw".into(), Zeroizing::new("pw".into()));
-        payload.secrets.insert("mac-pp".into(), Zeroizing::new("pp".into()));
-        payload.key_files.insert(
-            "/Users/me/id".into(),
-            KeyFile { file_name: "id".into(), data: Zeroizing::new(STANDARD.encode(b"K")) },
-        );
-        let staged = run(&store_of(vec![]), &payload, &[accept("ssh:n", &[])]).unwrap();
-        let p = &staged.data.profiles[0];
-        assert!(p.secret_id.as_deref().unwrap().starts_with(SECRET_PREFIX));
-        assert!(p.keys[0].path.starts_with(KEY_PREFIX));
-        assert!(p.keys[0].secret_id.as_deref().unwrap().starts_with(SECRET_PREFIX));
-        assert_eq!(staged.secrets.len(), 2);
-        assert_eq!(staged.key_files.len(), 1);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn network_key_paths_are_never_stored() {
-        let mut inc = profile("n", "new", "h9");
-        inc.keys = [
-            "\\\\evil\\share\\id",
-            "\\??\\UNC\\evil\\share\\id",
-            "\\??\\GLOBALROOT\\Device\\Mup\\evil\\share\\id",
-        ]
-        .map(|path| ProfileKey { path: path.into(), secret_id: None })
-        .into();
-        let payload = Payload { profiles: vec![inc.clone()], ..Default::default() };
-        let staged = run(&store_of(vec![]), &payload, &[accept("ssh:n", &[])]).unwrap();
-        assert!(staged.data.profiles[0].keys.is_empty());
-
-        inc.auth_method = AuthMethod::Key;
-        let payload = Payload { profiles: vec![inc], ..Default::default() };
-        let problems = run(&store_of(vec![]), &payload, &[accept("ssh:n", &[])]).err().unwrap();
-        assert!(problems[0].message.contains("private key"));
-    }
-
-    #[test]
-    fn placeholder_key_paths_are_never_stored() {
-        let mut inc = profile("n", "new", "h9");
-        inc.keys = vec![ProfileKey { path: format!("{KEY_PREFIX}0"), secret_id: None }];
-        let payload = Payload { profiles: vec![inc], ..Default::default() };
-        let staged = run(&store_of(vec![]), &payload, &[accept("ssh:n", &[])]).unwrap();
-        assert!(staged.data.profiles[0].keys.is_empty());
-        assert!(staged.key_files.is_empty());
-    }
-
-    #[test]
-    fn embedded_key_identical_to_a_local_one_keeps_the_local_key() {
-        let mut pc = profile("pc", "web", "h1");
-        pc.auth_method = AuthMethod::Key;
-        pc.keys = vec![
-            ProfileKey { path: "C:\\keys\\a".into(), secret_id: Some("pp-a".into()) },
-            ProfileKey { path: "C:\\keys\\b".into(), secret_id: None },
-        ];
-        let mut mac = pc.clone();
-        mac.id = "mac".into();
-        mac.keys = vec![
-            ProfileKey { path: "/Users/me/a".into(), secret_id: Some("mac-pp".into()) },
-            ProfileKey { path: "/Users/me/c".into(), secret_id: None },
-        ];
-        let mut payload = Payload { profiles: vec![mac], ..Default::default() };
-        for (path, content) in [("/Users/me/a", b"A"), ("/Users/me/c", b"C")] {
-            let data = Zeroizing::new(STANDARD.encode(content));
-            payload.key_files.insert(path.into(), KeyFile { file_name: "id".into(), data });
-        }
-        payload.secrets.insert("mac-pp".into(), Zeroizing::new("pass".into()));
-        let mut env = MapEnv::default();
-        env.files.insert("C:\\keys\\a".into(), b"A".to_vec());
-        env.files.insert("C:\\keys\\b".into(), b"B".to_vec());
-        env.secrets.insert("pp-a".into(), b"pass".to_vec());
-        let local = store_of(vec![pc.clone()]);
-        let decisions = [accept("ssh:mac", &["keys"])];
-
-        let staged =
-            stage(&local, &payload, &plan(&local, &payload, &env), &decisions, &env).unwrap();
-        let keys = &staged.data.profiles[0].keys;
-        assert_eq!(keys[0], pc.keys[0]);
-        assert_eq!(keys[1].path, format!("{KEY_PREFIX}0"));
-        assert_eq!(staged.key_files.len(), 1);
-        assert_eq!(STANDARD.decode(staged.key_files[0].data.as_bytes()).unwrap(), b"C");
-        assert!(staged.secrets.is_empty());
-        assert!(staged.replaced_secrets.is_empty());
-
-        // A different passphrase in the export still replaces the stored one.
-        payload.secrets.insert("mac-pp".into(), Zeroizing::new("other".into()));
-        let staged =
-            stage(&local, &payload, &plan(&local, &payload, &env), &decisions, &env).unwrap();
-        let keys = &staged.data.profiles[0].keys;
-        assert_eq!(keys[0].path, "C:\\keys\\a");
-        assert_eq!(keys[0].secret_id, Some(format!("{SECRET_PREFIX}0")));
-        assert_eq!(staged.replaced_secrets, ["pp-a"]);
-    }
-
-    #[test]
-    fn replacing_a_password_schedules_the_old_secret_for_removal() {
-        let mut pc = profile("pc", "web", "h1");
-        pc.secret_id = Some("old".into());
-        let mut mac = pc.clone();
-        mac.id = "mac".into();
-        mac.secret_id = Some("mac-pw".into());
-        let mut payload = Payload { profiles: vec![mac], ..Default::default() };
-        payload.secrets.insert("mac-pw".into(), Zeroizing::new("new".into()));
-        let local = store_of(vec![pc]);
-        let staged = run(&local, &payload, &[accept("ssh:mac", &["password"])]).unwrap();
-        assert_eq!(staged.replaced_secrets, ["old"]);
-    }
-
-    #[test]
-    fn key_login_without_keys_is_a_problem() {
-        let mut pc = profile("pc", "web", "h1");
-        pc.auth_method = AuthMethod::Password;
-        let mut mac = pc.clone();
-        mac.id = "mac".into();
-        mac.auth_method = AuthMethod::Key;
-        let payload = Payload { profiles: vec![mac], ..Default::default() };
-        let problems = run(&store_of(vec![pc]), &payload, &[accept("ssh:mac", &["authMethod"])])
-            .err()
-            .unwrap();
-        assert_eq!(problems[0].key, "ssh:mac");
-    }
-
-    #[test]
-    fn declined_new_group_blocks_a_profile_that_moves_into_it() {
-        let mut inc = profile("n", "new", "h9");
-        inc.group_id = Some("g".into());
-        let payload = Payload {
-            groups: vec![Group {
-                id: "g".into(),
-                name: "Lab".into(),
-                parent_id: None,
-                icon: IconRef::default(),
-                order: 0,
-                extra: Default::default(),
-            }],
-            profiles: vec![inc],
-            ..Default::default()
-        };
-        let problems = run(&store_of(vec![]), &payload, &[accept("ssh:n", &[])]).err().unwrap();
-        assert!(problems[0].message.contains("Lab"));
-        assert!(run(&store_of(vec![]), &payload, &[accept("ssh:n", &[]), accept("group:g", &[])])
-            .is_ok());
-    }
-
-    #[test]
-    fn matched_group_declined_as_new_keeps_its_local_id() {
-        let local = ProfileStore { groups: vec![group("g-pc", "Lab", None)], ..store_of(vec![]) };
-        let mut inc = profile("n", "new", "h9");
-        inc.group_id = Some("g-mac".into());
-        let payload = Payload {
-            groups: vec![group("g-mac", "Lab", None)],
-            profiles: vec![inc],
-            ..Default::default()
-        };
-        let declined =
-            ItemDecision { key: "group:g-mac".into(), accept: false, as_new: true, fields: vec![] };
-        let staged = run(&local, &payload, &[declined, accept("ssh:n", &[])]).unwrap();
-        assert_eq!(staged.data.profiles[0].group_id.as_deref(), Some("g-pc"));
-    }
-
-    #[test]
-    fn declined_new_jump_host_blocks_its_user() {
-        let mut web = profile("w", "web", "h1");
-        web.jump_host_id = Some("b".into());
-        let payload =
-            Payload { profiles: vec![web, profile("b", "bastion", "h2")], ..Default::default() };
-        let problems = run(&store_of(vec![]), &payload, &[accept("ssh:w", &[])]).err().unwrap();
-        assert!(problems[0].message.contains("bastion"));
-    }
-
-    #[test]
-    fn dangling_group_imports_ungrouped() {
-        let mut inc = profile("n", "new", "h9");
-        inc.group_id = Some("nowhere".into());
-        let payload = Payload { profiles: vec![inc], ..Default::default() };
-        let staged = run(&store_of(vec![]), &payload, &[accept("ssh:n", &[])]).unwrap();
-        assert_eq!(staged.data.profiles[0].group_id, None);
-    }
-
-    #[test]
-    fn jump_host_loop_is_a_problem() {
-        let a = profile("a", "a", "ha");
-        let mut b = profile("b", "b", "hb");
-        b.jump_host_id = Some("a".into());
-        let mut inc = a.clone();
-        inc.jump_host_id = Some("b".into());
-        let payload = Payload { profiles: vec![inc], ..Default::default() };
-        let problems = run(&store_of(vec![a, b]), &payload, &[accept("ssh:a", &["jumpHostId"])])
-            .err()
-            .unwrap();
-        assert!(problems[0].message.contains("jump hosts would form a loop"));
-    }
-
-    #[test]
-    fn parent_group_loop_is_a_problem() {
-        let local = ProfileStore {
-            groups: vec![group("g1", "one", None), group("g2", "two", Some("g1"))],
-            ..store_of(vec![])
-        };
-        let payload =
-            Payload { groups: vec![group("g1", "one", Some("g2"))], ..Default::default() };
-        let problems = run(&local, &payload, &[accept("group:g1", &["parentId"])]).err().unwrap();
-        assert!(problems[0].message.contains("parent groups would form a loop"));
-    }
-
-    #[test]
-    fn matched_sftp_profile_takes_only_the_accepted_fields() {
-        let mut pc = sftp("pc", "files", "h1");
-        pc.secret_id = Some("old".into());
-        let mut mac = sftp("mac", "files (mac)", "h1");
-        mac.auth_method = AuthMethod::Agent;
-        mac.secret_id = Some("mac-pw".into());
-        let mut payload = Payload { sftp_profiles: vec![mac], ..Default::default() };
-        payload.secrets.insert("mac-pw".into(), Zeroizing::new("new".into()));
-        let local = ProfileStore { sftp_profiles: vec![pc], ..store_of(vec![]) };
-        let staged =
-            run(&local, &payload, &[accept("sftp:mac", &["authMethod", "password"])]).unwrap();
-        let p = &staged.data.sftp_profiles[0];
-        assert_eq!(
-            (p.id.as_str(), p.name.as_str(), p.auth_method),
-            ("pc", "files", AuthMethod::Agent)
-        );
-        assert_eq!(p.secret_id, Some(format!("{SECRET_PREFIX}0")));
-        assert_eq!(staged.secrets[0].as_str(), "new");
-        assert_eq!(staged.replaced_secrets, ["old"]);
-        assert_eq!(staged.summary, ApplySummary { added: 0, updated: 1 });
-    }
-
-    #[test]
-    fn keys_row_carries_over_or_replaces_the_local_passphrases() {
-        let mut pc = profile("pc", "web", "h1");
-        pc.auth_method = AuthMethod::Key;
-        pc.keys = vec![
-            ProfileKey { path: "C:\\keys\\a".into(), secret_id: Some("pp-a".into()) },
-            ProfileKey { path: "C:\\keys\\b".into(), secret_id: Some("pp-b".into()) },
-        ];
-        let mut mac = pc.clone();
-        mac.id = "mac".into();
-        mac.keys = vec![
-            ProfileKey { path: "/Users/me/a".into(), secret_id: Some("mac-pp-a".into()) },
-            ProfileKey { path: "/Users/me/c".into(), secret_id: Some("mac-pp-c".into()) },
-        ];
-        let mut payload = Payload { profiles: vec![mac], ..Default::default() };
-        for (path, content) in [("/Users/me/a", b"A"), ("/Users/me/c", b"C")] {
-            let data = Zeroizing::new(STANDARD.encode(content));
-            payload.key_files.insert(path.into(), KeyFile { file_name: "id".into(), data });
-        }
-        // The export carries no passphrase for the first key.
-        payload.secrets.insert("mac-pp-c".into(), Zeroizing::new("pass-c".into()));
-        let mut env = MapEnv::default();
-        env.files.insert("C:\\keys\\a".into(), b"A".to_vec());
-        env.files.insert("C:\\keys\\b".into(), b"B".to_vec());
-        env.secrets.insert("pp-a".into(), b"pass-a".to_vec());
-        env.secrets.insert("pp-b".into(), b"pass-b".to_vec());
-        let local = store_of(vec![pc]);
-
-        let planned = plan(&local, &payload, &env);
-        let staged =
-            stage(&local, &payload, &planned, &[accept("ssh:mac", &["keys"])], &env).unwrap();
-        let keys = &staged.data.profiles[0].keys;
-        assert_eq!(keys[0].secret_id.as_deref(), Some("pp-a"));
-        assert_eq!(keys[1].secret_id, Some(format!("{SECRET_PREFIX}0")));
-        assert_eq!(staged.secrets[0].as_str(), "pass-c");
-        assert_eq!(staged.replaced_secrets, ["pp-b"]);
-    }
-
-    #[test]
-    fn jump_host_reference_lands_on_the_matched_local_profile() {
-        let local = store_of(vec![profile("b-pc", "bastion", "hb"), profile("w-pc", "web", "h1")]);
-        let mut web = profile("w-mac", "web", "h1");
-        web.jump_host_id = Some("b-mac".into());
-        let bastion = profile("b-mac", "bastion", "hb");
-        let payload = Payload { profiles: vec![web, bastion], ..Default::default() };
-        let staged = run(&local, &payload, &[accept("ssh:w-mac", &["jumpHostId"])]).unwrap();
-        assert_eq!(staged.data.profiles.len(), 2);
-        assert_eq!(staged.data.profiles[1].jump_host_id.as_deref(), Some("b-pc"));
-    }
-
-    #[test]
-    fn jump_host_reference_follows_a_jump_host_added_as_new() {
-        let local = store_of(vec![profile("b-pc", "bastion", "hb")]);
-        let mut web = profile("w-mac", "web", "h1");
-        web.jump_host_id = Some("b-mac".into());
-        let mut bastion = profile("b-mac", "bastion", "hb");
-        bastion.auth_method = AuthMethod::Agent;
-        let payload = Payload { profiles: vec![web, bastion], ..Default::default() };
-        let as_new =
-            ItemDecision { key: "ssh:b-mac".into(), accept: true, as_new: true, fields: vec![] };
-        let staged = run(&local, &payload, &[accept("ssh:w-mac", &[]), as_new]).unwrap();
-        let profiles = &staged.data.profiles;
-        assert_eq!(profiles.len(), 3);
-        let added = profiles.iter().find(|p| p.auth_method == AuthMethod::Agent).unwrap();
-        assert!(added.id != "b-pc" && added.id != "b-mac");
-        let web = profiles.iter().find(|p| p.name == "web").unwrap();
-        assert_eq!(web.jump_host_id.as_ref(), Some(&added.id));
-    }
-
-    fn vault(dir: &std::path::Path) -> Vault {
+    fn vault(dir: &Path) -> Vault {
         Vault::open_with_key(dir.join("vault.enc"), Zeroizing::new([3u8; 32])).unwrap()
     }
 
-    fn staged_with_secret_and_key() -> Staged {
-        let mut inc = profile("n", "new", "h9");
-        inc.auth_method = AuthMethod::Key;
-        inc.secret_id = Some("mac-pw".into());
-        inc.keys = vec![ProfileKey { path: "/Users/me/id".into(), secret_id: None }];
-        let mut payload = Payload { profiles: vec![inc], ..Default::default() };
-        payload.secrets.insert("mac-pw".into(), Zeroizing::new("pw".into()));
-        payload.key_files.insert(
-            "/Users/me/id".into(),
-            KeyFile { file_name: "id".into(), data: Zeroizing::new(STANDARD.encode(b"K")) },
-        );
-        run(&store_of(vec![]), &payload, &[accept("ssh:n", &[])]).unwrap()
+    fn accept_all(plan: &Plan) -> Vec<ItemDecision> {
+        plan.items
+            .iter()
+            .map(|i| ItemDecision {
+                key: i.key.clone(),
+                accept: true,
+                as_new: false,
+                fields: i.fields.iter().map(|f| f.field.clone()).collect(),
+            })
+            .collect()
+    }
+
+    fn run(local: &HostsFile, payload: &PayloadV3, decide: impl Fn(&Plan) -> Vec<ItemDecision>) -> Result<Staged, Vec<ItemProblem>> {
+        let env = MapEnv::default();
+        let planned = plan(local, payload, &env);
+        stage(local, payload, &planned, &decide(&planned), &env)
+    }
+
+    fn jumping(id: &str, jump: &str) -> Connection {
+        let mut c = ssh(id, 22, own("u", None));
+        if let ConnectionKind::Ssh(SshConn { jump_host_id, .. }) = &mut c.kind {
+            *jump_host_id = Some(jump.into());
+        }
+        c
+    }
+
+    fn jump_of(file: &HostsFile, host_name: &str) -> Option<String> {
+        let h = file.hosts.iter().find(|h| h.name == host_name).unwrap();
+        match &h.connections[0].kind {
+            ConnectionKind::Ssh(s) => s.jump_host_id.clone(),
+            _ => None,
+        }
     }
 
     #[test]
-    fn icon_outside_the_icons_folder_becomes_the_default_icon() {
-        let dir = tempfile::tempdir().unwrap();
-        let v = vault(dir.path());
-        std::fs::write(dir.path().join("vault.enc"), b"x").unwrap();
-        let env = LocalEnv { vault: &v, config_dir: dir.path() };
-        let icon = IconRef::Custom { path: "vault.enc".into() };
-        let mut inc = profile("n", "new", "h9");
-        inc.icon = icon.clone();
-        let payload = Payload {
-            groups: vec![Group { icon, ..group("g", "Lab", None) }],
-            profiles: vec![inc],
+    fn accepting_a_new_host_adds_it_with_its_connections() {
+        let payload = PayloadV3 {
+            hosts: vec![host("h", "nas", "nas.local", vec![ssh("c1", 22, own("admin", None)), vnc("c2", None)])],
             ..Default::default()
         };
-        let local = store_of(vec![]);
-        let decisions = [accept("group:g", &[]), accept("ssh:n", &[])];
-        let staged =
-            stage(&local, &payload, &plan(&local, &payload, &env), &decisions, &env).unwrap();
-        assert_eq!(staged.data.groups[0].icon, IconRef::default());
-        assert_eq!(staged.data.profiles[0].icon, IconRef::default());
+        let staged = run(&file(vec![]), &payload, accept_all).unwrap();
+        let added = staged.data.hosts.iter().find(|h| h.name == "nas").unwrap();
+        let ids: Vec<_> = added.connections.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["c1", "c2"]);
+        assert_eq!(staged.summary.added, 1);
     }
 
     #[test]
-    fn execute_writes_secrets_and_keys_then_commits() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        let mut v = vault(dir.path());
-        let summary =
-            execute(&mut store, &mut v, &dir.path().join("keys"), staged_with_secret_and_key())
-                .unwrap();
-        assert_eq!(summary, ApplySummary { added: 1, updated: 0 });
-        let p = &store.profiles()[0];
-        assert_eq!(v.get_secret(p.secret_id.as_deref().unwrap()).unwrap().as_slice(), b"pw");
-        assert_eq!(std::fs::read(&p.keys[0].path).unwrap(), b"K");
-        assert!(p.keys[0].path.starts_with(dir.path().join("keys").to_string_lossy().as_ref()));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&p.keys[0].path).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600);
-            let mode = std::fs::metadata(dir.path().join("keys")).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o700);
+    fn declining_a_new_host_skips_its_connections() {
+        let payload = PayloadV3 {
+            hosts: vec![host("h", "nas", "nas.local", vec![vnc("c1", None)])],
+            ..Default::default()
+        };
+        let staged = run(&file(vec![]), &payload, |p| {
+            p.items.iter().map(|i| ItemDecision { key: i.key.clone(), accept: i.key != "host:h", as_new: false, fields: vec![] }).collect()
+        })
+        .unwrap();
+        assert!(staged.data.hosts.is_empty());
+    }
+
+    #[test]
+    fn a_new_connection_lands_on_the_matched_host() {
+        let local = file(vec![host("l", "nas", "nas.local", vec![vnc("lv", None)])]);
+        let payload = PayloadV3 {
+            hosts: vec![host("i", "nas", "nas.local", vec![vnc("iv", None), ssh("is", 22, own("admin", None))])],
+            ..Default::default()
+        };
+        let staged = run(&local, &payload, accept_all).unwrap();
+        assert_eq!(staged.data.hosts.len(), 1);
+        let ids: Vec<_> = staged.data.hosts[0].connections.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["lv", "is"]);
+    }
+
+    #[test]
+    fn a_taken_id_gets_a_fresh_one_and_references_follow() {
+        let local = file(vec![host("x", "other", "10.9.9.9", vec![vnc("bastion-ssh", None)])]);
+        let payload = PayloadV3 {
+            hosts: vec![
+                host("b", "bastion", "bastion.corp", vec![ssh("bastion-ssh", 22, own("u", None))]),
+                host("t", "target", "10.0.0.2", vec![jumping("t-ssh", "bastion-ssh")]),
+            ],
+            ..Default::default()
+        };
+        let staged = run(&local, &payload, accept_all).unwrap();
+        let bastion = staged.data.hosts.iter().find(|h| h.name == "bastion").unwrap();
+        let fresh_id = bastion.connections[0].id.clone();
+        assert_ne!(fresh_id, "bastion-ssh");
+        assert_eq!(jump_of(&staged.data, "target"), Some(fresh_id));
+    }
+
+    #[test]
+    fn a_declined_jump_host_is_a_problem() {
+        let payload = PayloadV3 {
+            hosts: vec![
+                host("b", "bastion", "bastion.corp", vec![ssh("b-ssh", 22, own("u", None))]),
+                host("t", "target", "10.0.0.2", vec![jumping("t-ssh", "b-ssh")]),
+            ],
+            ..Default::default()
+        };
+        let problems = run(&file(vec![]), &payload, |p| {
+            p.items.iter().map(|i| ItemDecision { key: i.key.clone(), accept: i.key != "host:b", as_new: false, fields: vec![] }).collect()
+        })
+        .err()
+        .unwrap();
+        assert_eq!(problems[0].key, "conn:t-ssh");
+        assert_eq!(problems[0].message, "Its jump host isn't being imported");
+    }
+
+    #[test]
+    fn a_jump_host_missing_from_the_export_connects_directly() {
+        let payload = PayloadV3 {
+            hosts: vec![host("t", "target", "10.0.0.2", vec![jumping("t-ssh", "gone")])],
+            ..Default::default()
+        };
+        let staged = run(&file(vec![]), &payload, accept_all).unwrap();
+        assert_eq!(jump_of(&staged.data, "target"), None);
+    }
+
+    #[test]
+    fn an_accepted_row_changes_only_that_field() {
+        let mut lc = vnc("c", None);
+        lc.label = Some("old".into());
+        let local = file(vec![host("h", "nas", "nas.local", vec![lc])]);
+        let mut ic = vnc("c", None);
+        ic.label = Some("new".into());
+        if let ConnectionKind::Vnc(v) = &mut ic.kind {
+            v.port = 5901;
         }
+        let payload = PayloadV3 { hosts: vec![host("h", "nas", "nas.local", vec![ic])], ..Default::default() };
+        let staged = run(&local, &payload, |p| {
+            p.items.iter().map(|i| ItemDecision { key: i.key.clone(), accept: true, as_new: false, fields: vec!["port".into()] }).collect()
+        })
+        .unwrap();
+        let c = &staged.data.hosts[0].connections[0];
+        assert_eq!(c.label.as_deref(), Some("old"));
+        assert!(matches!(&c.kind, ConnectionKind::Vnc(v) if v.port == 5901));
     }
 
     #[test]
-    fn new_sftp_profile_is_written_with_its_embedded_key_and_secrets() {
-        let mut inc = sftp("f", "files", "h9");
-        inc.auth_method = AuthMethod::Key;
-        inc.secret_id = Some("mac-pw".into());
-        inc.keys =
-            vec![ProfileKey { path: "/Users/me/id".into(), secret_id: Some("mac-pp".into()) }];
-        let mut payload = Payload { sftp_profiles: vec![inc], ..Default::default() };
-        payload.secrets.insert("mac-pw".into(), Zeroizing::new("pw".into()));
-        payload.secrets.insert("mac-pp".into(), Zeroizing::new("pp".into()));
+    fn a_failed_commit_leaves_vault_and_keys_as_they_were() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf(), &[]).unwrap();
+        let mut v = vault(dir.path());
+        let mut payload = PayloadV3 {
+            hosts: vec![host("h", "nas", "nas.local", vec![ssh("c", 22, own("admin", Some("pw")))])],
+            ..Default::default()
+        };
+        payload.secrets.insert("pw".into(), Zeroizing::new("secret".into()));
+        payload.keys.push(SshKey { id: "k".into(), path: "/remote/id".into(), secret_id: None, extra: Default::default() });
         payload.key_files.insert(
-            "/Users/me/id".into(),
-            KeyFile { file_name: "id".into(), data: Zeroizing::new(STANDARD.encode(b"K")) },
+            "/remote/id".into(),
+            KeyFile { file_name: "id".into(), data: Zeroizing::new(STANDARD.encode(b"KEY")) },
         );
-        let local =
-            ProfileStore { sftp_profiles: vec![sftp("x", "other", "h1")], ..store_of(vec![]) };
-        let staged = run(&local, &payload, &[accept("sftp:f", &[])]).unwrap();
-        assert_eq!(staged.summary, ApplySummary { added: 1, updated: 0 });
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        let mut v = vault(dir.path());
-        execute(&mut store, &mut v, &dir.path().join("keys"), staged).unwrap();
-        let p = &store.sftp_profiles()[1];
-        assert_eq!((p.id.as_str(), p.name.as_str(), p.order), ("f", "files", 1));
-        assert_eq!(p.keys.len(), 1);
-        assert_eq!(std::fs::read(&p.keys[0].path).unwrap(), b"K");
-        let secret = |id: &Option<String>| v.get_secret(id.as_deref().unwrap()).unwrap().to_vec();
-        assert_eq!(secret(&p.keys[0].secret_id), b"pp");
-        assert_eq!(secret(&p.secret_id), b"pw");
-    }
-
-    #[test]
-    fn new_s3_profile_is_written_with_its_secret() {
-        let mut inc = s3("s", "backups");
-        inc.secret_id = Some("mac-sk".into());
-        let mut payload = Payload { s3_profiles: vec![inc.clone()], ..Default::default() };
-        payload.secrets.insert("mac-sk".into(), Zeroizing::new("sk".into()));
-        let staged = run(&store_of(vec![]), &payload, &[accept("s3:s", &[])]).unwrap();
-        assert_eq!(staged.summary, ApplySummary { added: 1, updated: 0 });
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        let mut v = vault(dir.path());
-        execute(&mut store, &mut v, &dir.path().join("keys"), staged).unwrap();
-        let p = &store.s3_profiles()[0];
-        assert_eq!(v.get_secret(p.secret_id.as_deref().unwrap()).unwrap().as_slice(), b"sk");
-        assert_eq!(S3Profile { secret_id: inc.secret_id.clone(), ..p.clone() }, inc);
-    }
-
-    // This bundle carries no RDP profiles, so the import has to leave them as they are.
-    #[test]
-    fn import_leaves_rdp_profiles_as_they_were() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        let mut v = vault(dir.path());
-        let office = RdpProfile {
-            id: "r1".into(),
-            name: "office".into(),
-            host: "10.0.0.9".into(),
-            port: 3390,
-            username: "CORP\\faye".into(),
-            domain: None,
-            secret_id: Some(v.set_secret(b"pw").unwrap()),
-            keyboard_layout: Some(0x407),
-            audio: true,
-            shared_folder: None,
-            gateway: None,
-            icon: IconRef::Custom { path: "icons/6f1c2a9e-8d0b-4c57-9a3e-2b7d5e41f0c8.png".into() },
-            order: 3,
-            extra: Default::default(),
-        };
-        store.upsert_rdp_profile(office.clone()).unwrap();
-
-        let payload = Payload { profiles: vec![profile("n", "new", "h9")], ..Default::default() };
-        let staged = run(&store.snapshot(), &payload, &[accept("ssh:n", &[])]).unwrap();
-        let summary = execute(&mut store, &mut v, &dir.path().join("keys"), staged).unwrap();
-        assert_eq!(summary, ApplySummary { added: 1, updated: 0 });
-        assert_eq!(store.profiles().len(), 1);
-        assert_eq!(store.rdp_profiles(), [office.clone()]);
-        let reloaded = Store::load(dir.path().to_path_buf()).unwrap();
-        assert_eq!(reloaded.rdp_profiles(), [office.clone()]);
-        assert_eq!(v.get_secret(office.secret_id.as_deref().unwrap()).unwrap().as_slice(), b"pw");
-    }
-
-    // This bundle carries no VNC profiles, so the import has to leave them as they are.
-    #[test]
-    fn import_leaves_vnc_profiles_as_they_were() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        let mut v = vault(dir.path());
-        let desk = VncProfile {
-            id: "v1".into(),
-            name: "desk".into(),
-            host: "10.0.0.5".into(),
-            port: 5901,
-            username: Some("faye".into()),
-            secret_id: Some(v.set_secret(b"pw").unwrap()),
-            icon: IconRef::Custom { path: "icons/6f1c2a9e-8d0b-4c57-9a3e-2b7d5e41f0c8.png".into() },
-            order: 3,
-            extra: Default::default(),
-        };
-        store.upsert_vnc_profile(desk.clone()).unwrap();
-
-        let payload = Payload { profiles: vec![profile("n", "new", "h9")], ..Default::default() };
-        let staged = run(&store.snapshot(), &payload, &[accept("ssh:n", &[])]).unwrap();
-        let summary = execute(&mut store, &mut v, &dir.path().join("keys"), staged).unwrap();
-        assert_eq!(summary, ApplySummary { added: 1, updated: 0 });
-        assert_eq!(store.profiles().len(), 1);
-        assert_eq!(store.vnc_profiles(), [desk.clone()]);
-        assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().vnc_profiles(), [desk.clone()]);
-        assert_eq!(v.get_secret(desk.secret_id.as_deref().unwrap()).unwrap().as_slice(), b"pw");
-    }
-
-    #[test]
-    fn new_vnc_profile_is_written_with_its_secret() {
-        let inc = VncProfile {
-            username: Some("faye".into()),
-            secret_id: Some("mac-pw".into()),
-            ..vnc("v", "desk", "h9")
-        };
-        let mut payload = Payload { vnc_profiles: vec![inc.clone()], ..Default::default() };
-        payload.secrets.insert("mac-pw".into(), Zeroizing::new("pw".into()));
-        let local = ProfileStore {
-            vnc_profiles: vec![VncProfile { order: 3, ..vnc("x", "other", "h1") }],
-            ..store_of(vec![])
-        };
-        let staged = run(&local, &payload, &[accept("vnc:v", &[])]).unwrap();
-        assert_eq!(staged.summary, ApplySummary { added: 1, updated: 0 });
-        assert_eq!(staged.data.vnc_profiles[1].secret_id, Some(format!("{SECRET_PREFIX}0")));
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        let mut v = vault(dir.path());
-        execute(&mut store, &mut v, &dir.path().join("keys"), staged).unwrap();
-        assert_eq!(store.vnc_profiles()[0], local.vnc_profiles[0]);
-        let p = &store.vnc_profiles()[1];
-        assert_eq!(v.get_secret(p.secret_id.as_deref().unwrap()).unwrap().as_slice(), b"pw");
-        assert_eq!(p.order, 4);
-        assert_eq!(VncProfile { secret_id: inc.secret_id.clone(), order: 0, ..p.clone() }, inc);
-        let reloaded = Store::load(dir.path().to_path_buf()).unwrap();
-        assert_eq!(reloaded.vnc_profiles(), store.vnc_profiles());
-    }
-
-    #[test]
-    fn new_vnc_profile_drops_a_password_and_icon_the_bundle_does_not_bring() {
-        let inc = VncProfile {
-            secret_id: Some("mac-pw".into()),
-            icon: IconRef::Custom { path: "icons/6f1c2a9e-8d0b-4c57-9a3e-2b7d5e41f0c8.png".into() },
-            ..vnc("v", "desk", "h9")
-        };
-        let payload = Payload { vnc_profiles: vec![inc], ..Default::default() };
-        let staged = run(&store_of(vec![]), &payload, &[accept("vnc:v", &[])]).unwrap();
-        let p = &staged.data.vnc_profiles[0];
-        assert_eq!((p.id.as_str(), &p.secret_id, &p.icon), ("v", &None, &IconRef::default()));
-        assert!(staged.secrets.is_empty());
-    }
-
-    #[test]
-    fn matched_vnc_profile_takes_only_the_accepted_fields() {
-        let pc = VncProfile { secret_id: Some("old".into()), ..vnc("pc", "desk", "h1") };
-        let mac = VncProfile {
-            name: "desk (mac)".into(),
-            host: "h2".into(),
-            port: 5901,
-            username: Some("faye".into()),
-            secret_id: Some("mac-pw".into()),
-            icon: IconRef::Builtin { name: "monitor".into() },
-            ..pc.clone()
-        };
-        let mut payload = Payload { vnc_profiles: vec![mac.clone()], ..Default::default() };
-        payload.secrets.insert("mac-pw".into(), Zeroizing::new("new".into()));
-        let local = ProfileStore { vnc_profiles: vec![pc.clone()], ..store_of(vec![]) };
-
-        let staged = run(&local, &payload, &[accept("vnc:pc", &["port", "username"])]).unwrap();
-        let some = VncProfile { port: 5901, username: Some("faye".into()), ..pc };
-        assert_eq!(staged.data.vnc_profiles, [some]);
-        assert!(staged.secrets.is_empty() && staged.replaced_secrets.is_empty());
-        assert_eq!(staged.summary, ApplySummary { added: 0, updated: 1 });
-
-        let every = ["name", "host", "port", "username", "icon", "password"];
-        let staged = run(&local, &payload, &[accept("vnc:pc", &every)]).unwrap();
-        let all = VncProfile { secret_id: Some(format!("{SECRET_PREFIX}0")), ..mac };
-        assert_eq!(staged.data.vnc_profiles, [all]);
-        assert_eq!(staged.secrets[0].as_str(), "new");
-        assert_eq!(staged.replaced_secrets, ["old"]);
-        assert_eq!(staged.summary, ApplySummary { added: 0, updated: 1 });
-    }
-
-    #[test]
-    fn declined_vnc_profiles_leave_everything_untouched() {
-        let pc = VncProfile { secret_id: Some("old".into()), ..vnc("pc", "desk", "h1") };
-        let mac = VncProfile { port: 5901, secret_id: Some("mac-pw".into()), ..pc.clone() };
-        let mut payload =
-            Payload { vnc_profiles: vec![mac, vnc("n", "new", "h9")], ..Default::default() };
-        payload.secrets.insert("mac-pw".into(), Zeroizing::new("new".into()));
-        let local = ProfileStore { vnc_profiles: vec![pc], ..store_of(vec![]) };
-        let decline = |key: &str| ItemDecision {
-            key: key.into(),
-            accept: false,
-            as_new: false,
-            fields: vec!["port".into(), "password".into()],
-        };
-        for decisions in [
-            vec![],
-            vec![decline("vnc:pc"), decline("vnc:n")],
-            vec![accept("vnc:pc", &[])],
-        ] {
-            let staged = run(&local, &payload, &decisions).unwrap();
-            assert_eq!(staged.data, local);
-            assert!(staged.secrets.is_empty() && staged.replaced_secrets.is_empty());
-            assert_eq!(staged.summary, ApplySummary { added: 0, updated: 0 });
-        }
-    }
-
-    #[test]
-    fn vnc_profile_added_as_new_gets_its_own_id() {
-        let pc = vnc("pc", "desk", "h1");
-        let local = ProfileStore { vnc_profiles: vec![pc.clone()], ..store_of(vec![]) };
-        let inc = VncProfile { port: 5901, ..pc.clone() };
-        let payload = Payload { vnc_profiles: vec![inc], ..Default::default() };
-        let d = ItemDecision { key: "vnc:pc".into(), accept: true, as_new: true, fields: vec![] };
-        let staged = run(&local, &payload, &[d]).unwrap();
-        assert_eq!(staged.data.vnc_profiles.len(), 2);
-        assert_eq!(staged.data.vnc_profiles[0], pc);
-        let added = &staged.data.vnc_profiles[1];
-        assert_ne!(added.id, "pc");
-        assert_eq!((added.port, added.order), (5901, 1));
-        assert_eq!(staged.summary, ApplySummary { added: 1, updated: 0 });
-    }
-
-    // A stored VNC profile whose password is in the vault, and an import that replaces that
-    // password and adds a second profile with a password of its own.
-    fn vnc_import(dir: &std::path::Path) -> (Store, Vault, String, Staged) {
-        let mut store = Store::load(dir.to_path_buf()).unwrap();
-        let mut v = vault(dir);
-        let old = v.set_secret(b"old").unwrap();
-        let pc = VncProfile { secret_id: Some(old.clone()), ..vnc("pc", "desk", "h1") };
-        store.upsert_vnc_profile(pc).unwrap();
-        let mac = VncProfile { secret_id: Some("mac-pw".into()), ..vnc("mac", "desk", "h1") };
-        let lab = VncProfile { secret_id: Some("lab-pw".into()), ..vnc("lab", "lab", "h2") };
-        let mut payload = Payload { vnc_profiles: vec![mac, lab], ..Default::default() };
-        payload.secrets.insert("mac-pw".into(), Zeroizing::new("new".into()));
-        payload.secrets.insert("lab-pw".into(), Zeroizing::new("lab".into()));
-        let decisions = [accept("vnc:mac", &["password"]), accept("vnc:lab", &[])];
-        let staged = run(&store.snapshot(), &payload, &decisions).unwrap();
-        (store, v, old, staged)
-    }
-
-    #[test]
-    fn vnc_import_stores_the_new_passwords_and_deletes_the_replaced_one() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut store, mut v, old, staged) = vnc_import(dir.path());
-        let summary = execute(&mut store, &mut v, &dir.path().join("keys"), staged).unwrap();
-        assert_eq!(summary, ApplySummary { added: 1, updated: 1 });
-        let profiles = store.vnc_profiles();
-        let ids: Vec<_> = profiles.iter().map(|p| p.id.as_str()).collect();
-        assert_eq!(ids, ["pc", "lab"]);
-        let secret =
-            |p: &VncProfile| v.get_secret(p.secret_id.as_deref().unwrap()).unwrap().to_vec();
-        assert_eq!(secret(&profiles[0]), b"new");
-        assert_eq!(secret(&profiles[1]), b"lab");
-        assert!(!v.has_secret(&old));
-        assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().vnc_profiles(), profiles);
-    }
-
-    #[test]
-    fn failed_vnc_import_leaves_the_store_and_the_vault_as_they_were() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut store, mut v, old, staged) = vnc_import(dir.path());
-        assert_eq!(staged.secrets.len(), 2);
-        assert_eq!(staged.replaced_secrets, [old.clone()]);
-        let on_disk = |name: &str| std::fs::read(dir.path().join(name)).unwrap();
-        let before = (store.snapshot(), on_disk("profiles.json"), on_disk("vault.enc"));
+        let staged = run(&store.hosts(), &payload, accept_all).unwrap();
         // A directory where the temp file should be makes the store write fail.
-        std::fs::create_dir(dir.path().join("profiles.json.tmp")).unwrap();
-        assert!(execute(&mut store, &mut v, &dir.path().join("keys"), staged).is_err());
-        assert_eq!((store.snapshot(), on_disk("profiles.json"), on_disk("vault.enc")), before);
-        assert_eq!(v.get_secret(&old).unwrap().as_slice(), b"old");
+        std::fs::create_dir(dir.path().join("hosts.json.tmp")).unwrap();
+        let keys = dir.path().join("keys");
+        assert!(execute(&mut store, &mut v, &keys, staged).is_err());
+        assert!(store.hosts().hosts.iter().all(|h| h.name != "nas"));
+        assert_eq!(std::fs::read_dir(&keys).unwrap().count(), 0);
+        let vault_file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("vault.enc")).unwrap()).unwrap();
+        assert_eq!(vault_file["secrets"].as_object().map(|s| s.len()).unwrap_or(0), 0);
     }
 
     #[test]
-    fn new_rdp_profile_is_written_with_its_secret() {
-        let inc = RdpProfile {
-            domain: Some("CORP".into()),
-            keyboard_layout: Some(0x407),
-            secret_id: Some("mac-pw".into()),
-            ..rdp("r", "office", "h9")
-        };
-        let mut payload = Payload { rdp_profiles: vec![inc.clone()], ..Default::default() };
-        payload.secrets.insert("mac-pw".into(), Zeroizing::new("pw".into()));
-        let local = ProfileStore {
-            rdp_profiles: vec![RdpProfile { order: 3, ..rdp("x", "other", "h1") }],
-            ..store_of(vec![])
-        };
-        let staged = run(&local, &payload, &[accept("rdp:r", &[])]).unwrap();
-        assert_eq!(staged.summary, ApplySummary { added: 1, updated: 0 });
-        assert_eq!(staged.data.rdp_profiles[1].secret_id, Some(format!("{SECRET_PREFIX}0")));
-
+    fn execute_writes_secrets_and_key_files_and_points_at_them() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        let mut store = Store::load(dir.path().to_path_buf(), &[]).unwrap();
         let mut v = vault(dir.path());
-        execute(&mut store, &mut v, &dir.path().join("keys"), staged).unwrap();
-        assert_eq!(store.rdp_profiles()[0], local.rdp_profiles[0]);
-        let p = &store.rdp_profiles()[1];
-        assert_eq!(v.get_secret(p.secret_id.as_deref().unwrap()).unwrap().as_slice(), b"pw");
-        assert_eq!(p.order, 4);
-        assert_eq!(RdpProfile { secret_id: inc.secret_id.clone(), order: 0, ..p.clone() }, inc);
-        let reloaded = Store::load(dir.path().to_path_buf()).unwrap();
-        assert_eq!(reloaded.rdp_profiles(), store.rdp_profiles());
-    }
-
-    #[test]
-    fn new_rdp_profile_drops_a_password_and_icon_the_bundle_does_not_bring() {
-        let inc = RdpProfile {
-            secret_id: Some("mac-pw".into()),
-            icon: IconRef::Custom { path: "icons/6f1c2a9e-8d0b-4c57-9a3e-2b7d5e41f0c8.png".into() },
-            ..rdp("r", "office", "h9")
-        };
-        let payload = Payload { rdp_profiles: vec![inc], ..Default::default() };
-        let staged = run(&store_of(vec![]), &payload, &[accept("rdp:r", &[])]).unwrap();
-        let p = &staged.data.rdp_profiles[0];
-        assert_eq!((p.id.as_str(), &p.secret_id, &p.icon), ("r", &None, &IconRef::default()));
-        assert!(staged.secrets.is_empty());
-    }
-
-    #[test]
-    fn matched_rdp_profile_takes_only_the_accepted_fields() {
-        let pc = RdpProfile { secret_id: Some("old".into()), ..rdp("pc", "office", "h1") };
-        let mac = RdpProfile {
-            name: "office (mac)".into(),
-            host: "h2".into(),
-            port: 3390,
-            username: "CORP\\faye".into(),
-            domain: Some("CORP".into()),
-            keyboard_layout: Some(0x407),
-            secret_id: Some("mac-pw".into()),
-            icon: IconRef::Builtin { name: "monitor".into() },
-            ..pc.clone()
-        };
-        let mut payload = Payload { rdp_profiles: vec![mac.clone()], ..Default::default() };
-        payload.secrets.insert("mac-pw".into(), Zeroizing::new("new".into()));
-        let local = ProfileStore { rdp_profiles: vec![pc.clone()], ..store_of(vec![]) };
-
-        let some = ["port", "domain", "keyboardLayout"];
-        let staged = run(&local, &payload, &[accept("rdp:pc", &some)]).unwrap();
-        let expected = RdpProfile {
-            port: 3390,
-            domain: Some("CORP".into()),
-            keyboard_layout: Some(0x407),
-            ..pc
-        };
-        assert_eq!(staged.data.rdp_profiles, [expected]);
-        assert!(staged.secrets.is_empty() && staged.replaced_secrets.is_empty());
-        assert_eq!(staged.summary, ApplySummary { added: 0, updated: 1 });
-
-        let every =
-            ["name", "host", "port", "username", "domain", "keyboardLayout", "icon", "password"];
-        let staged = run(&local, &payload, &[accept("rdp:pc", &every)]).unwrap();
-        let all = RdpProfile { secret_id: Some(format!("{SECRET_PREFIX}0")), ..mac };
-        assert_eq!(staged.data.rdp_profiles, [all]);
-        assert_eq!(staged.secrets[0].as_str(), "new");
-        assert_eq!(staged.replaced_secrets, ["old"]);
-        assert_eq!(staged.summary, ApplySummary { added: 0, updated: 1 });
-    }
-
-    #[test]
-    fn declined_rdp_profiles_leave_everything_untouched() {
-        let pc = RdpProfile { secret_id: Some("old".into()), ..rdp("pc", "office", "h1") };
-        let mac = RdpProfile { port: 3390, secret_id: Some("mac-pw".into()), ..pc.clone() };
-        let mut payload =
-            Payload { rdp_profiles: vec![mac, rdp("n", "new", "h9")], ..Default::default() };
-        payload.secrets.insert("mac-pw".into(), Zeroizing::new("new".into()));
-        let local = ProfileStore { rdp_profiles: vec![pc], ..store_of(vec![]) };
-        let decline = |key: &str| ItemDecision {
-            key: key.into(),
-            accept: false,
-            as_new: false,
-            fields: vec!["port".into(), "password".into()],
-        };
-        for decisions in [
-            vec![],
-            vec![decline("rdp:pc"), decline("rdp:n")],
-            vec![accept("rdp:pc", &[])],
-        ] {
-            let staged = run(&local, &payload, &decisions).unwrap();
-            assert_eq!(staged.data, local);
-            assert!(staged.secrets.is_empty() && staged.replaced_secrets.is_empty());
-            assert_eq!(staged.summary, ApplySummary { added: 0, updated: 0 });
-        }
-    }
-
-    #[test]
-    fn rdp_profile_added_as_new_gets_its_own_id() {
-        let pc = rdp("pc", "office", "h1");
-        let local = ProfileStore { rdp_profiles: vec![pc.clone()], ..store_of(vec![]) };
-        let inc = RdpProfile { port: 3390, ..pc.clone() };
-        let payload = Payload { rdp_profiles: vec![inc], ..Default::default() };
-        let d = ItemDecision { key: "rdp:pc".into(), accept: true, as_new: true, fields: vec![] };
-        let staged = run(&local, &payload, &[d]).unwrap();
-        assert_eq!(staged.data.rdp_profiles.len(), 2);
-        assert_eq!(staged.data.rdp_profiles[0], pc);
-        let added = &staged.data.rdp_profiles[1];
-        assert_ne!(added.id, "pc");
-        assert_eq!((added.port, added.order), (3390, 1));
-        assert_eq!(staged.summary, ApplySummary { added: 1, updated: 0 });
-    }
-
-    // A stored RDP profile whose password is in the vault, and an import that replaces that
-    // password and adds a second profile with a password of its own.
-    fn rdp_import(dir: &std::path::Path) -> (Store, Vault, String, Staged) {
-        let mut store = Store::load(dir.to_path_buf()).unwrap();
-        let mut v = vault(dir);
-        let old = v.set_secret(b"old").unwrap();
-        let pc = RdpProfile { secret_id: Some(old.clone()), ..rdp("pc", "office", "h1") };
-        store.upsert_rdp_profile(pc).unwrap();
-        let mac = RdpProfile { secret_id: Some("mac-pw".into()), ..rdp("mac", "office", "h1") };
-        let lab = RdpProfile { secret_id: Some("lab-pw".into()), ..rdp("lab", "lab", "h2") };
-        let mut payload = Payload { rdp_profiles: vec![mac, lab], ..Default::default() };
-        payload.secrets.insert("mac-pw".into(), Zeroizing::new("new".into()));
-        payload.secrets.insert("lab-pw".into(), Zeroizing::new("lab".into()));
-        let decisions = [accept("rdp:mac", &["password"]), accept("rdp:lab", &[])];
-        let staged = run(&store.snapshot(), &payload, &decisions).unwrap();
-        (store, v, old, staged)
-    }
-
-    #[test]
-    fn rdp_import_stores_the_new_passwords_and_deletes_the_replaced_one() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut store, mut v, old, staged) = rdp_import(dir.path());
-        let summary = execute(&mut store, &mut v, &dir.path().join("keys"), staged).unwrap();
-        assert_eq!(summary, ApplySummary { added: 1, updated: 1 });
-        let profiles = store.rdp_profiles();
-        let ids: Vec<_> = profiles.iter().map(|p| p.id.as_str()).collect();
-        assert_eq!(ids, ["pc", "lab"]);
-        let secret =
-            |p: &RdpProfile| v.get_secret(p.secret_id.as_deref().unwrap()).unwrap().to_vec();
-        assert_eq!(secret(&profiles[0]), b"new");
-        assert_eq!(secret(&profiles[1]), b"lab");
-        assert!(!v.has_secret(&old));
-        assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().rdp_profiles(), profiles);
-    }
-
-    #[test]
-    fn failed_rdp_import_leaves_the_store_and_the_vault_as_they_were() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut store, mut v, old, staged) = rdp_import(dir.path());
-        assert_eq!(staged.secrets.len(), 2);
-        assert_eq!(staged.replaced_secrets, [old.clone()]);
-        let on_disk = |name: &str| std::fs::read(dir.path().join(name)).unwrap();
-        let before = (store.snapshot(), on_disk("profiles.json"), on_disk("vault.enc"));
-        // A directory where the temp file should be makes the store write fail.
-        std::fs::create_dir(dir.path().join("profiles.json.tmp")).unwrap();
-        assert!(execute(&mut store, &mut v, &dir.path().join("keys"), staged).is_err());
-        assert_eq!((store.snapshot(), on_disk("profiles.json"), on_disk("vault.enc")), before);
-        assert_eq!(v.get_secret(&old).unwrap().as_slice(), b"old");
-    }
-
-    fn gateway(same_login: bool, username: &str, secret: Option<&str>) -> RdpGateway {
-        RdpGateway {
-            host: "gw.corp".into(),
-            port: 443,
-            same_login,
-            username: username.into(),
-            secret_id: secret.map(Into::into),
+        let key_login = Login::Own(OwnLogin {
+            username: "admin".into(),
+            auth_method: AuthMethod::Key,
+            key_ids: vec!["k".into()],
+            secret_id: None,
             extra: Default::default(),
-        }
-    }
-
-    fn share() -> SharedFolder {
-        SharedFolder {
-            path: "/home/faye/share".into(),
-            name: "faye".into(),
-            extra: Default::default(),
-        }
-    }
-
-    #[test]
-    fn matched_rdp_profile_takes_sound_and_the_shared_folder_when_accepted() {
-        let pc = rdp("pc", "office", "h1");
-        let mac = RdpProfile { audio: false, shared_folder: Some(share()), ..pc.clone() };
-        let payload = Payload { rdp_profiles: vec![mac.clone()], ..Default::default() };
-        let local = ProfileStore { rdp_profiles: vec![pc.clone()], ..store_of(vec![]) };
-        let mut env = MapEnv::default();
-        env.dirs.insert("/home/faye/share".into());
-        let planned = plan(&local, &payload, &env);
-
-        let staged = stage(&local, &payload, &planned, &[accept("rdp:pc", &["audio"])], &env);
-        let sound_off = RdpProfile { audio: false, ..pc.clone() };
-        assert_eq!(staged.unwrap().data.rdp_profiles, [sound_off]);
-
-        let both = [accept("rdp:pc", &["audio", "sharedFolder"])];
-        let staged = stage(&local, &payload, &planned, &both, &env).unwrap();
-        assert_eq!(staged.data.rdp_profiles, [mac]);
-        assert_eq!(staged.summary, ApplySummary { added: 0, updated: 1 });
-    }
-
-    // A stored RDP profile with `local` as its gateway and the same profile from another machine
-    // with `incoming`, whose gateway password "mac-gw" the export carries.
-    fn stage_gateway(
-        local: Option<RdpGateway>,
-        incoming: Option<RdpGateway>,
-        fields: &[&str],
-    ) -> Result<Staged, Vec<ItemProblem>> {
-        let pc = RdpProfile { gateway: local, ..rdp("pc", "office", "h1") };
-        let mac = RdpProfile { gateway: incoming, ..pc.clone() };
-        let mut payload = Payload { rdp_profiles: vec![mac], ..Default::default() };
-        payload.secrets.insert("mac-gw".into(), Zeroizing::new("new".into()));
-        let local = ProfileStore { rdp_profiles: vec![pc], ..store_of(vec![]) };
-        let mut env = MapEnv::default();
-        env.secrets.insert("old-gw".into(), b"old".to_vec());
-        let planned = plan(&local, &payload, &env);
-        let offered: Vec<_> = planned.items[0].fields.iter().map(|f| f.field.as_str()).collect();
-        for field in fields {
-            assert!(offered.contains(field), "{field} is not offered: {offered:?}");
-        }
-        stage(&local, &payload, &planned, &[accept("rdp:pc", fields)], &env)
-    }
-
-    #[test]
-    fn accepted_gateway_keeps_the_local_gateway_password_when_both_use_their_own_login() {
-        let local = gateway(false, "CORP\\gw", Some("old-gw"));
-        let incoming = gateway(false, "CORP\\other", Some("mac-gw"));
-        let staged = stage_gateway(Some(local), Some(incoming), &["gateway"]).unwrap();
-        let kept = gateway(false, "CORP\\other", Some("old-gw"));
-        assert_eq!(staged.data.rdp_profiles[0].gateway, Some(kept));
-        assert!(staged.secrets.is_empty() && staged.replaced_secrets.is_empty());
-    }
-
-    #[test]
-    fn accepted_gateway_without_its_own_login_drops_the_local_gateway_password() {
-        let local = || Some(gateway(false, "CORP\\gw", Some("old-gw")));
-        let staged = stage_gateway(local(), None, &["gateway"]).unwrap();
-        assert_eq!(staged.data.rdp_profiles[0].gateway, None);
-        assert!(staged.secrets.is_empty());
-        assert_eq!(staged.replaced_secrets, ["old-gw"]);
-
-        let same = gateway(true, "", None);
-        let staged = stage_gateway(local(), Some(same.clone()), &["gateway"]).unwrap();
-        assert_eq!(staged.data.rdp_profiles[0].gateway, Some(same));
-        assert!(staged.secrets.is_empty());
-        assert_eq!(staged.replaced_secrets, ["old-gw"]);
-    }
-
-    #[test]
-    fn accepted_gateway_password_is_stored_anew_and_replaces_the_local_one() {
-        let local = || Some(gateway(false, "CORP\\gw", Some("old-gw")));
-        let incoming = || Some(gateway(false, "CORP\\other", Some("mac-gw")));
-        let placeholder = Some(format!("{SECRET_PREFIX}0"));
-
-        let both = ["gateway", "gatewayPassword"];
-        let staged = stage_gateway(local(), incoming(), &both).unwrap();
-        let taken = RdpGateway { secret_id: placeholder.clone(), ..incoming().unwrap() };
-        assert_eq!(staged.data.rdp_profiles[0].gateway, Some(taken));
-        assert_eq!(staged.secrets[0].as_str(), "new");
-        assert_eq!(staged.replaced_secrets, ["old-gw"]);
-
-        // Only the password: the local gateway stays, with the new password.
-        let staged = stage_gateway(local(), incoming(), &["gatewayPassword"]).unwrap();
-        let kept = RdpGateway { secret_id: placeholder.clone(), ..local().unwrap() };
-        assert_eq!(staged.data.rdp_profiles[0].gateway, Some(kept));
-        assert_eq!(staged.secrets[0].as_str(), "new");
-        assert_eq!(staged.replaced_secrets, ["old-gw"]);
-
-        // No gateway here yet: nothing to replace.
-        let staged = stage_gateway(None, incoming(), &both).unwrap();
-        let added = RdpGateway { secret_id: placeholder, ..incoming().unwrap() };
-        assert_eq!(staged.data.rdp_profiles[0].gateway, Some(added));
-        assert_eq!(staged.secrets[0].as_str(), "new");
-        assert!(staged.replaced_secrets.is_empty());
-
-        let staged = stage_gateway(None, incoming(), &["gateway"]).unwrap();
-        let without = RdpGateway { secret_id: None, ..incoming().unwrap() };
-        assert_eq!(staged.data.rdp_profiles[0].gateway, Some(without));
-        assert!(staged.secrets.is_empty() && staged.replaced_secrets.is_empty());
-    }
-
-    #[test]
-    fn gateway_password_without_a_gateway_of_its_own_login_is_a_problem() {
-        let incoming = || Some(gateway(false, "CORP\\other", Some("mac-gw")));
-        for local in [None, Some(gateway(true, "", None))] {
-            let problems = stage_gateway(local.clone(), incoming(), &["gatewayPassword"])
-                .err()
-                .unwrap_or_else(|| panic!("accepted with {local:?}"));
-            assert_eq!(
-                problems,
-                [ItemProblem {
-                    key: "rdp:pc".into(),
-                    message: "Gateway password needs the incoming RD Gateway".into(),
-                }]
-            );
-        }
-    }
-
-    #[test]
-    fn new_rdp_profile_brings_its_gateway_password_and_a_shared_folder_that_is_here() {
-        let inc = RdpProfile {
-            secret_id: Some("mac-pw".into()),
-            shared_folder: Some(share()),
-            gateway: Some(gateway(false, "CORP\\gw", Some("mac-gw"))),
-            ..rdp("r", "office", "h9")
+        });
+        let mut payload = PayloadV3 {
+            hosts: vec![host("h", "nas", "nas.local", vec![ssh("c", 22, key_login)])],
+            ..Default::default()
         };
-        let mut payload = Payload { rdp_profiles: vec![inc.clone()], ..Default::default() };
-        payload.secrets.insert("mac-pw".into(), Zeroizing::new("pw".into()));
-        payload.secrets.insert("mac-gw".into(), Zeroizing::new("gw".into()));
-        let local = store_of(vec![]);
-        let mut env = MapEnv::default();
-        env.dirs.insert("/home/faye/share".into());
-        let planned = plan(&local, &payload, &env);
-        let staged = stage(&local, &payload, &planned, &[accept("rdp:r", &[])], &env).unwrap();
-        let p = &staged.data.rdp_profiles[0];
-        assert_eq!(p.shared_folder, Some(share()));
-        let gateway_secret = p.gateway.as_ref().unwrap().secret_id.clone().unwrap();
-        assert!(gateway_secret.starts_with(SECRET_PREFIX));
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        let mut v = vault(dir.path());
-        execute(&mut store, &mut v, &dir.path().join("keys"), staged).unwrap();
-        let p = &store.rdp_profiles()[0];
-        let gw = p.gateway.as_ref().unwrap();
-        assert_eq!(v.get_secret(gw.secret_id.as_deref().unwrap()).unwrap().as_slice(), b"gw");
-        assert_eq!(v.get_secret(p.secret_id.as_deref().unwrap()).unwrap().as_slice(), b"pw");
-        let same_secrets = RdpProfile {
-            secret_id: inc.secret_id.clone(),
-            gateway: inc.gateway.clone(),
-            ..p.clone()
-        };
-        assert_eq!(same_secrets, inc);
-        assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().rdp_profiles(), [p.clone()]);
-    }
-
-    #[test]
-    fn new_rdp_profile_has_no_gateway_password_the_bundle_does_not_bring() {
-        for (gw, carried) in [
-            (gateway(false, "CORP\\gw", Some("mac-gw")), false),
-            (gateway(true, "", Some("mac-gw")), true),
-        ] {
-            let inc = RdpProfile { gateway: Some(gw.clone()), ..rdp("r", "office", "h9") };
-            let mut payload = Payload { rdp_profiles: vec![inc], ..Default::default() };
-            if carried {
-                payload.secrets.insert("mac-gw".into(), Zeroizing::new("gw".into()));
-            }
-            let staged = run(&store_of(vec![]), &payload, &[accept("rdp:r", &[])]).unwrap();
-            let none = RdpGateway { secret_id: None, ..gw };
-            assert_eq!(staged.data.rdp_profiles[0].gateway, Some(none));
-            assert!(staged.secrets.is_empty());
-        }
-    }
-
-    #[test]
-    fn rdp_profile_added_without_a_shared_folder_that_is_not_here() {
-        let inc = RdpProfile { shared_folder: Some(share()), ..rdp("r", "office", "h9") };
-        let payload = Payload { rdp_profiles: vec![inc.clone()], ..Default::default() };
-        let staged = run(&store_of(vec![]), &payload, &[accept("rdp:r", &[])]).unwrap();
-        assert_eq!(staged.data.rdp_profiles[0], RdpProfile { shared_folder: None, ..inc });
-
-        // The same for a match the user adds as new.
-        let pc = RdpProfile { shared_folder: None, ..rdp("pc", "office", "h1") };
-        let mac = RdpProfile { shared_folder: Some(share()), port: 3390, ..pc.clone() };
-        let payload = Payload { rdp_profiles: vec![mac], ..Default::default() };
-        let local = ProfileStore { rdp_profiles: vec![pc.clone()], ..store_of(vec![]) };
-        let d = ItemDecision { key: "rdp:pc".into(), accept: true, as_new: true, fields: vec![] };
-        let staged = run(&local, &payload, &[d]).unwrap();
-        assert_eq!(staged.data.rdp_profiles[0], pc);
-        let added = &staged.data.rdp_profiles[1];
-        assert_eq!((added.port, &added.shared_folder), (3390, &None));
-    }
-
-    // A stored RDP profile whose gateway password is in the vault, and an import that takes the
-    // `fields` of the same profile from another machine with `incoming` as its gateway.
-    fn rdp_gateway_import(
-        dir: &std::path::Path,
-        incoming: Option<RdpGateway>,
-        fields: &[&str],
-    ) -> (Store, Vault, String, Staged) {
-        let mut store = Store::load(dir.to_path_buf()).unwrap();
-        let mut v = vault(dir);
-        let old = v.set_secret(b"old").unwrap();
-        let gw = gateway(false, "CORP\\gw", Some(&old));
-        let pc = RdpProfile { gateway: Some(gw), ..rdp("pc", "office", "h1") };
-        store.upsert_rdp_profile(pc).unwrap();
-        let mac = RdpProfile { gateway: incoming, ..rdp("mac", "office", "h1") };
-        let mut payload = Payload { rdp_profiles: vec![mac], ..Default::default() };
-        payload.secrets.insert("mac-gw".into(), Zeroizing::new("new".into()));
-        let staged = run(&store.snapshot(), &payload, &[accept("rdp:mac", fields)]).unwrap();
-        assert_eq!(staged.replaced_secrets, [old.clone()]);
-        (store, v, old, staged)
-    }
-
-    fn gateway_imports() -> [(Option<RdpGateway>, &'static [&'static str]); 3] {
-        [
-            (Some(gateway(false, "CORP\\gw", Some("mac-gw"))), &["gatewayPassword"]),
-            (None, &["gateway"]),
-            (Some(gateway(true, "", None)), &["gateway"]),
-        ]
-    }
-
-    #[test]
-    fn rdp_gateway_import_deletes_the_replaced_gateway_password_after_the_commit() {
-        for (incoming, fields) in gateway_imports() {
-            let dir = tempfile::tempdir().unwrap();
-            let (mut store, mut v, old, staged) = rdp_gateway_import(dir.path(), incoming, fields);
-            execute(&mut store, &mut v, &dir.path().join("keys"), staged).unwrap();
-            assert!(!v.has_secret(&old), "{fields:?}");
-            let p = &store.rdp_profiles()[0];
-            match p.gateway.as_ref().and_then(|g| g.secret_id.as_deref()) {
-                Some(id) => assert_eq!(v.get_secret(id).unwrap().as_slice(), b"new"),
-                None => assert_eq!(fields, ["gateway"]),
-            }
-            assert_eq!(Store::load(dir.path().to_path_buf()).unwrap().rdp_profiles(), [p.clone()]);
-        }
-    }
-
-    #[test]
-    fn failed_rdp_gateway_import_leaves_the_store_and_the_vault_as_they_were() {
-        for (incoming, fields) in gateway_imports() {
-            let dir = tempfile::tempdir().unwrap();
-            let (mut store, mut v, old, staged) = rdp_gateway_import(dir.path(), incoming, fields);
-            let on_disk = |name: &str| std::fs::read(dir.path().join(name)).unwrap();
-            let before = (store.snapshot(), on_disk("profiles.json"), on_disk("vault.enc"));
-            // A directory where the temp file should be makes the store write fail.
-            std::fs::create_dir(dir.path().join("profiles.json.tmp")).unwrap();
-            assert!(execute(&mut store, &mut v, &dir.path().join("keys"), staged).is_err());
-            let after = (store.snapshot(), on_disk("profiles.json"), on_disk("vault.enc"));
-            assert_eq!(after, before, "{fields:?}");
-            assert_eq!(v.get_secret(&old).unwrap().as_slice(), b"old");
-        }
-    }
-
-    #[test]
-    fn failed_commit_rolls_back_secrets_and_key_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        std::fs::create_dir(dir.path().join("profiles.json")).unwrap();
-        let mut v = vault(dir.path());
-        let keys_dir = dir.path().join("keys");
-        assert!(execute(&mut store, &mut v, &keys_dir, staged_with_secret_and_key()).is_err());
-        assert!(store.profiles().is_empty());
-        assert_eq!(std::fs::read_dir(&keys_dir).unwrap().count(), 0);
-        let raw = std::fs::read_to_string(dir.path().join("vault.enc")).unwrap_or_default();
-        let secrets = serde_json::from_str::<serde_json::Value>(&raw)
-            .ok()
-            .and_then(|v| v["secrets"].as_object().map(|o| o.len()))
-            .unwrap_or(0);
-        assert_eq!(secrets, 0);
-    }
-
-    #[test]
-    fn corrupt_key_file_rolls_back_the_one_already_written() {
-        let mut inc = profile("n", "new", "h9");
-        inc.keys = vec![
-            ProfileKey { path: "/a".into(), secret_id: None },
-            ProfileKey { path: "/b".into(), secret_id: None },
-        ];
-        let mut payload = Payload { profiles: vec![inc], ..Default::default() };
-        let good = KeyFile { file_name: "a".into(), data: Zeroizing::new(STANDARD.encode(b"K")) };
-        let bad = KeyFile { file_name: "b".into(), data: Zeroizing::new("not base64!".into()) };
-        payload.key_files.insert("/a".into(), good);
-        payload.key_files.insert("/b".into(), bad);
-        let staged = run(&store_of(vec![]), &payload, &[accept("ssh:n", &[])]).unwrap();
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        let mut v = vault(dir.path());
-        let keys_dir = dir.path().join("keys");
-        let result = execute(&mut store, &mut v, &keys_dir, staged);
-        assert!(matches!(result, Err(AppError::Import(_))));
-        assert_eq!(std::fs::read_dir(&keys_dir).unwrap().count(), 0);
-        assert!(store.profiles().is_empty());
-    }
-
-    #[test]
-    fn locked_vault_rolls_back_key_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        let mut v = Vault::open_locked(dir.path().join("vault.enc")).unwrap();
-        let keys_dir = dir.path().join("keys");
-        let result = execute(&mut store, &mut v, &keys_dir, staged_with_secret_and_key());
-        assert!(matches!(result, Err(AppError::Vault(_))));
-        assert_eq!(std::fs::read_dir(&keys_dir).unwrap().count(), 0);
-        assert!(store.profiles().is_empty());
-    }
-
-    // A stored profile whose password is in the vault, and an import that replaces that password.
-    fn password_replacement(dir: &std::path::Path) -> (Store, Vault, String, Staged) {
-        let mut store = Store::load(dir.to_path_buf()).unwrap();
-        let mut v = vault(dir);
-        let old = v.set_secret(b"old").unwrap();
-        let mut pc = profile("pc", "web", "h1");
-        pc.secret_id = Some(old.clone());
-        store.commit(store_of(vec![pc.clone()])).unwrap();
-        let mut mac = pc;
-        mac.id = "mac".into();
-        mac.secret_id = Some("mac-pw".into());
-        let mut payload = Payload { profiles: vec![mac], ..Default::default() };
-        payload.secrets.insert("mac-pw".into(), Zeroizing::new("new".into()));
-        let staged = run(&store.snapshot(), &payload, &[accept("ssh:mac", &["password"])]).unwrap();
-        (store, v, old, staged)
-    }
-
-    // Two local profiles on one server, and a review of an incoming profile that matched "web".
-    fn reviewed_import(dir: &std::path::Path) -> (Store, Vault, String, Payload, Vec<ReviewItem>) {
-        let mut store = Store::load(dir.to_path_buf()).unwrap();
-        let mut v = vault(dir);
-        let old = v.set_secret(b"old").unwrap();
-        let mut web = profile("w", "web", "h1");
-        web.secret_id = Some(old.clone());
-        store.commit(store_of(vec![web, profile("d", "db", "h1")])).unwrap();
-        let mut mac = profile("mac", "web", "h1");
-        mac.auth_method = AuthMethod::Agent;
-        mac.secret_id = Some("mac-pw".into());
-        let mut payload = Payload { profiles: vec![mac], ..Default::default() };
-        payload.secrets.insert("mac-pw".into(), Zeroizing::new("new".into()));
-        let items =
-            plan(&store.snapshot(), &payload, &LocalEnv { vault: &v, config_dir: dir }).items;
-        assert_eq!(items[0].matched.as_ref().unwrap().id, "w");
-        (store, v, old, payload, items)
-    }
-
-    #[test]
-    fn reviewed_import_applies_while_the_store_is_unchanged() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut store, mut v, old, payload, items) = reviewed_import(dir.path());
-        let decisions = [accept("ssh:mac", &["authMethod", "password"])];
-        let staged = {
-            let env = LocalEnv { vault: &v, config_dir: dir.path() };
-            stage_reviewed(&store.snapshot(), &payload, &items, &decisions, &env).unwrap().unwrap()
-        };
-        execute(&mut store, &mut v, &dir.path().join("keys"), staged).unwrap();
-        let profiles = store.profiles();
-        assert_eq!(profiles[0].auth_method, AuthMethod::Agent);
-        assert_eq!(
-            v.get_secret(profiles[0].secret_id.as_deref().unwrap()).unwrap().as_slice(),
-            b"new"
+        payload.keys.push(SshKey { id: "k".into(), path: "/remote/id".into(), secret_id: Some("pp".into()), extra: Default::default() });
+        payload.secrets.insert("pp".into(), Zeroizing::new("phrase".into()));
+        payload.key_files.insert(
+            "/remote/id".into(),
+            KeyFile { file_name: "id".into(), data: Zeroizing::new(STANDARD.encode(b"KEY")) },
         );
-        assert!(!v.has_secret(&old));
-        assert_eq!(profiles[1], profile("d", "db", "h1"));
+        let staged = run(&store.hosts(), &payload, accept_all).unwrap();
+        let keys = dir.path().join("keys");
+        execute(&mut store, &mut v, &keys, staged).unwrap();
+        let key = store.hosts().keys.into_iter().find(|k| k.id == "k").unwrap();
+        assert!(Path::new(&key.path).starts_with(&keys));
+        assert_eq!(std::fs::read(&key.path).unwrap(), b"KEY");
+        assert_eq!(v.get_secret(key.secret_id.as_deref().unwrap()).unwrap().as_slice(), b"phrase");
     }
 
     #[test]
-    fn import_is_refused_when_its_match_changed_after_the_review() {
-        let delete: fn(&mut Store) = |s| s.delete_profile("w").unwrap();
-        let edit: fn(&mut Store) = |s| {
-            let mut web = s.profiles()[0].clone();
-            web.auth_method = AuthMethod::Key;
-            s.upsert_profile(web).unwrap();
-        };
-        for change in [delete, edit] {
-            let dir = tempfile::tempdir().unwrap();
-            let (mut store, v, old, payload, items) = reviewed_import(dir.path());
-            change(&mut store);
-            let on_disk = |name: &str| std::fs::read(dir.path().join(name)).unwrap();
-            let before = (store.snapshot(), on_disk("profiles.json"), on_disk("vault.enc"));
-
-            let env = LocalEnv { vault: &v, config_dir: dir.path() };
-            let decisions = [accept("ssh:mac", &["authMethod", "password"])];
-            let result = stage_reviewed(&store.snapshot(), &payload, &items, &decisions, &env);
-            let Err(AppError::Import(message)) = result else { panic!("not refused") };
-            assert_eq!(
-                message,
-                "your profiles changed since this file was opened; close this tab and import \
-                 the file again"
-            );
-            assert_eq!((store.snapshot(), on_disk("profiles.json"), on_disk("vault.enc")), before);
-            assert_eq!(v.get_secret(&old).unwrap().as_slice(), b"old");
-        }
+    fn a_network_key_path_without_an_embedded_file_is_a_problem() {
+        let mut payload = PayloadV3::default();
+        payload.keys.push(SshKey { id: "k".into(), path: "\\\\server\\share\\id".into(), secret_id: None, extra: Default::default() });
+        let problems = run(&file(vec![]), &payload, accept_all).err().unwrap();
+        assert_eq!(problems[0].key, "key:k");
     }
 
-    #[test]
-    fn replaced_password_is_deleted_after_the_commit() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut store, mut v, old, staged) = password_replacement(dir.path());
-        execute(&mut store, &mut v, &dir.path().join("keys"), staged).unwrap();
-        let p = &store.profiles()[0];
-        assert_eq!(v.get_secret(p.secret_id.as_deref().unwrap()).unwrap().as_slice(), b"new");
-        assert!(!v.has_secret(&old));
-    }
-
-    // A file named the way `execute` names an imported key.
-    fn app_key(folder: &Path, n: u8) -> ProfileKey {
+    fn app_key(folder: &Path, n: u8) -> String {
         let path = folder.join(format!("6f1c2a9e-8d0b-4c57-9a3e-2b7d5e41f0c{n}-id"));
         std::fs::write(&path, b"K").unwrap();
-        ProfileKey { path: path.to_string_lossy().into_owned(), secret_id: None }
+        path.to_string_lossy().into_owned()
     }
 
-    fn on_disk(key: &ProfileKey) -> bool {
-        Path::new(&key.path).is_file()
+    fn on_disk(path: &str) -> bool {
+        Path::new(path).is_file()
     }
 
     #[test]
-    fn empty_store_without_candidates_removes_no_key_files() {
+    fn nothing_dropped_removes_no_key_files() {
         let dir = tempfile::tempdir().unwrap();
         let keys = dir.path().join("keys");
-        remove_unreferenced_keys(&keys, &[], &store_of(vec![]));
+        remove_unreferenced_key_files(&keys, &[], &[]);
         assert!(!keys.exists());
 
         std::fs::create_dir(&keys).unwrap();
         let imported = app_key(&keys, 1);
-        remove_unreferenced_keys(&keys, &[], &store_of(vec![]));
+        remove_unreferenced_key_files(&keys, &[], &[]);
         assert!(on_disk(&imported));
     }
 
     #[test]
-    fn deleting_a_profile_removes_only_its_own_app_made_keys() {
+    fn only_app_made_keys_nothing_uses_are_removed() {
         let dir = tempfile::tempdir().unwrap();
         let keys = dir.path().join("keys");
         std::fs::create_dir_all(keys.join("sub")).unwrap();
         let own = app_key(&keys, 1);
         let shared = app_key(&keys, 2);
-        let shared_with_sftp = app_key(&keys, 3);
-        let other = app_key(&keys, 4);
+        let shared_in_capitals = app_key(&keys, 3);
         let never_a_candidate = app_key(&keys, 5);
         let nested = app_key(&keys.join("sub"), 6);
         let outside = app_key(dir.path(), 7);
-        let hand_made = ProfileKey {
-            path: keys.join("id_ed25519").to_string_lossy().into_owned(),
-            secret_id: None,
-        };
-        std::fs::write(&hand_made.path, b"K").unwrap();
+        let hand_made = keys.join("id_ed25519").to_string_lossy().into_owned();
+        std::fs::write(&hand_made, b"K").unwrap();
 
-        let mut web = profile("w", "web", "h1");
-        web.keys = vec![
-            own.clone(),
-            shared.clone(),
-            shared_with_sftp.clone(),
-            nested.clone(),
-            outside.clone(),
-            hand_made.clone(),
-        ];
-        let mut db = profile("d", "db", "h2");
-        db.keys = vec![shared.clone(), other.clone()];
-        let mut files = sftp("f", "files", "h1");
-        files.keys =
-            vec![ProfileKey { path: shared_with_sftp.path.to_uppercase(), secret_id: None }];
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        let data = ProfileStore { sftp_profiles: vec![files], ..store_of(vec![web, db]) };
-        store.commit(data).unwrap();
-
-        let deleted = store.profiles().into_iter().find(|p| p.id == "w").unwrap();
-        store.delete_profile("w").unwrap();
-        remove_unreferenced_keys(&keys, &deleted.keys, &store.snapshot());
+        let previous = [own.clone(), shared.clone(), shared_in_capitals.clone(), nested.clone(), outside.clone(), hand_made.clone()];
+        let used = [shared.clone(), shared_in_capitals.to_uppercase()];
+        remove_unreferenced_key_files(&keys, &previous, &used);
         assert!(!on_disk(&own));
-        assert!(on_disk(&shared) && on_disk(&shared_with_sftp) && on_disk(&other));
+        assert!(on_disk(&shared) && on_disk(&shared_in_capitals));
         assert!(on_disk(&never_a_candidate));
         assert!(on_disk(&nested) && on_disk(&outside) && on_disk(&hand_made));
-    }
-
-    #[test]
-    fn dropping_one_of_two_keys_removes_only_that_one() {
-        let dir = tempfile::tempdir().unwrap();
-        let keys = dir.path().join("keys");
-        std::fs::create_dir(&keys).unwrap();
-        let (kept, dropped) = (app_key(&keys, 1), app_key(&keys, 2));
-        let mut web = profile("w", "web", "h1");
-        web.keys = vec![kept.clone(), dropped.clone()];
-        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
-        store.commit(store_of(vec![web.clone()])).unwrap();
-
-        let previous = store.profiles().into_iter().find(|p| p.id == "w").unwrap();
-        web.keys.truncate(1);
-        store.upsert_profile(web).unwrap();
-        remove_unreferenced_keys(&keys, &previous.keys, &store.snapshot());
-        assert!(on_disk(&kept) && !on_disk(&dropped));
     }
 
     #[test]
@@ -2466,13 +1339,8 @@ mod tests {
         let keys = dir.path().join("keys");
         std::fs::create_dir(&keys).unwrap();
         let used = app_key(&keys, 1);
-        let mut web = profile("w", "web", "h1");
-        web.keys = vec![used.clone()];
-        let spellings: Vec<ProfileKey> = [".", " ", "::$DATA"]
-            .iter()
-            .map(|tail| ProfileKey { path: format!("{}{tail}", used.path), secret_id: None })
-            .collect();
-        remove_unreferenced_keys(&keys, &spellings, &store_of(vec![web]));
+        let spellings: Vec<String> = [".", " ", "::$DATA"].iter().map(|tail| format!("{used}{tail}")).collect();
+        remove_unreferenced_key_files(&keys, &spellings, &[used.clone()]);
         assert!(on_disk(&used));
     }
 
@@ -2508,23 +1376,23 @@ mod tests {
         let keys = dir.path().join("keys");
         link_dir(&elsewhere, &keys);
         let through_link = app_key(&keys, 1);
-        remove_unreferenced_keys(&keys, &[through_link.clone()], &store_of(vec![]));
+        remove_unreferenced_key_files(&keys, &[through_link.clone()], &[]);
         assert!(on_disk(&through_link));
 
         let direct = app_key(&elsewhere, 1);
-        remove_unreferenced_keys(&elsewhere, &[direct.clone()], &store_of(vec![]));
+        remove_unreferenced_key_files(&elsewhere, &[direct.clone()], &[]);
         assert!(!on_disk(&direct) && !on_disk(&through_link));
     }
 
     // Other paths to the file of `key`, which is in `<dir>/real/keys`; `<dir>/via` links to
     // `<dir>/real`. On Windows none of them ends in the file's own name.
     #[cfg(windows)]
-    fn other_paths(dir: &Path, key: &ProfileKey) -> Vec<String> {
-        let name = Path::new(&key.path).file_name().unwrap().to_string_lossy().into_owned();
+    fn other_paths(dir: &Path, key: &str) -> Vec<String> {
+        let name = Path::new(key).file_name().unwrap().to_string_lossy().into_owned();
         let keys = dir.join("real").join("keys").to_string_lossy().into_owned();
         vec![
-            format!("{}.", key.path),
-            format!("{}::$DATA", key.path),
+            format!("{key}."),
+            format!("{key}::$DATA"),
             format!("{}\\{name}.", keys.to_ascii_uppercase()),
             format!("{keys}\\sub\\..\\{name}."),
             format!("{}\\keys\\{name}.", dir.join("via").to_string_lossy()),
@@ -2533,17 +1401,17 @@ mod tests {
 
     // Only the symlink has another name here; the other two are the same file under its own.
     #[cfg(unix)]
-    fn other_paths(dir: &Path, key: &ProfileKey) -> Vec<String> {
-        let name = Path::new(&key.path).file_name().unwrap();
+    fn other_paths(dir: &Path, key: &str) -> Vec<String> {
+        let name = Path::new(key).file_name().unwrap();
         let link = dir.join("id_link");
-        std::os::unix::fs::symlink(&key.path, &link).unwrap();
+        std::os::unix::fs::symlink(key, &link).unwrap();
         [link, dir.join("real/keys/sub/..").join(name), dir.join("via/keys").join(name)]
             .map(|path| path.to_string_lossy().into_owned())
             .into()
     }
 
     #[test]
-    fn key_a_profile_reaches_through_another_path_is_not_removed() {
+    fn a_key_reached_through_another_path_is_not_removed() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("real");
         let keys = config.join("keys");
@@ -2554,61 +1422,47 @@ mod tests {
         let previous = [used.clone(), unused.clone()];
         for path in other_paths(dir.path(), &used) {
             assert_eq!(std::fs::read(&path).unwrap(), b"K", "{path}");
-            let mut web = profile("w", "web", "h1");
-            web.keys = vec![ProfileKey { path: path.clone(), secret_id: None }];
-            remove_unreferenced_keys(&keys, &previous, &store_of(vec![web]));
+            remove_unreferenced_key_files(&keys, &previous, &[path.clone()]);
             assert!(on_disk(&used), "{path}");
             assert!(!on_disk(&unused), "{path}");
         }
     }
 
     #[test]
-    fn stored_path_to_a_missing_file_does_not_keep_another_key() {
+    fn a_used_path_to_a_missing_file_or_a_folder_keeps_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let keys = dir.path().join("keys");
         std::fs::create_dir(&keys).unwrap();
         let dropped = app_key(&keys, 1);
-        let mut web = profile("w", "web", "h1");
         let gone = keys.join("gone").to_string_lossy().into_owned();
-        web.keys = vec![ProfileKey { path: gone, secret_id: None }];
-        remove_unreferenced_keys(&keys, &[dropped.clone()], &store_of(vec![web]));
+        remove_unreferenced_key_files(&keys, &[dropped.clone()], &[gone]);
         assert!(!on_disk(&dropped));
-    }
 
-    #[test]
-    fn stored_path_to_a_directory_does_not_keep_another_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let keys = dir.path().join("keys");
-        std::fs::create_dir(&keys).unwrap();
-        let dropped = app_key(&keys, 1);
-        let mut web = profile("w", "web", "h1");
+        let dropped = app_key(&keys, 2);
         let folder = dir.path().to_string_lossy().into_owned();
-        web.keys = vec![ProfileKey { path: folder, secret_id: None }];
-        remove_unreferenced_keys(&keys, &[dropped.clone()], &store_of(vec![web]));
+        remove_unreferenced_key_files(&keys, &[dropped.clone()], &[folder]);
         assert!(!on_disk(&dropped));
     }
 
     #[cfg(windows)]
     #[test]
-    fn stored_network_path_is_not_opened() {
+    fn a_used_network_path_is_not_opened() {
         let dir = tempfile::tempdir().unwrap();
         let keys = dir.path().join("keys");
         std::fs::create_dir(&keys).unwrap();
         let dropped = app_key(&keys, 1);
-        let mut web = profile("w", "web", "h1");
         // An address reserved for documentation: nothing answers there, and Windows needs about
         // 20 seconds to find that out.
         let share = "\\\\192.0.2.1\\share\\id".to_string();
-        web.keys = vec![ProfileKey { path: share, secret_id: None }];
         let started = std::time::Instant::now();
-        remove_unreferenced_keys(&keys, &[dropped.clone()], &store_of(vec![web]));
+        remove_unreferenced_key_files(&keys, &[dropped.clone()], &[share]);
         assert!(started.elapsed() < std::time::Duration::from_secs(1), "{:?}", started.elapsed());
         assert!(!on_disk(&dropped));
     }
 
     #[cfg(unix)]
     #[test]
-    fn stored_path_to_a_fifo_is_not_opened() {
+    fn a_used_path_to_a_fifo_is_not_opened() {
         let dir = tempfile::tempdir().unwrap();
         let keys = dir.path().join("keys");
         std::fs::create_dir(&keys).unwrap();
@@ -2622,28 +1476,15 @@ mod tests {
         }
         let dropped = app_key(&keys, 1);
         let previous = [dropped.clone()];
-        let mut web = profile("w", "web", "h1");
-        web.keys = vec![ProfileKey { path: fifo.to_string_lossy().into_owned(), secret_id: None }];
-        let data = store_of(vec![web]);
+        let used = [fifo.to_string_lossy().into_owned()];
         let (done, finished) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            remove_unreferenced_keys(&keys, &previous, &data);
+            remove_unreferenced_key_files(&keys, &previous, &used);
             done.send(()).unwrap();
         });
         // Opening a FIFO for reading waits for a writer that never comes.
         let waited = finished.recv_timeout(std::time::Duration::from_secs(5));
         assert!(waited.is_ok(), "blocked on the FIFO");
         assert!(!on_disk(&dropped));
-    }
-
-    #[test]
-    fn failed_commit_keeps_the_replaced_password() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut store, mut v, old, staged) = password_replacement(dir.path());
-        // A directory where the temp file should be makes the store write fail.
-        std::fs::create_dir(dir.path().join("profiles.json.tmp")).unwrap();
-        assert!(execute(&mut store, &mut v, &dir.path().join("keys"), staged).is_err());
-        assert_eq!(store.profiles()[0].secret_id.as_deref(), Some(old.as_str()));
-        assert_eq!(v.get_secret(&old).unwrap().as_slice(), b"old");
     }
 }

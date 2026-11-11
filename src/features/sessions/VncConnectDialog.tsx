@@ -9,15 +9,18 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import type { AdhocInitial } from '@/features/sessions/AdhocLoginFields'
 
 export function VncConnectDialog({
   open,
   onOpenChange,
   onConnect,
+  initial,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
   onConnect: (host: string, port: number, username: string, password: string) => void
+  initial?: AdhocInitial
 }) {
   const [host, setHost] = useState('')
   const [port, setPort] = useState('5900')
@@ -31,10 +34,10 @@ export function VncConnectDialog({
       setPassword('')
       return
     }
-    setHost('')
-    setPort('5900')
-    setUsername('')
-  }, [open])
+    setHost(initial?.host ?? '')
+    setPort(String(initial?.port ?? 5900))
+    setUsername(initial?.username ?? '')
+  }, [open, initial])
 
   const portNumber = Number(port)
   const portValid = Number.isInteger(portNumber) && portNumber >= 1 && portNumber <= 65535

@@ -1,8 +1,22 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use serde::Serialize;
+use specta::Type;
+
 use crate::error::AppResult;
 use crate::store::io;
+
+// One trusted key: an SSH host key, or a remote desktop or RD Gateway certificate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct KnownHostEntry {
+    pub key: String,
+    pub kind: String,
+    pub host: String,
+    pub port: u16,
+    pub fingerprint: String,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum HostKeyVerdict {
@@ -33,6 +47,34 @@ impl KnownHosts {
         }
     }
 
+    pub fn list(&self) -> Vec<KnownHostEntry> {
+        self.entries
+            .iter()
+            .map(|(key, fingerprint)| {
+                let (kind, address) = ["rdp", "rdg", "vnc"]
+                    .iter()
+                    .find_map(|k| key.strip_prefix(&format!("{k}/")).map(|rest| (*k, rest)))
+                    .unwrap_or(("ssh", key.as_str()));
+                // The last colon, so an IPv6 address in brackets keeps its own.
+                let (host, port) = address.rsplit_once(':').unwrap_or((address, ""));
+                KnownHostEntry {
+                    key: key.clone(),
+                    kind: kind.to_string(),
+                    host: host.to_string(),
+                    port: port.parse().unwrap_or(0),
+                    fingerprint: fingerprint.clone(),
+                }
+            })
+            .collect()
+    }
+
+    pub fn forget(&mut self, key: &str) -> AppResult<()> {
+        if self.entries.remove(key).is_some() {
+            io::write_json_atomic(&self.path, &self.entries)?;
+        }
+        Ok(())
+    }
+
     pub fn record(&mut self, host: &str, port: u16, fingerprint: &str) -> AppResult<()> {
         self.entries.insert(format!("{host}:{port}"), fingerprint.to_string());
         io::write_json_atomic(&self.path, &self.entries)?;
@@ -43,6 +85,41 @@ impl KnownHosts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn known_hosts_list_reads_every_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "nas.local:22": "SHA256:abc",
+              "rdp/win-dev.corp:3389": "SHA256:0a1b",
+              "rdg/gw.corp:443": "SHA256:ff00",
+              "vnc/[::1]:5900": "no certificate (unencrypted login)"
+            }"#,
+        )
+        .unwrap();
+        let mut kh = KnownHosts::load(path.clone()).unwrap();
+        let entry = |key: &str, kind: &str, host: &str, port: u16, fp: &str| KnownHostEntry {
+            key: key.into(),
+            kind: kind.into(),
+            host: host.into(),
+            port,
+            fingerprint: fp.into(),
+        };
+        assert_eq!(
+            kh.list(),
+            vec![
+                entry("nas.local:22", "ssh", "nas.local", 22, "SHA256:abc"),
+                entry("rdg/gw.corp:443", "rdg", "gw.corp", 443, "SHA256:ff00"),
+                entry("rdp/win-dev.corp:3389", "rdp", "win-dev.corp", 3389, "SHA256:0a1b"),
+                entry("vnc/[::1]:5900", "vnc", "[::1]", 5900, "no certificate (unencrypted login)"),
+            ]
+        );
+        kh.forget("rdp/win-dev.corp:3389").unwrap();
+        assert_eq!(KnownHosts::load(path).unwrap().list().len(), 3);
+    }
 
     #[test]
     fn unknown_then_trusted_after_record() {

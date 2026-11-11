@@ -1,4 +1,4 @@
-use std::net::Ipv6Addr;
+use std::net::{IpAddr, Ipv6Addr};
 
 // `[::1]` is the URL form of an address, not an address. Windows' getaddrinfo accepts it,
 // glibc doesn't - stripping the brackets makes the same profile work on every platform.
@@ -8,6 +8,19 @@ pub fn normalize_host(host: &str) -> String {
         .filter(|h| h.parse::<Ipv6Addr>().is_ok())
         .unwrap_or(host)
         .to_string()
+}
+
+// One spelling per host, for comparing addresses: IPs in canonical form, names lowercased
+// without a trailing dot.
+pub fn address_key(host: &str) -> String {
+    let host = normalize_host(host);
+    match host.parse::<IpAddr>() {
+        Ok(address) => address.to_string(),
+        Err(_) => {
+            let name = host.to_ascii_lowercase();
+            name.strip_suffix('.').unwrap_or(&name).to_string()
+        }
+    }
 }
 
 // For anything parsed as a SocketAddr or used as a URL authority, a bare IPv6 literal has

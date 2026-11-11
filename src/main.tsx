@@ -2,6 +2,7 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import './index.css'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
+import '@fontsource-variable/inter'
 import { applyAppTheme, cachedTheme } from '@/lib/theme'
 import App from './App'
 

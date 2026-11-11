@@ -1,8 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
-import { connectFtp, disconnectFtp } from '@/lib/ftp'
+import { ConnectError } from '@/features/sessions/ConnectError'
+import { connectFtp, connectFtpSaved, disconnectFtp } from '@/lib/ftp'
+import type { SessionStatus } from '@/stores/sessionStore'
 import { FtpPanel } from './FtpPanel'
 
 export function FtpConnectionView({
+  name,
+  connectionId = null,
   host,
   port,
   username,
@@ -11,7 +15,11 @@ export function FtpConnectionView({
   allowInvalidCert,
   ignoreHostname,
   active,
+  onStatus,
 }: {
+  name: string
+  onStatus: (status: SessionStatus) => void
+  connectionId?: string | null
   host: string
   port: number
   username: string
@@ -32,7 +40,10 @@ export function FtpConnectionView({
     idRef.current = null
     setSessionId(null)
     setError(null)
-    connectFtp(host, port, username, secretId, secure, allowInvalidCert, ignoreHostname)
+    ;(connectionId
+      ? connectFtpSaved(connectionId)
+      : connectFtp(host, port, username, secretId, secure, allowInvalidCert, ignoreHostname)
+    )
       .then((sid) => {
         if (disposed) {
           disconnectFtp(sid).catch(() => {})
@@ -50,7 +61,21 @@ export function FtpConnectionView({
       disposed = true
       if (idRef.current) disconnectFtp(idRef.current).catch(() => {})
     }
-  }, [host, port, username, secretId, secure, allowInvalidCert, ignoreHostname, nonce])
+  }, [
+    connectionId,
+    host,
+    port,
+    username,
+    secretId,
+    secure,
+    allowInvalidCert,
+    ignoreHostname,
+    nonce,
+  ])
+
+  const live = sessionId
+  const status: SessionStatus = live ? 'connected' : error ? 'error' : 'connecting'
+  useEffect(() => onStatus(status), [onStatus, status])
 
   if (sessionId)
     return (
@@ -65,16 +90,7 @@ export function FtpConnectionView({
   return (
     <div className="flex h-full flex-col items-center justify-center gap-2 text-sm">
       {error ? (
-        <>
-          <p className="max-w-xs text-center text-destructive">{error}</p>
-          <button
-            type="button"
-            onClick={() => setNonce((n) => n + 1)}
-            className="rounded border border-border px-3 py-1.5 hover:bg-muted"
-          >
-            Retry
-          </button>
-        </>
+        <ConnectError name={name} reason={error} onRetry={() => setNonce((n) => n + 1)} />
       ) : (
         <p className="text-muted-foreground">Connecting…</p>
       )}

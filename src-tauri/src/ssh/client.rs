@@ -216,7 +216,7 @@ fn ppk_to_key(contents: &str, passphrase: Option<&str>) -> AppResult<PrivateKey>
         .find_map(|l| l.strip_prefix("Encryption:"))
         .is_some_and(|v| v.trim() != "none");
     if encrypted && passphrase.is_none() {
-        return Err(AppError::PassphraseRequired);
+        return Err(AppError::PassphraseRequired(String::new()));
     }
     PrivateKey::from_ppk(contents, passphrase.map(String::from)).map_err(|e| {
         if encrypted {
@@ -244,7 +244,10 @@ pub async fn auth_key(
     passphrase: Option<&str>,
 ) -> AppResult<()> {
     let contents = std::fs::read_to_string(key_path)?;
-    let key = parse_key(&contents, passphrase)?;
+    let key = parse_key(&contents, passphrase).map_err(|e| match e {
+        AppError::PassphraseRequired(_) => AppError::PassphraseRequired(key_path.to_string()),
+        e => e,
+    })?;
     // RSA must negotiate rsa-sha2 (SHA-512); ed25519/ecdsa ignore the hash alg.
     let hash_alg = if matches!(key.algorithm(), Algorithm::Rsa { .. }) {
         Some(HashAlg::Sha512)
@@ -432,7 +435,7 @@ mod tests {
     fn ppk_encrypted_without_passphrase_is_passphrase_required() {
         assert!(matches!(
             super::ppk_to_key(ED25519_ENC_PPK, None),
-            Err(AppError::PassphraseRequired)
+            Err(AppError::PassphraseRequired(_))
         ));
     }
 

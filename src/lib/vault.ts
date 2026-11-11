@@ -13,6 +13,14 @@ export async function vaultChangePassword(password: string): Promise<void> {
   unwrap(await commands.vaultChangePassword(password))
 }
 
+export async function vaultCanSkipPassword(): Promise<boolean> {
+  return unwrap(await commands.vaultCanSkipPassword())
+}
+
+export async function vaultSkipPassword(): Promise<void> {
+  unwrap(await commands.vaultSkipPassword())
+}
+
 // Ad-hoc connections (FTP, VNC, manual SFTP) park their password here so the tab holds a
 // reference instead of the plaintext, which also makes those tabs safe to persist.
 export async function setSecret(value: string): Promise<string> {

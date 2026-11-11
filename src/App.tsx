@@ -1,170 +1,188 @@
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import { message } from '@tauri-apps/plugin-dialog'
-import { Settings } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import {
-  events,
-  type RdpProfile,
-  type S3Profile,
-  type SftpProfile,
-  type ShellInfo,
-  type VncProfile,
-} from '@/bindings'
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu'
+import { commands, events } from '@/bindings'
+import { ConfirmDialog } from '@/components/ConfirmDialog'
+import { Notices } from '@/components/Notices'
+import { useConnectOnce } from '@/features/connections/connectOnce'
 import { FtpConnectDialog } from '@/features/ftp/FtpConnectDialog'
-import { FtpConnectionView } from '@/features/ftp/FtpConnectionView'
+import { HostsTab } from '@/features/hosts/HostsTab'
+import { openConnection } from '@/features/hosts/openConnection'
 import { CommandPalette } from '@/features/palette/CommandPalette'
-import { ProfileTree } from '@/features/profiles/ProfileTree'
 import { RdpConnectDialog } from '@/features/remote/RdpConnectDialog'
-import { RdpProfileDialog } from '@/features/remote/RdpProfileDialog'
 import { RemoteDesktopView } from '@/features/remote/RemoteDesktopView'
-import { VncProfileDialog } from '@/features/remote/VncProfileDialog'
-import { S3ConnectionView } from '@/features/s3/S3ConnectionView'
-import { S3ProfileDialog } from '@/features/s3/S3ProfileDialog'
-import { LocalTerminalView } from '@/features/sessions/LocalTerminalView'
+import { toAdhocParams } from '@/features/sessions/AdhocLoginFields'
+import { PaneLayer } from '@/features/sessions/PaneLayer'
 import { PanesView } from '@/features/sessions/PanesView'
-import { SftpConnectionView } from '@/features/sessions/SftpConnectionView'
+import { SessionHostList } from '@/features/sessions/SessionHostList'
+import { SshConnectDialog } from '@/features/sessions/SshConnectDialog'
 import { TabBar } from '@/features/sessions/TabBar'
-import { ViewHost } from '@/features/sessions/ViewHost'
+import {
+  hostsAskingToClose,
+  requestClosePane,
+  requestCloseTab,
+  tabRules,
+} from '@/features/sessions/tabHosts'
 import { VncConnectDialog } from '@/features/sessions/VncConnectDialog'
 import { SftpConnectDialog } from '@/features/sftp/SftpConnectDialog'
-import { SftpProfileDialog } from '@/features/sftp/SftpProfileDialog'
 import { AppShell } from '@/features/shell/AppShell'
-import { UpdateBanner } from '@/features/updater/UpdateBanner'
+import { importFromFile } from '@/features/transfer/importFromFile'
+import { tunnelNotice } from '@/features/tunnels/run'
+import { useTunnelStarter } from '@/features/tunnels/useTunnelStarter'
+import { startUpdateCheck } from '@/features/updater/updateNotice'
 import { VaultGate } from '@/features/vault/VaultGate'
-import { WelcomePage } from '@/features/welcome/WelcomePage'
+import { THIS_COMPUTER } from '@/lib/hosts'
 import { useHotkeys } from '@/lib/hotkeys'
-import { clearEditTemp, listShells } from '@/lib/local'
+import { unwrap } from '@/lib/ipc'
+import { clearEditTemp } from '@/lib/local'
+import { customTitleBar } from '@/lib/platform'
 import { rdpDriver } from '@/lib/rdp'
-import { clearSnapshot, loadSnapshot, saveSnapshot } from '@/lib/sessionPersist'
+import { clearSnapshot, dropMissing, loadSnapshot, saveSnapshot } from '@/lib/sessionPersist'
+import { tagColor } from '@/lib/tagColors'
 import { watchSystemTheme } from '@/lib/theme'
-import { pickImportPath } from '@/lib/transfer'
 import { cn } from '@/lib/utils'
 import { setSecret } from '@/lib/vault'
 import { vncDriver } from '@/lib/vnc'
-import { useProfileStore } from '@/stores/profileStore'
-import { useRdpProfileStore } from '@/stores/rdpProfileStore'
-import { useS3ProfileStore } from '@/stores/s3ProfileStore'
-import {
-  type FtpTab,
-  type LocalTab,
-  type RdpTab,
-  type S3Tab,
-  type SessionTab,
-  type SftpTab,
-  useSessionStore,
-  type ViewTab,
-  type VncTab,
-} from '@/stores/sessionStore'
+import { confirm } from '@/stores/confirmStore'
+import { useHostStore } from '@/stores/hostStore'
+import { useHostsUiStore } from '@/stores/hostsUiStore'
+import { notify } from '@/stores/noticeStore'
+import { type PanesTab, type RdpTab, useSessionStore, type VncTab } from '@/stores/sessionStore'
 import { useSettingsStore } from '@/stores/settingsStore'
-import { useSftpProfileStore } from '@/stores/sftpProfileStore'
-import { useTunnelStore } from '@/stores/tunnelStore'
-import { useVncProfileStore } from '@/stores/vncProfileStore'
+import { applyAppearance, useThemeStore } from '@/stores/themeStore'
+import { type TunnelState, useTunnelStore } from '@/stores/tunnelStore'
 
+const count = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`
+
+// The pinned Hosts tab (null) comes first.
 function cycleTab(delta: number) {
   const st = useSessionStore.getState()
-  if (st.tabs.length === 0) return
-  const i = st.tabs.findIndex((t) => t.id === st.activeTabId)
-  const next = st.tabs[(i + delta + st.tabs.length) % st.tabs.length]
-  if (next) st.setActiveTab(next.id)
+  const ids = [null, ...st.tabs.map((t) => t.id)]
+  const i = ids.indexOf(st.activeTabId)
+  st.setActiveTab(ids[(i + delta + ids.length) % ids.length])
+}
+
+function moveActiveTab(delta: number) {
+  const st = useSessionStore.getState()
+  if (st.activeTabId) st.moveTab(st.activeTabId, delta)
 }
 
 function splitActivePane(direction: 'horizontal' | 'vertical') {
   const st = useSessionStore.getState()
   const t = st.tabs.find((tab) => tab.id === st.activeTabId)
-  if (t?.kind === 'session') st.splitPane(t.id, t.activePaneId, direction)
+  if (t?.kind === 'panes') st.splitPane(t.id, t.activePaneId, direction)
 }
 
 function nudgeZoom(delta: number, reset = false) {
   const st = useSessionStore.getState()
   const t = st.tabs.find((tab) => tab.id === st.activeTabId)
-  if (t?.kind === 'local') {
-    st.setLocalZoom(t.id, reset ? 0 : (t.zoom ?? 0) + delta)
-    return
-  }
-  if (t?.kind !== 'session') return
-  const cur = st.sessions[t.activePaneId]?.zoom ?? 0
-  st.setZoom(t.activePaneId, reset ? 0 : cur + delta)
+  if (t?.kind !== 'panes') return
+  const pane = st.panes[t.activePaneId]
+  if (pane?.kind !== 'ssh' && pane?.kind !== 'local') return
+  st.setZoom(pane.id, reset ? 0 : (pane.zoom ?? 0) + delta)
 }
 
+// The view reconnects whenever it is given another driver object. A saved connection is
+// resolved by the backend from its id, so the target fields are only for connect once.
 function VncTabView({ tab, active }: { tab: VncTab; active: boolean }) {
-  const { host, port, username, secretId, profileId } = tab
-  // The view reconnects whenever it is given another driver object.
+  const { connectionId, once } = tab
   const driver = useMemo(
-    () => vncDriver({ host, port, username, secretId, profileId }),
-    [host, port, username, secretId, profileId],
+    () =>
+      vncDriver({
+        host: once?.host ?? '',
+        port: once?.port ?? 0,
+        username: once?.username ?? null,
+        secretId: once?.secretId ?? null,
+        profileId: connectionId,
+      }),
+    [connectionId, once],
   )
   return <RemoteDesktopView tabId={tab.id} driver={driver} active={active} />
 }
 
 function RdpTabView({ tab, active }: { tab: RdpTab; active: boolean }) {
-  const { host, port, username, domain, secretId, profileId, keyboardLayout } = tab
-  // The view reconnects whenever it is given another driver object.
+  const { connectionId, once } = tab
   const driver = useMemo(
-    () => rdpDriver({ host, port, username, domain, secretId, profileId, keyboardLayout }),
-    [host, port, username, domain, secretId, profileId, keyboardLayout],
+    () =>
+      rdpDriver({
+        host: once?.host ?? '',
+        port: once?.port ?? 0,
+        username: once?.username ?? '',
+        domain: once?.domain ?? null,
+        secretId: once?.secretId ?? null,
+        profileId: connectionId,
+        keyboardLayout: once?.keyboardLayout ?? null,
+      }),
+    [connectionId, once],
   )
   return <RemoteDesktopView tabId={tab.id} driver={driver} active={active} />
 }
 
 export default function App() {
-  const load = useProfileStore((s) => s.load)
+  const loadHosts = useHostStore((s) => s.load)
+  const loadShells = useHostStore((s) => s.loadShells)
   const tabs = useSessionStore((s) => s.tabs)
+  const panes = useSessionStore((s) => s.panes)
+  const hostsList = useHostStore((s) => s.hosts)
+  const tagList = useHostStore((s) => s.tags)
+  const hostListRight = useSettingsStore((s) => s.settings.hostListSide === 'right')
   const activeTabId = useSessionStore((s) => s.activeTabId)
-  const openTab = useSessionStore((s) => s.openTab)
-  const openView = useSessionStore((s) => s.openView)
+  const openPage = useHostsUiStore((s) => s.openPage)
   const openLocalShell = useSessionStore((s) => s.openLocalShell)
   const openVnc = useSessionStore((s) => s.openVnc)
   const openRdp = useSessionStore((s) => s.openRdp)
   const openSftp = useSessionStore((s) => s.openSftp)
   const openSftpAdhoc = useSessionStore((s) => s.openSftpAdhoc)
-  const openSftpProfile = useSessionStore((s) => s.openSftpProfile)
+  const openSshAdhoc = useSessionStore((s) => s.openSshAdhoc)
   const openFtp = useSessionStore((s) => s.openFtp)
-  const openS3 = useSessionStore((s) => s.openS3)
   const loadSettings = useSettingsStore((s) => s.load)
-  const loadS3 = useS3ProfileStore((s) => s.load)
-  const loadSftpProfiles = useSftpProfileStore((s) => s.load)
-  const loadVncProfiles = useVncProfileStore((s) => s.load)
-  const loadRdpProfiles = useRdpProfileStore((s) => s.load)
-  const themeValue = useSettingsStore((s) => s.settings.theme)
   const settingsHotkeys = useSettingsStore((s) => s.settings.hotkeys ?? {})
   const [vncDialogOpen, setVncDialogOpen] = useState(false)
   const [rdpDialogOpen, setRdpDialogOpen] = useState(false)
   const [ftpDialogOpen, setFtpDialogOpen] = useState(false)
   const [sftpDialogOpen, setSftpDialogOpen] = useState(false)
-  const [s3DialogOpen, setS3DialogOpen] = useState(false)
-  const [s3Editing, setS3Editing] = useState<S3Profile | null>(null)
-  const [sftpProfileDialogOpen, setSftpProfileDialogOpen] = useState(false)
-  const [sftpEditing, setSftpEditing] = useState<SftpProfile | null>(null)
-  const [vncProfileDialogOpen, setVncProfileDialogOpen] = useState(false)
-  const [vncEditing, setVncEditing] = useState<VncProfile | null>(null)
-  const [rdpProfileDialogOpen, setRdpProfileDialogOpen] = useState(false)
-  const [rdpEditing, setRdpEditing] = useState<RdpProfile | null>(null)
-  const [shells, setShells] = useState<ShellInfo[]>([])
+  const [sshDialogOpen, setSshDialogOpen] = useState(false)
+  const once = useConnectOnce((s) => s.request)
+  const clearOnce = useConnectOnce((s) => s.clear)
+  const onceInitial = useMemo(
+    () =>
+      once && {
+        host: once.host,
+        port: once.port ?? undefined,
+        username: once.user ?? undefined,
+        secure: once.type === 'ftps',
+      },
+    [once],
+  )
+  const onceFor = (...types: string[]) =>
+    once && types.includes(once.type) ? (onceInitial ?? undefined) : undefined
+  const closing = (set: (open: boolean) => void) => (open: boolean) => {
+    set(open)
+    if (!open) clearOnce()
+  }
   const [paletteOpen, setPaletteOpen] = useState(false)
+  const tunnelStarter = useTunnelStarter()
   const [vaultReady, setVaultReady] = useState(false)
   const settingsLoaded = useSettingsStore((s) => s.loaded)
+  const hostsLoaded = useHostStore((s) => s.loaded)
   const restoreEnabled = useSettingsStore((s) => s.settings.restoreSession ?? true)
   const restoredRef = useRef(false)
   const restoreEnabledRef = useRef(restoreEnabled)
   restoreEnabledRef.current = restoreEnabled
 
-  // Restoring waits on both the vault (secrets) and settings (the toggle still reads as its
-  // default until they load), and persistence only starts afterwards so an empty startup
-  // state can't overwrite the saved snapshot.
+  // Restoring waits on the vault (secrets), settings (the toggle still reads as its default
+  // until they load) and hosts (to drop tabs of deleted connections), and persistence only
+  // starts afterwards so an empty startup state can't overwrite the saved snapshot.
   useEffect(() => {
-    if (!vaultReady || !settingsLoaded || restoredRef.current) return
+    if (!vaultReady || !settingsLoaded || !hostsLoaded || restoredRef.current) return
     restoredRef.current = true
     if (restoreEnabledRef.current) {
       const snap = loadSnapshot()
       // Anything opened while the vault was resolving must survive.
       if (snap && useSessionStore.getState().tabs.length === 0) {
-        useSessionStore.getState().restoreTabs(snap)
+        const ids = new Set(
+          useHostStore.getState().hosts.flatMap((h) => h.connections.map((c) => c.id)),
+        )
+        useSessionStore.getState().restoreTabs(dropMissing(snap, ids))
       }
     } else {
       clearSnapshot()
@@ -172,25 +190,57 @@ export default function App() {
     return useSessionStore.subscribe((s) => {
       if (restoreEnabledRef.current) saveSnapshot(s)
     })
-  }, [vaultReady, settingsLoaded])
+  }, [vaultReady, settingsLoaded, hostsLoaded])
+
+  // The backend hands the report out once; StrictMode's second run gets null and leaves it.
+  useEffect(() => {
+    if (!vaultReady) return
+    commands
+      .takeMigrationReport()
+      .then((res) => {
+        const report = unwrap(res)
+        if (!report) return
+        notify({
+          title: `${count(report.profiles, 'profile')} became ${count(report.hosts, 'host')}`,
+          body: "Profiles with the same address were joined into one host. Your old profiles file is kept next to the new one.\nSomething joined that shouldn't be? Use Move to another host on that connection.",
+          sticky: true,
+          actions: [{ label: 'OK', run: () => {} }],
+        })
+      })
+      .catch(console.error)
+  }, [vaultReady])
+
+  useEffect(() => {
+    startUpdateCheck().catch(console.error)
+  }, [])
 
   useHotkeys(
     {
       palette: () => setPaletteOpen((v) => !v),
-      localShell: () => openLocalShell(),
-      settings: () => openView({ kind: 'settings' }, 'Settings'),
+      paletteShort: () => setPaletteOpen((v) => !v),
+      newConnection: () => useHostsUiStore.getState().openNewConnection(),
+      toggleHostList: () => useHostsUiStore.getState().toggleHostList(),
+      localShell: () => {
+        const pc = useHostStore.getState().hosts.find((h) => h.id === THIS_COMPUTER)
+        const first = pc?.connections[0]
+        if (pc && first) openConnection(pc, first)
+        else openLocalShell()
+      },
+      settings: () => openPage('settings'),
       closeTab: () => {
         const st = useSessionStore.getState()
-        if (st.activeTabId) st.removeTab(st.activeTabId)
+        if (st.activeTabId) void requestCloseTab(st.activeTabId)
       },
       nextTab: () => cycleTab(1),
       prevTab: () => cycleTab(-1),
+      moveTabLeft: () => moveActiveTab(-1),
+      moveTabRight: () => moveActiveTab(1),
       splitRight: () => splitActivePane('horizontal'),
       splitDown: () => splitActivePane('vertical'),
       closePane: () => {
         const st = useSessionStore.getState()
         const t = st.tabs.find((tab) => tab.id === st.activeTabId)
-        if (t?.kind === 'session') st.closePane(t.id, t.activePaneId)
+        if (t?.kind === 'panes') void requestClosePane(t.id, t.activePaneId)
       },
       zoomIn: () => nudgeZoom(1),
       zoomOut: () => nudgeZoom(-1),
@@ -198,15 +248,16 @@ export default function App() {
       broadcast: () => {
         const st = useSessionStore.getState()
         const t = st.tabs.find((tab) => tab.id === st.activeTabId)
-        if (t?.kind === 'session') st.toggleBroadcast(t.id)
+        if (t?.kind === 'panes') st.toggleBroadcast(t.id)
       },
     },
     settingsHotkeys,
   )
 
   useEffect(() => {
-    load().catch(console.error)
-  }, [load])
+    loadHosts().catch(console.error)
+    loadShells().catch(console.error)
+  }, [loadHosts, loadShells])
   useEffect(() => {
     try {
       getCurrentWindow()
@@ -217,393 +268,217 @@ export default function App() {
     }
   }, [])
   useEffect(() => {
-    listShells().then(setShells).catch(console.error)
-  }, [])
-  useEffect(() => {
     clearEditTemp().catch(console.error)
+  }, [])
+  // Closing the window stops every tab, so a tag that asks before closing asks here too.
+  useEffect(() => {
+    let allowed = false
+    let un: Promise<() => void> | null = null
+    try {
+      un = getCurrentWindow().onCloseRequested(async (event) => {
+        if (allowed) return
+        const names = hostsAskingToClose()
+        if (!names) return
+        event.preventDefault()
+        const ok = await confirm({
+          title: 'Close Wisp?',
+          body: `Tabs of ${names} are tagged to ask first. Anything still running in them stops.`,
+          confirmLabel: 'Close Wisp',
+          destructive: true,
+        })
+        if (!ok) return
+        allowed = true
+        await getCurrentWindow().close()
+      })
+    } catch {
+      // not running inside a Tauri window (tests / web preview)
+    }
+    return () => {
+      un?.then((f) => f())
+    }
   }, [])
   useEffect(() => {
     loadSettings().catch(console.error)
   }, [loadSettings])
   useEffect(() => {
-    loadS3().catch(console.error)
-  }, [loadS3])
+    // Following the system, a switch to dark picks the dark theme; themes can change too.
+    const reapply = () => applyAppearance(useSettingsStore.getState().settings)
+    const unwatch = watchSystemTheme(reapply)
+    const unsubscribe = useThemeStore.subscribe(reapply)
+    useThemeStore.getState().load().catch(console.error)
+    return () => {
+      unwatch()
+      unsubscribe()
+    }
+  }, [])
   useEffect(() => {
-    loadSftpProfiles().catch(console.error)
-  }, [loadSftpProfiles])
-  useEffect(() => {
-    loadVncProfiles().catch(console.error)
-  }, [loadVncProfiles])
-  useEffect(() => {
-    loadRdpProfiles().catch(console.error)
-  }, [loadRdpProfiles])
-  useEffect(() => {
-    return watchSystemTheme(() =>
-      themeValue === 'light' || themeValue === 'dark' ? themeValue : 'system',
-    )
-  }, [themeValue])
-  useEffect(() => {
-    const un = events.tunnelStatus.listen((e) =>
-      useTunnelStore.getState().setStatus({
-        ...e.payload,
-        state: e.payload.state as import('@/stores/tunnelStore').TunnelState,
-      }),
-    )
+    const un = events.tunnelStatus.listen((e) => {
+      const { tunnelId, state, message } = e.payload
+      useTunnelStore.getState().setStatus({ ...e.payload, state: state as TunnelState })
+      // A stop the user asked for carries no reason; one the connection caused does.
+      if (state !== 'stopped' || !message) return
+      const tunnel = useHostStore
+        .getState()
+        .hosts.flatMap((h) => h.connections)
+        .flatMap((c) => (c.kind.type === 'ssh' ? (c.kind.tunnels ?? []) : []))
+        .find((t) => t.id === tunnelId)
+      if (tunnel) tunnelNotice(tunnel, message)
+    })
+    // A background connection has no pane to clear up after it.
+    const unSsh = events.sshStatus.listen((e) => {
+      if (e.payload.state === 'disconnected') {
+        useTunnelStore.getState().clearSession(e.payload.sessionId)
+      }
+    })
     return () => {
       un.then((f) => f())
+      unSsh.then((f) => f())
     }
   }, [])
 
-  const importFromFile = async () => {
-    const path = await pickImportPath()
-    if (path) openView({ kind: 'transfer-import', path }, 'Import profiles')
-  }
-  const exportToFile = () => openView({ kind: 'transfer-export' }, 'Export profiles')
+  const exportToFile = () => openPage('export')
 
   const activeTab = tabs.find((t) => t.id === activeTabId)
-  const sessionTabs = tabs.filter((t): t is SessionTab => t.kind === 'session')
-  const localTabs = tabs.filter((t): t is LocalTab => t.kind === 'local')
-  const vncTabs = tabs.filter((t): t is VncTab => t.kind === 'vnc')
-  const rdpTabs = tabs.filter((t): t is RdpTab => t.kind === 'rdp')
-  const sftpTabs = tabs.filter((t): t is SftpTab => t.kind === 'sftp')
-  const ftpTabs = tabs.filter((t): t is FtpTab => t.kind === 'ftp')
-  const s3Tabs = tabs.filter((t): t is S3Tab => t.kind === 's3')
-  // Kept mounted while inactive so a tab switch doesn't throw away a review in progress.
-  const transferTabs = tabs.filter(
-    (t): t is ViewTab =>
-      t.kind === 'view' && (t.view.kind === 'transfer-export' || t.view.kind === 'transfer-import'),
-  )
-  const activeViewTab =
-    activeTab && activeTab.kind === 'view' && !transferTabs.includes(activeTab) ? activeTab : null
-
+  // The window wears the colour of what the active tab shows.
+  const frame = activeTab && tagColor(tabRules(activeTab, panes, hostsList, tagList).color)?.ring
+  // In a fixed order: reordering tabs would move a view's element, and a moved element loses
+  // keyboard focus.
+  const placed = [...tabs].sort((a, b) => a.id.localeCompare(b.id))
+  const panesTabs = placed.filter((t): t is PanesTab => t.kind === 'panes')
+  const vncTabs = placed.filter((t): t is VncTab => t.kind === 'vnc')
+  const rdpTabs = placed.filter((t): t is RdpTab => t.kind === 'rdp')
   return (
     <>
       <VaultGate onReady={() => setVaultReady(true)} />
-      <UpdateBanner />
-      <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} />
+      <Notices />
+      <ConfirmDialog />
+      {tunnelStarter.dialog}
+      <CommandPalette
+        open={paletteOpen}
+        onOpenChange={setPaletteOpen}
+        onStartTunnel={tunnelStarter.start}
+        actions={[
+          { id: 'ssh-once', label: 'Connect to SSH once…', run: () => setSshDialogOpen(true) },
+          { id: 'sftp-once', label: 'Connect to SFTP once…', run: () => setSftpDialogOpen(true) },
+          {
+            id: 'ftp-once',
+            label: 'Connect to FTP or FTPS once…',
+            run: () => setFtpDialogOpen(true),
+          },
+          { id: 'vnc-once', label: 'Connect to VNC once…', run: () => setVncDialogOpen(true) },
+          { id: 'rdp-once', label: 'Connect to RDP once…', run: () => setRdpDialogOpen(true) },
+          {
+            id: 'ssh-import',
+            label: 'Import from ~/.ssh/config',
+            run: () => openPage('sshImport'),
+          },
+          { id: 'import', label: 'Import a Wisp export…', run: () => void importFromFile() },
+          { id: 'export', label: 'Export hosts…', run: exportToFile },
+        ]}
+      />
       <VncConnectDialog
-        open={vncDialogOpen}
-        onOpenChange={setVncDialogOpen}
+        open={vncDialogOpen || once?.type === 'vnc'}
+        onOpenChange={closing(setVncDialogOpen)}
+        initial={onceFor('vnc')}
         onConnect={async (host, port, username, password) => {
           let secretId: string | null = null
           if (password) {
             try {
               secretId = await setSecret(password)
             } catch (e) {
-              await message(String(e), { title: 'Could not store the password', kind: 'error' })
+              notify({ title: 'Could not store the password', body: String(e), tone: 'error' })
               return
             }
           }
-          openVnc({ host, port, username: username.trim() || null, secretId, profileId: null })
+          openVnc({ once: { host, port, username: username.trim() || null, secretId } })
         }}
       />
       <RdpConnectDialog
-        open={rdpDialogOpen}
-        onOpenChange={setRdpDialogOpen}
+        open={rdpDialogOpen || once?.type === 'rdp'}
+        onOpenChange={closing(setRdpDialogOpen)}
+        initial={onceFor('rdp')}
         onConnect={async (host, port, username, domain, password) => {
           let secretId: string | null = null
           if (password) {
             try {
               secretId = await setSecret(password)
             } catch (e) {
-              await message(String(e), { title: 'Could not store the password', kind: 'error' })
+              notify({ title: 'Could not store the password', body: String(e), tone: 'error' })
               return
             }
           }
-          openRdp({
-            host,
-            port,
-            username,
-            domain,
-            secretId,
-            profileId: null,
-            keyboardLayout: null,
-          })
+          openRdp({ once: { host, port, username, domain, secretId, keyboardLayout: null } })
         }}
       />
       <FtpConnectDialog
-        open={ftpDialogOpen}
-        onOpenChange={setFtpDialogOpen}
+        open={ftpDialogOpen || once?.type === 'ftp' || once?.type === 'ftps'}
+        onOpenChange={closing(setFtpDialogOpen)}
+        initial={onceFor('ftp', 'ftps')}
         onConnect={async ({ password, ...rest }) =>
           openFtp({ ...rest, secretId: password ? await setSecret(password) : null })
         }
       />
       <SftpConnectDialog
-        open={sftpDialogOpen}
-        onOpenChange={setSftpDialogOpen}
+        open={sftpDialogOpen || once?.type === 'sftp'}
+        onOpenChange={closing(setSftpDialogOpen)}
+        initial={onceFor('sftp')}
         onPick={openSftp}
-        onConnect={async ({ secret, keyPath, authMethod, ...rest }) => {
-          const secretId = secret ? await setSecret(secret) : null
-          openSftpAdhoc({
-            ...rest,
-            authMethod,
-            // Quick connect takes one key; its passphrase is the same secret.
-            keys: authMethod === 'key' && keyPath ? [{ path: keyPath, secretId }] : [],
-            secretId: authMethod === 'key' ? null : secretId,
-          })
+        onConnect={async (form) => openSftpAdhoc(await toAdhocParams(form))}
+      />
+      <SshConnectDialog
+        open={sshDialogOpen || once?.type === 'ssh'}
+        onOpenChange={closing(setSshDialogOpen)}
+        initial={onceFor('ssh')}
+        onConnect={async (form) => {
+          try {
+            openSshAdhoc(await toAdhocParams(form))
+          } catch (e) {
+            notify({ title: 'Could not store the password', body: String(e), tone: 'error' })
+          }
         }}
       />
-      <S3ProfileDialog open={s3DialogOpen} onOpenChange={setS3DialogOpen} editing={s3Editing} />
-      <SftpProfileDialog
-        open={sftpProfileDialogOpen}
-        onOpenChange={setSftpProfileDialogOpen}
-        editing={sftpEditing}
-      />
-      <VncProfileDialog
-        open={vncProfileDialogOpen}
-        onOpenChange={setVncProfileDialogOpen}
-        editing={vncEditing}
-      />
-      <RdpProfileDialog
-        open={rdpProfileDialogOpen}
-        onOpenChange={setRdpProfileDialogOpen}
-        editing={rdpEditing}
-      />
       <AppShell
-        sidebar={
-          <div className="flex h-full flex-col">
-            <div className="flex justify-end gap-1 border-border border-b p-1">
-              <button
-                type="button"
-                aria-label="Home"
-                onClick={() => {
-                  // With no active tab the welcome screen is already shown as the empty
-                  // state, so don't open a redundant Welcome tab.
-                  if (activeTab) openView({ kind: 'welcome' }, 'Welcome')
-                }}
-                className="rounded px-2 py-1 text-xs hover:bg-muted"
-              >
-                Home
-              </button>
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <button
-                    type="button"
-                    aria-label="Import"
-                    className="rounded px-2 py-1 text-xs hover:bg-muted"
-                  >
-                    Import
-                  </button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end">
-                  <DropdownMenuItem onSelect={() => openView({ kind: 'import' }, 'Import')}>
-                    From SSH config
-                  </DropdownMenuItem>
-                  <DropdownMenuItem onSelect={importFromFile}>From file (JSON)</DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
-              <button
-                type="button"
-                aria-label="Export profiles"
-                className="rounded px-2 py-1 text-xs hover:bg-muted"
-                onClick={exportToFile}
-              >
-                Export
-              </button>
-              <button
-                type="button"
-                aria-label="Settings"
-                onClick={() => openView({ kind: 'settings' }, 'Settings')}
-                className="rounded p-1.5 hover:bg-muted"
-              >
-                <Settings className="size-4" />
-              </button>
-            </div>
-            <div className="min-h-0 flex-1">
-              <ProfileTree
-                onActivateProfile={(p) =>
-                  openTab({
-                    id: crypto.randomUUID(),
-                    profileId: p.id,
-                    title: p.name,
-                    status: 'connecting',
-                    reconnectNonce: 0,
-                  })
-                }
-                onNewProfile={() =>
-                  openView({ kind: 'profile-editor', profileId: null }, 'New profile')
-                }
-                onNewVnc={() => setVncDialogOpen(true)}
-                onNewRdp={() => setRdpDialogOpen(true)}
-                onNewVncProfile={() => {
-                  setVncEditing(null)
-                  setVncProfileDialogOpen(true)
-                }}
-                onActivateVnc={(p) =>
-                  openVnc({
-                    host: p.host,
-                    port: p.port,
-                    username: p.username,
-                    secretId: null,
-                    profileId: p.id,
-                    title: p.name,
-                  })
-                }
-                onEditVnc={(p) => {
-                  setVncEditing(p)
-                  setVncProfileDialogOpen(true)
-                }}
-                onNewRdpProfile={() => {
-                  setRdpEditing(null)
-                  setRdpProfileDialogOpen(true)
-                }}
-                onActivateRdp={(p) =>
-                  openRdp({
-                    host: p.host,
-                    port: p.port,
-                    username: p.username,
-                    domain: p.domain,
-                    secretId: null,
-                    profileId: p.id,
-                    keyboardLayout: p.keyboardLayout,
-                    title: p.name,
-                  })
-                }
-                onEditRdp={(p) => {
-                  setRdpEditing(p)
-                  setRdpProfileDialogOpen(true)
-                }}
-                onNewFtp={() => setFtpDialogOpen(true)}
-                onNewS3={() => {
-                  setS3Editing(null)
-                  setS3DialogOpen(true)
-                }}
-                onActivateS3={(p) => openS3(p.id, p.bucket, p.name)}
-                onNewSftpProfile={() => {
-                  setSftpEditing(null)
-                  setSftpProfileDialogOpen(true)
-                }}
-                onActivateSftpProfile={(p) => openSftpProfile(p.id, p.name)}
-                onEditSftpProfile={(p) => {
-                  setSftpEditing(p)
-                  setSftpProfileDialogOpen(true)
-                }}
-                onEditS3={(p) => {
-                  setS3Editing(p)
-                  setS3DialogOpen(true)
-                }}
-                onNewLocalShell={(program, title) => openLocalShell(program, title)}
-                onNewSftp={(profileId, title) => openSftp(profileId, title)}
-                onOpenSftpPicker={() => setSftpDialogOpen(true)}
-                shells={shells}
-                onEditProfile={(profile) =>
-                  openView(
-                    { kind: 'profile-editor', profileId: profile.id },
-                    `Edit ${profile.name}`,
-                  )
-                }
-                onNewGroup={() => openView({ kind: 'group-editor', groupId: null }, 'New group')}
-                onEditGroup={(group) =>
-                  openView({ kind: 'group-editor', groupId: group.id }, `Edit ${group.name}`)
-                }
-              />
-            </div>
-          </div>
-        }
         main={
-          <div className="flex h-full flex-col">
-            <TabBar />
-            <div className="relative min-h-0 flex-1">
-              {sessionTabs.map((t) => (
+          <div className={cn('flex h-full flex-col', frame && cn('ring-2 ring-inset', frame))}>
+            <TabBar titleBar={customTitleBar} onPalette={() => setPaletteOpen(true)} />
+            <div className={cn('flex min-h-0 flex-1', hostListRight && 'flex-row-reverse')}>
+              {activeTabId !== null && <SessionHostList />}
+              <div className="relative min-w-0 flex-1">
                 <div
-                  key={t.id}
-                  data-testid={`tabpane-${t.id}`}
-                  className={cn('absolute inset-0', t.id !== activeTabId && 'hidden')}
+                  data-testid="tabpane-hosts"
+                  className={cn('absolute inset-0', activeTabId !== null && 'hidden')}
                 >
-                  <PanesView tab={t} />
+                  <HostsTab />
                 </div>
-              ))}
-              {localTabs.map((t) => (
-                <div
-                  key={t.id}
-                  data-testid={`tabpane-${t.id}`}
-                  className={cn('absolute inset-0', t.id !== activeTabId && 'hidden')}
-                >
-                  <LocalTerminalView tabId={t.id} program={t.program} />
-                </div>
-              ))}
-              {vncTabs.map((t) => (
-                <div
-                  key={t.id}
-                  data-testid={`tabpane-${t.id}`}
-                  className={cn('absolute inset-0', t.id !== activeTabId && 'hidden')}
-                >
-                  <VncTabView tab={t} active={t.id === activeTabId} />
-                </div>
-              ))}
-              {rdpTabs.map((t) => (
-                <div
-                  key={t.id}
-                  data-testid={`tabpane-${t.id}`}
-                  className={cn('absolute inset-0', t.id !== activeTabId && 'hidden')}
-                >
-                  <RdpTabView tab={t} active={t.id === activeTabId} />
-                </div>
-              ))}
-              {sftpTabs.map((t) => (
-                <div
-                  key={t.id}
-                  data-testid={`tabpane-${t.id}`}
-                  className={cn('absolute inset-0', t.id !== activeTabId && 'hidden')}
-                >
-                  <SftpConnectionView
-                    profileId={t.profileId}
-                    sftpProfileId={t.sftpProfileId}
-                    adhoc={t.adhoc}
-                    active={t.id === activeTabId}
-                  />
-                </div>
-              ))}
-              {ftpTabs.map((t) => (
-                <div
-                  key={t.id}
-                  data-testid={`tabpane-${t.id}`}
-                  className={cn('absolute inset-0', t.id !== activeTabId && 'hidden')}
-                >
-                  <FtpConnectionView
-                    host={t.host}
-                    port={t.port}
-                    username={t.username}
-                    secretId={t.secretId}
-                    secure={t.secure}
-                    allowInvalidCert={t.allowInvalidCert}
-                    ignoreHostname={t.ignoreHostname}
-                    active={t.id === activeTabId}
-                  />
-                </div>
-              ))}
-              {s3Tabs.map((t) => (
-                <div
-                  key={t.id}
-                  data-testid={`tabpane-${t.id}`}
-                  className={cn('absolute inset-0', t.id !== activeTabId && 'hidden')}
-                >
-                  <S3ConnectionView
-                    profileId={t.profileId}
-                    bucket={t.bucket}
-                    active={t.id === activeTabId}
-                  />
-                </div>
-              ))}
-              {transferTabs.map((t) => (
-                <div
-                  key={t.id}
-                  data-testid={`tabpane-${t.id}`}
-                  className={cn('absolute inset-0 bg-background', t.id !== activeTabId && 'hidden')}
-                >
-                  <ViewHost tab={t} />
-                </div>
-              ))}
-              {activeViewTab && (
-                <div className="absolute inset-0 bg-background">
-                  <ViewHost key={activeViewTab.id} tab={activeViewTab} />
-                </div>
-              )}
-              {!activeTab && (
-                <div className="absolute inset-0">
-                  <WelcomePage />
-                </div>
-              )}
+                {panesTabs.map((t) => (
+                  <div
+                    key={t.id}
+                    data-testid={`tabpane-${t.id}`}
+                    className={cn('absolute inset-0', t.id !== activeTabId && 'hidden')}
+                  >
+                    <PanesView tab={t} />
+                  </div>
+                ))}
+                <PaneLayer />
+                {vncTabs.map((t) => (
+                  <div
+                    key={t.id}
+                    data-testid={`tabpane-${t.id}`}
+                    className={cn('absolute inset-0', t.id !== activeTabId && 'hidden')}
+                  >
+                    <VncTabView tab={t} active={t.id === activeTabId} />
+                  </div>
+                ))}
+                {rdpTabs.map((t) => (
+                  <div
+                    key={t.id}
+                    data-testid={`tabpane-${t.id}`}
+                    className={cn('absolute inset-0', t.id !== activeTabId && 'hidden')}
+                  >
+                    <RdpTabView tab={t} active={t.id === activeTabId} />
+                  </div>
+                ))}
+              </div>
             </div>
           </div>
         }

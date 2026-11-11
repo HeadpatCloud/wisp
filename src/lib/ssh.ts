@@ -1,6 +1,7 @@
 import { Channel } from '@tauri-apps/api/core'
 import { commands } from '@/bindings'
 import { unwrap } from '@/lib/ipc'
+import type { AdhocParams } from '@/lib/sftp'
 
 export async function connectSession(
   profileId: string,
@@ -14,6 +15,20 @@ export async function connectSession(
   const channel = new Channel<string>()
   channel.onmessage = (msg) => onBytes(Uint8Array.from(atob(msg), (c) => c.charCodeAt(0)))
   const res = await commands.sshConnect(profileId, cols, rows, channel)
+  if (res.status === 'error') throw res.error
+  return res.data
+}
+
+// Connect once: the login is the tab's own, nothing is saved.
+export async function connectAdhoc(
+  p: AdhocParams,
+  cols: number,
+  rows: number,
+  onBytes: (bytes: Uint8Array) => void,
+): Promise<string> {
+  const channel = new Channel<string>()
+  channel.onmessage = (msg) => onBytes(Uint8Array.from(atob(msg), (c) => c.charCodeAt(0)))
+  const res = await commands.sshConnectAdhoc(p, cols, rows, channel)
   if (res.status === 'error') throw res.error
   return res.data
 }

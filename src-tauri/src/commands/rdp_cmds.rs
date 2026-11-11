@@ -22,7 +22,7 @@ use crate::rdp::input::Input;
 use crate::rdp::session::{Session, CLOSE_LIMIT, CONNECT_LIMIT};
 use crate::rdp::share::Share;
 use crate::remote::{FrameBytes, FrameOp};
-use crate::store::model::{RdpGateway, RdpProfile, SharedFolder};
+use crate::store::hosts::RdpResolved as Dialed;
 use crate::store::Store;
 
 #[derive(Clone, Serialize, Deserialize, Type)]
@@ -246,26 +246,10 @@ fn local_layout() -> u32 {
     DEFAULT_LAYOUT
 }
 
-#[derive(Debug, PartialEq)]
-struct Dialed {
-    host: String,
-    port: u16,
-    username: String,
-    domain: Option<String>,
-    secret_id: Option<String>,
-    keyboard_layout: Option<u32>,
-    audio: bool,
-    shared_folder: Option<SharedFolder>,
-    gateway: Option<RdpGateway>,
-}
-
 // A saved profile is read at every connect and never copied into the tab: saving a new password
 // gives the profile another vault id, and a copy in an open or restored tab would be a dead one.
 // The store is read only for a profile, so a quick connect does not wait on its lock.
-fn resolve_target(
-    saved: impl FnOnce() -> AppResult<Vec<RdpProfile>>,
-    given: RdpTarget,
-) -> AppResult<Dialed> {
+fn resolve_target(saved: impl FnOnce(&str) -> AppResult<Dialed>, given: RdpTarget) -> AppResult<Dialed> {
     let Some(id) = given.profile_id else {
         return Ok(Dialed {
             host: given.host,
@@ -279,21 +263,7 @@ fn resolve_target(
             gateway: None,
         });
     };
-    let p = saved()?
-        .into_iter()
-        .find(|p| p.id == id)
-        .ok_or_else(|| AppError::NotFound("rdp: this profile no longer exists".into()))?;
-    Ok(Dialed {
-        host: p.host,
-        port: p.port,
-        username: p.username,
-        domain: p.domain,
-        secret_id: p.secret_id,
-        keyboard_layout: p.keyboard_layout,
-        audio: p.audio,
-        shared_folder: p.shared_folder,
-        gateway: p.gateway,
-    })
+    saved(&id)
 }
 
 // The user name and the vault id of the password the gateway gets. Basic has no domain field, so
@@ -325,10 +295,10 @@ pub async fn rdp_open(
     let vault = app.state::<std::sync::Mutex<crate::vault::Vault>>();
     let known = app.state::<KnownHostsState>();
     let rdps = app.state::<RdpSessions>();
-    let saved = || -> AppResult<Vec<RdpProfile>> {
+    let saved = |id: &str| -> AppResult<Dialed> {
         let store = app.state::<std::sync::Mutex<Store>>();
         let store = store.lock().map_err(|_| AppError::Internal("store lock poisoned".into()))?;
-        Ok(store.rdp_profiles())
+        store.hosts().rdp_target(id)
     };
     let dialed = resolve_target(saved, target)?;
     // The password lives in the vault; the caller only ever holds a reference to it.
@@ -470,6 +440,8 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
+    use crate::store::hosts::{fixtures, ConnectionKind, HostsFile, RdpConn, RdpGatewayConn};
+    use crate::store::model::{RdpGateway, SharedFolder};
     use crate::rdp::testserver::{
         accept_nla_holding, certificate, confirm, off_thread, read_client, tls, ClientPdu, Login,
         Mouse, Options, Seen, TestServer,
@@ -1015,27 +987,46 @@ mod tests {
         }
     }
 
-    fn office() -> RdpProfile {
-        RdpProfile {
-            id: "r1".into(),
-            name: "office".into(),
-            host: "10.0.0.9".into(),
+    struct Office {
+        domain: Option<&'static str>,
+        secret: Option<&'static str>,
+        layout: Option<u32>,
+        audio: bool,
+        share: bool,
+        gateway: bool,
+    }
+
+    const OFFICE: Office = Office {
+        domain: Some("corp"),
+        secret: Some("vault-new"),
+        layout: Some(0x407),
+        audio: false,
+        share: true,
+        gateway: true,
+    };
+
+    fn office(o: Office) -> HostsFile {
+        let rdp = RdpConn {
             port: 3390,
-            username: "CORP\\faye".into(),
-            domain: Some("corp".into()),
-            secret_id: Some("vault-new".into()),
-            keyboard_layout: Some(0x407),
-            audio: false,
-            shared_folder: Some(SharedFolder {
+            login: fixtures::own("CORP\\faye", o.secret),
+            domain: o.domain.map(Into::into),
+            keyboard_layout: o.layout,
+            audio: o.audio,
+            shared_folder: o.share.then(|| SharedFolder {
                 path: "C:\\Users\\faye\\share".into(),
                 name: "share".into(),
                 extra: Default::default(),
             }),
-            gateway: Some(gateway(false)),
-            icon: Default::default(),
-            order: 0,
+            gateway: o.gateway.then(|| RdpGatewayConn {
+                host: "gw.corp".into(),
+                port: 8443,
+                login: Some(fixtures::own("gw-faye", Some("vault-gw"))),
+                extra: Default::default(),
+            }),
             extra: Default::default(),
-        }
+        };
+        let c = fixtures::conn("r1", ConnectionKind::Rdp(rdp));
+        fixtures::file(vec![fixtures::host("h", "office", "10.0.0.9", vec![c])])
     }
 
     fn gateway(same_login: bool) -> RdpGateway {
@@ -1075,13 +1066,14 @@ mod tests {
         }
     }
 
-    fn unreadable() -> AppResult<Vec<RdpProfile>> {
+    fn unreadable(_: &str) -> AppResult<Dialed> {
         Err(AppError::Internal("store lock poisoned".into()))
     }
 
     #[test]
     fn a_profile_id_connects_with_what_the_profile_holds_now() {
-        let target = resolve_target(|| Ok(vec![office()]), given(Some("r1"))).unwrap();
+        let held_file = office(OFFICE);
+        let target = resolve_target(|id| held_file.rdp_target(id), given(Some("r1"))).unwrap();
         let held = Dialed {
             host: "10.0.0.9".into(),
             port: 3390,
@@ -1106,16 +1098,15 @@ mod tests {
         };
         assert_eq!(target, held);
 
-        let bare = RdpProfile {
+        let bare_file = office(Office {
             domain: None,
-            secret_id: None,
-            keyboard_layout: None,
+            secret: None,
+            layout: None,
             audio: true,
-            shared_folder: None,
-            gateway: None,
-            ..office()
-        };
-        let target = resolve_target(|| Ok(vec![bare]), given(Some("r1"))).unwrap();
+            share: false,
+            gateway: false,
+        });
+        let target = resolve_target(|id| bare_file.rdp_target(id), given(Some("r1"))).unwrap();
         let bare = Dialed {
             domain: None,
             secret_id: None,
@@ -1130,10 +1121,11 @@ mod tests {
 
     #[test]
     fn a_profile_id_that_is_gone_is_not_found() {
-        let missing = resolve_target(|| Ok(vec![office()]), given(Some("gone")));
+        let held = office(OFFICE);
+        let missing = resolve_target(|id| held.rdp_target(id), given(Some("gone")));
         assert!(matches!(
             missing,
-            Err(AppError::NotFound(m)) if m == "rdp: this profile no longer exists"
+            Err(AppError::NotFound(m)) if m == "This connection no longer exists."
         ));
     }
 
@@ -1145,18 +1137,20 @@ mod tests {
 
     #[test]
     fn without_a_profile_id_the_arguments_are_used() {
-        assert_eq!(resolve_target(|| Ok(vec![office()]), given(None)).unwrap(), quick());
+        let held = office(OFFICE);
+        assert_eq!(resolve_target(|id| held.rdp_target(id), given(None)).unwrap(), quick());
     }
 
     #[test]
     fn without_a_profile_id_the_store_is_not_read() {
-        let target = resolve_target(|| panic!("the store was read"), given(None));
+        let target = resolve_target(|_| panic!("the store was read"), given(None));
         assert_eq!(target.unwrap(), quick());
     }
 
     #[test]
     fn a_quick_connect_plays_sound_without_a_share_or_a_gateway() {
-        let target = resolve_target(|| Ok(vec![office()]), given(None)).unwrap();
+        let held = office(OFFICE);
+        let target = resolve_target(|id| held.rdp_target(id), given(None)).unwrap();
         assert!(target.audio);
         assert_eq!(target.shared_folder, None);
         assert_eq!(target.gateway, None);

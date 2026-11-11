@@ -1,19 +1,31 @@
 import { useEffect, useRef } from 'react'
+import { isMac } from '@/lib/platform'
 
 export const HOTKEY_ACTIONS = [
   { id: 'palette', label: 'Command palette', default: 'ctrl+shift+p' },
+  // While a terminal has focus a Ctrl chord goes to the shell; Cmd+K on macOS never reaches it.
+  {
+    id: 'paletteShort',
+    label: 'Command palette (short)',
+    default: isMac ? 'meta+k' : 'ctrl+k',
+    shellFirst: true,
+  },
+  { id: 'newConnection', label: 'New connection', default: 'ctrl+shift+n' },
+  { id: 'toggleHostList', label: 'Show or hide the host list', default: 'ctrl+shift+b' },
   { id: 'localShell', label: 'New local shell', default: 'ctrl+shift+t' },
   // Chords stay shift/alt-qualified: bare Ctrl+letter belongs to readline in the terminal.
   { id: 'closeTab', label: 'Close tab', default: 'ctrl+shift+w' },
   { id: 'nextTab', label: 'Next tab', default: 'ctrl+tab' },
   { id: 'prevTab', label: 'Previous tab', default: 'ctrl+shift+tab' },
+  { id: 'moveTabLeft', label: 'Move tab left', default: 'ctrl+shift+pageup' },
+  { id: 'moveTabRight', label: 'Move tab right', default: 'ctrl+shift+pagedown' },
   { id: 'splitRight', label: 'Split pane right', default: 'ctrl+alt+arrowright' },
   { id: 'splitDown', label: 'Split pane down', default: 'ctrl+alt+arrowdown' },
   { id: 'closePane', label: 'Close pane', default: 'ctrl+shift+x' },
   { id: 'zoomIn', label: 'Zoom in', default: 'ctrl+plus' },
   { id: 'zoomOut', label: 'Zoom out', default: 'ctrl+-' },
   { id: 'zoomReset', label: 'Reset zoom', default: 'ctrl+0' },
-  { id: 'broadcast', label: 'Toggle broadcast input', default: 'ctrl+shift+i' },
+  { id: 'broadcast', label: 'Type into every pane of the tab', default: 'ctrl+shift+i' },
   { id: 'settings', label: 'Open settings', default: 'ctrl+,' },
 ] as const
 
@@ -43,6 +55,8 @@ export function formatChord(chord: string): string {
     .replace('Arrowdown', '↓')
     .replace('Arrowleft', '←')
     .replace('Arrowup', '↑')
+    .replace('Pageup', 'PgUp')
+    .replace('Pagedown', 'PgDn')
 }
 
 export function chordFor(action: HotkeyAction, overrides: Record<string, string>): string {
@@ -69,10 +83,12 @@ export function conflictFor(
   return null
 }
 
-// chord -> action, so a keypress is a single lookup.
+// chord -> action, so a keypress is a single lookup. A chord the user picked beats a default
+// that a newer version added on the same keys.
 function keymapOf(overrides: Record<string, string>): Record<string, HotkeyAction> {
   const map: Record<string, HotkeyAction> = {}
-  for (const a of HOTKEY_ACTIONS) map[chordFor(a.id, overrides)] = a.id
+  for (const a of HOTKEY_ACTIONS) if (!(a.id in overrides)) map[chordFor(a.id, overrides)] = a.id
+  for (const a of HOTKEY_ACTIONS) if (a.id in overrides) map[chordFor(a.id, overrides)] = a.id
   return map
 }
 
@@ -83,11 +99,18 @@ export function suspendHotkeys(value: boolean) {
   suspended = value
 }
 
+const isTerminal = (t: EventTarget | null) =>
+  !!(t as HTMLElement | null)?.classList?.contains('xterm-helper-textarea')
+
+const SHELL_FIRST = new Set<string>(
+  HOTKEY_ACTIONS.filter((a) => 'shellFirst' in a).map((a) => a.id),
+)
+
 // xterm's hidden textarea must still receive hotkeys; every other text field must not.
 function isTypingTarget(t: EventTarget | null): boolean {
   const el = t as HTMLElement | null
   if (!el) return false
-  if (el.classList?.contains('xterm-helper-textarea')) return false
+  if (isTerminal(el)) return false
   // A remote desktop gets every key pressed inside it.
   if (el.closest?.('[data-remote-desktop]')) return true
   return el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable
@@ -108,6 +131,7 @@ export function useHotkeys(
       if (suspended || isTypingTarget(ev.target)) return
       const action = mapRef.current[chordOf(ev)]
       if (!action) return
+      if (SHELL_FIRST.has(action) && ev.ctrlKey && isTerminal(ev.target)) return
       const run = handlersRef.current[action]
       if (!run) return
       ev.preventDefault()

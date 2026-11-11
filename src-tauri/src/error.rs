@@ -24,8 +24,9 @@ pub enum AppError {
     HostKeyUnknown { host: String, port: u16, fingerprint: String },
     #[error("host key mismatch for {host}:{port}")]
     HostKeyMismatch { host: String, port: u16, stored: String, offered: String },
-    #[error("key is encrypted - passphrase required")]
-    PassphraseRequired,
+    // The key file's path; parsing leaves it empty and auth_key fills it in.
+    #[error("{0} needs a passphrase")]
+    PassphraseRequired(String),
     #[error("wrong passphrase")]
     WrongPassphrase,
     #[error("sftp error: {0}")]
@@ -38,6 +39,9 @@ pub enum AppError {
     Import(String),
     #[error("internal error: {0}")]
     Internal(String),
+    // Shown to the user as it is.
+    #[error("{0}")]
+    Invalid(String),
     // The caller closed what it was waiting for.
     #[error("cancelled")]
     Cancelled,
@@ -66,7 +70,7 @@ impl From<russh::Error> for AppError {
 impl From<russh::keys::Error> for AppError {
     fn from(e: russh::keys::Error) -> Self {
         match e {
-            russh::keys::Error::KeyIsEncrypted => AppError::PassphraseRequired,
+            russh::keys::Error::KeyIsEncrypted => AppError::PassphraseRequired(String::new()),
             russh::keys::Error::SshKey(_) => AppError::WrongPassphrase,
             other => AppError::Ssh(other.to_string()),
         }
@@ -131,9 +135,9 @@ mod tests {
     }
 
     #[test]
-    fn passphrase_required_has_no_message() {
-        let json = serde_json::to_value(AppError::PassphraseRequired).unwrap();
+    fn passphrase_required_names_the_key() {
+        let json = serde_json::to_value(AppError::PassphraseRequired("C:/keys/id".into())).unwrap();
         assert_eq!(json["kind"], "passphraseRequired");
-        assert!(json.get("message").is_none());
+        assert_eq!(json["message"], "C:/keys/id");
     }
 }

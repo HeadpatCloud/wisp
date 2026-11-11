@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -9,6 +9,7 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import type { AdhocInitial } from '@/features/sessions/AdhocLoginFields'
 
 export interface FtpParams {
   host: string
@@ -24,10 +25,12 @@ export function FtpConnectDialog({
   open,
   onOpenChange,
   onConnect,
+  initial,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
   onConnect: (params: FtpParams) => void
+  initial?: AdhocInitial & { secure?: boolean }
 }) {
   const [host, setHost] = useState('')
   const [port, setPort] = useState(21)
@@ -36,6 +39,14 @@ export function FtpConnectDialog({
   const [secure, setSecure] = useState(true)
   const [allowInvalidCert, setAllowInvalidCert] = useState(false)
   const [ignoreHostname, setIgnoreHostname] = useState(false)
+
+  useEffect(() => {
+    if (!open || !initial) return
+    setHost(initial.host ?? '')
+    setPort(initial.port ?? 21)
+    setUsername(initial.username ?? '')
+    setSecure(initial.secure ?? true)
+  }, [open, initial])
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>

@@ -1,28 +1,26 @@
 import { useState } from 'react'
-import type { ExportSummary, Group, Profile } from '@/bindings'
+import type { ExportSummary, Folder, Host } from '@/bindings'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { PageShell } from '@/components/ui/page-shell'
+import { THIS_COMPUTER } from '@/lib/hosts'
 import { exportBundle, pickExportPath } from '@/lib/transfer'
-import { useProfileStore } from '@/stores/profileStore'
-import { useRdpProfileStore } from '@/stores/rdpProfileStore'
-import { useS3ProfileStore } from '@/stores/s3ProfileStore'
-import { useSessionStore } from '@/stores/sessionStore'
-import { useSftpProfileStore } from '@/stores/sftpProfileStore'
-import { useVncProfileStore } from '@/stores/vncProfileStore'
+import { useHostStore } from '@/stores/hostStore'
 import type { Tri } from './review'
 import { TriCheckbox } from './TriCheckbox'
 
-function leaves(groupId: string, groups: Group[], profiles: Profile[]): string[] {
-  const keys = profiles.filter((p) => p.groupId === groupId).map((p) => `ssh:${p.id}`)
-  for (const g of groups) if (g.parentId === groupId) keys.push(...leaves(g.id, groups, profiles))
-  return keys.length > 0 ? keys : [`group:${groupId}`]
+// The hosts in a folder and all its subfolders.
+function hostsUnder(folderId: string, folders: Folder[], hosts: Host[]): string[] {
+  const ids = hosts.filter((h) => h.folderId === folderId).map((h) => h.id)
+  for (const f of folders)
+    if (f.parentId === folderId) ids.push(...hostsUnder(f.id, folders, hosts))
+  return ids
 }
 
-function stateOf(keys: string[], selected: Set<string>): Tri {
-  const on = keys.filter((k) => selected.has(k)).length
-  if (on === keys.length) return 'all'
+function stateOf(ids: string[], selected: Set<string>): Tri {
+  const on = ids.filter((id) => selected.has(id)).length
+  if (on > 0 && on === ids.length) return 'all'
   return on === 0 ? 'none' : 'some'
 }
 
@@ -30,14 +28,10 @@ function plural(n: number, noun: string): string {
   return `${n} ${noun}${n === 1 ? '' : 's'}`
 }
 
-export function ExportPage({ tabId }: { tabId: string }) {
-  const groups = useProfileStore((s) => s.groups)
-  const profiles = useProfileStore((s) => s.profiles)
-  const sftp = useSftpProfileStore((s) => s.profiles)
-  const s3 = useS3ProfileStore((s) => s.profiles)
-  const vnc = useVncProfileStore((s) => s.profiles)
-  const rdp = useRdpProfileStore((s) => s.profiles)
-  const removeTab = useSessionStore((s) => s.removeTab)
+export function ExportPage({ onClose }: { onClose: () => void }) {
+  const folders = useHostStore((s) => s.folders)
+  const allHosts = useHostStore((s) => s.hosts)
+  const hosts = allHosts.filter((h) => h.id !== THIS_COMPUTER)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [includeSecrets, setIncludeSecrets] = useState(false)
   const [includeKeys, setIncludeKeys] = useState(false)
@@ -47,20 +41,20 @@ export function ExportPage({ tabId }: { tabId: string }) {
   const [error, setError] = useState<string | null>(null)
   const [summary, setSummary] = useState<ExportSummary | null>(null)
 
-  const toggle = (keys: string[], on: boolean) =>
+  const toggle = (ids: string[], on: boolean) =>
     setSelected((prev) => {
       const next = new Set(prev)
-      for (const k of keys) {
-        if (on) next.add(k)
-        else next.delete(k)
+      for (const id of ids) {
+        if (on) next.add(id)
+        else next.delete(id)
       }
       return next
     })
 
   const needsPassword = includeSecrets || includeKeys
   const passwordOk = !needsPassword || (password.length > 0 && password === confirm)
-  const ids = (prefix: string) =>
-    [...selected].filter((k) => k.startsWith(prefix)).map((k) => k.slice(prefix.length))
+  const byOrder = <T extends { order: number }>(items: T[]) =>
+    [...items].sort((a, b) => a.order - b.order)
 
   async function doExport() {
     setBusy(true)
@@ -68,18 +62,13 @@ export function ExportPage({ tabId }: { tabId: string }) {
     try {
       const path = await pickExportPath()
       if (!path) return
+      const folderIds = folders
+        .filter((f) => stateOf(hostsUnder(f.id, folders, hosts), selected) === 'all')
+        .map((f) => f.id)
+      const hostIds = hosts.filter((h) => selected.has(h.id)).map((h) => h.id)
       setSummary(
         await exportBundle(
-          {
-            groupIds: groups
-              .filter((g) => stateOf(leaves(g.id, groups, profiles), selected) === 'all')
-              .map((g) => g.id),
-            profileIds: ids('ssh:'),
-            sftpIds: ids('sftp:'),
-            s3Ids: ids('s3:'),
-            vncIds: ids('vnc:'),
-            rdpIds: ids('rdp:'),
-          },
+          { folderIds, hostIds },
           { includeSecrets, includeKeys },
           needsPassword ? password : null,
           path,
@@ -94,78 +83,54 @@ export function ExportPage({ tabId }: { tabId: string }) {
     }
   }
 
-  const renderGroup = (g: Group) => {
-    const keys = leaves(g.id, groups, profiles)
+  const renderHost = (h: Host) => (
+    <li key={h.id}>
+      <label className="flex items-center gap-2">
+        <input
+          type="checkbox"
+          aria-label={h.name}
+          checked={selected.has(h.id)}
+          onChange={(e) => toggle([h.id], e.target.checked)}
+        />
+        {h.name}
+      </label>
+    </li>
+  )
+
+  const renderFolder = (f: Folder) => {
+    const ids = hostsUnder(f.id, folders, hosts)
     return (
-      <li key={g.id}>
-        <label htmlFor={`export-group-${g.id}`} className="flex items-center gap-2">
+      <li key={f.id}>
+        <label htmlFor={`export-folder-${f.id}`} className="flex items-center gap-2">
           <TriCheckbox
-            id={`export-group-${g.id}`}
-            state={stateOf(keys, selected)}
-            label={g.name}
-            onChange={(on) => toggle(keys, on)}
+            id={`export-folder-${f.id}`}
+            state={stateOf(ids, selected)}
+            label={f.name}
+            onChange={(on) => toggle(ids, on)}
           />
-          <span className="font-medium">{g.name}</span>
+          <span className="font-medium">{f.name}</span>
         </label>
-        <ul className="space-y-1 pl-6 pt-1">
-          {groups.filter((c) => c.parentId === g.id).map(renderGroup)}
-          {profiles.filter((p) => p.groupId === g.id).map(renderProfile)}
+        <ul className="space-y-1 pt-1 pl-6">
+          {byOrder(folders.filter((c) => c.parentId === f.id)).map(renderFolder)}
+          {byOrder(hosts.filter((h) => h.folderId === f.id)).map(renderHost)}
         </ul>
       </li>
     )
   }
 
-  const renderProfile = (p: Profile) => (
-    <li key={p.id}>
-      <label className="flex items-center gap-2">
-        <input
-          type="checkbox"
-          aria-label={p.name}
-          checked={selected.has(`ssh:${p.id}`)}
-          onChange={(e) => toggle([`ssh:${p.id}`], e.target.checked)}
-        />
-        {p.name}
-      </label>
-    </li>
-  )
-
-  const flat = (prefix: string, items: { id: string; name: string }[]) =>
-    items.map((p) => (
-      <li key={p.id}>
-        <label className="flex items-center gap-2">
-          <input
-            type="checkbox"
-            aria-label={p.name}
-            checked={selected.has(`${prefix}${p.id}`)}
-            onChange={(e) => toggle([`${prefix}${p.id}`], e.target.checked)}
-          />
-          {p.name}
-        </label>
-      </li>
-    ))
-
-  const everything = [
-    ...groups.flatMap((g) => leaves(g.id, groups, profiles)),
-    ...profiles.map((p) => `ssh:${p.id}`),
-    ...sftp.map((p) => `sftp:${p.id}`),
-    ...s3.map((p) => `s3:${p.id}`),
-    ...vnc.map((p) => `vnc:${p.id}`),
-    ...rdp.map((p) => `rdp:${p.id}`),
-  ]
-
   if (summary) {
     return (
       <PageShell
-        title="Export profiles"
+        title="Export hosts"
         footer={
-          <Button type="button" onClick={() => removeTab(tabId)}>
+          <Button type="button" onClick={onClose}>
             Close
           </Button>
         }
       >
         <p className="text-sm">
-          Exported {plural(summary.profiles, 'profile')} ({plural(summary.secrets, 'password')},{' '}
-          {plural(summary.keyFiles, 'key file')}).
+          Exported {plural(summary.hosts, 'host')} with {plural(summary.connections, 'connection')}{' '}
+          ({plural(summary.secrets, 'password')}, {plural(summary.keyFiles, 'key file')}).
         </p>
         <ul className="mt-2 space-y-1 text-muted-foreground text-sm">
           {[...new Set(summary.warnings)].map((w) => (
@@ -176,12 +141,13 @@ export function ExportPage({ tabId }: { tabId: string }) {
     )
   }
 
+  const known = new Set(folders.map((f) => f.id))
   return (
     <PageShell
-      title="Export profiles"
+      title="Export hosts"
       footer={
         <>
-          <Button type="button" variant="ghost" onClick={() => removeTab(tabId)}>
+          <Button type="button" variant="ghost" onClick={onClose}>
             Cancel
           </Button>
           <Button
@@ -196,44 +162,26 @@ export function ExportPage({ tabId }: { tabId: string }) {
     >
       <div className="space-y-4 text-sm">
         <div className="flex gap-2">
-          <Button type="button" variant="ghost" onClick={() => toggle(everything, true)}>
+          <Button
+            type="button"
+            variant="ghost"
+            onClick={() =>
+              toggle(
+                hosts.map((h) => h.id),
+                true,
+              )
+            }
+          >
             Select all
           </Button>
           <Button type="button" variant="ghost" onClick={() => setSelected(new Set())}>
             Select none
           </Button>
         </div>
-        <section>
-          <h3 className="mb-1 font-semibold">SSH</h3>
-          <ul className="space-y-1">
-            {groups.filter((g) => !groups.some((p) => p.id === g.parentId)).map(renderGroup)}
-            {profiles.filter((p) => !p.groupId).map(renderProfile)}
-          </ul>
-        </section>
-        {sftp.length > 0 && (
-          <section>
-            <h3 className="mb-1 font-semibold">SFTP</h3>
-            <ul className="space-y-1">{flat('sftp:', sftp)}</ul>
-          </section>
-        )}
-        {s3.length > 0 && (
-          <section>
-            <h3 className="mb-1 font-semibold">S3</h3>
-            <ul className="space-y-1">{flat('s3:', s3)}</ul>
-          </section>
-        )}
-        {vnc.length > 0 && (
-          <section>
-            <h3 className="mb-1 font-semibold">VNC</h3>
-            <ul className="space-y-1">{flat('vnc:', vnc)}</ul>
-          </section>
-        )}
-        {rdp.length > 0 && (
-          <section>
-            <h3 className="mb-1 font-semibold">RDP</h3>
-            <ul className="space-y-1">{flat('rdp:', rdp)}</ul>
-          </section>
-        )}
+        <ul className="space-y-1">
+          {byOrder(folders.filter((f) => !f.parentId || !known.has(f.parentId))).map(renderFolder)}
+          {byOrder(hosts.filter((h) => !h.folderId || !known.has(h.folderId))).map(renderHost)}
+        </ul>
         <section className="space-y-2 border-border border-t pt-4">
           <label className="flex items-center gap-2">
             <input

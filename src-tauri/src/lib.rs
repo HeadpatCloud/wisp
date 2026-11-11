@@ -77,42 +77,48 @@ fn specta_builder() -> Builder<tauri::Wry> {
     Builder::<tauri::Wry>::new()
         .commands(collect_commands![
             health_check,
-            store_cmds::list_groups,
-            store_cmds::list_profiles,
+            store_cmds::get_hosts,
+            store_cmds::take_migration_report,
+            store_cmds::upsert_host,
+            store_cmds::delete_host,
+            store_cmds::undo_delete,
+            store_cmds::purge_deletes,
+            store_cmds::upsert_key,
+            store_cmds::upsert_login,
+            store_cmds::delete_login,
+            store_cmds::delete_key,
+            store_cmds::upsert_tag,
+            store_cmds::delete_tag,
+            store_cmds::upsert_folder,
+            store_cmds::move_hosts,
+            store_cmds::move_folders,
             store_cmds::get_settings,
-            store_cmds::upsert_group,
-            store_cmds::delete_group,
-            store_cmds::upsert_profile,
-            store_cmds::delete_profile,
             store_cmds::set_settings,
-            store_cmds::list_sftp_profiles,
-            store_cmds::upsert_sftp_profile,
-            store_cmds::delete_sftp_profile,
-            store_cmds::list_s3_profiles,
-            store_cmds::upsert_s3_profile,
-            store_cmds::delete_s3_profile,
-            store_cmds::list_vnc_profiles,
-            store_cmds::upsert_vnc_profile,
-            store_cmds::delete_vnc_profile,
-            store_cmds::list_rdp_profiles,
-            store_cmds::upsert_rdp_profile,
-            store_cmds::delete_rdp_profile,
+            store_cmds::get_themes,
+            store_cmds::set_themes,
             transfer_cmds::transfer_export,
             transfer_cmds::transfer_read,
             transfer_cmds::transfer_validate,
             transfer_cmds::transfer_apply,
             transfer_cmds::transfer_discard,
             vault_cmds::vault_status,
+            vault_cmds::vault_uses_password,
+            vault_cmds::vault_can_skip_password,
+            vault_cmds::vault_skip_password,
             vault_cmds::set_secret,
             vault_cmds::delete_secret,
             vault_cmds::has_secret,
             vault_cmds::vault_unlock,
             vault_cmds::vault_change_password,
             ssh_cmds::ssh_connect,
+            ssh_cmds::ssh_connect_adhoc,
+            ssh_cmds::ssh_open_background,
             ssh_cmds::ssh_write,
             ssh_cmds::ssh_resize,
             ssh_cmds::ssh_disconnect,
             ssh_cmds::trust_host_key,
+            ssh_cmds::known_hosts_list,
+            ssh_cmds::known_hosts_forget,
             sftp_cmds::sftp_list,
             sftp_cmds::sftp_stat,
             sftp_cmds::sftp_mkdir,
@@ -126,6 +132,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
             sftp_cmds::sftp_connect_saved,
             sftp_cmds::sftp_disconnect,
             ftp_cmds::ftp_connect,
+            ftp_cmds::ftp_connect_saved,
             ftp_cmds::ftp_list,
             ftp_cmds::ftp_exists,
             ftp_cmds::ftp_mkdir,
@@ -150,10 +157,13 @@ fn specta_builder() -> Builder<tauri::Wry> {
             tunnel_cmds::tunnel_stop,
             tunnel_cmds::tunnel_list,
             import_cmds::import_ssh_config,
+            import_cmds::ssh_config_apply,
             icon_cmds::import_icon,
             icon_cmds::read_icon,
             local_cmds::list_shells,
             local_cmds::edit_temp_path,
+            local_cmds::read_text_file,
+            local_cmds::write_text_file,
             local_cmds::file_mtime,
             local_cmds::clear_edit_temp,
             local_cmds::local_open,
@@ -242,12 +252,16 @@ pub fn run() {
         .setup(move |app| {
             // Built here because the window config has no setting for clipboard access;
             // without it WebView2 asks with its own prompt on the first clipboard read.
-            tauri::WebviewWindowBuilder::from_config(app.handle(), &app.config().app.windows[0])?
-                .enable_clipboard_access()
-                .build()?;
+            let window =
+                tauri::WebviewWindowBuilder::from_config(app.handle(), &app.config().app.windows[0])?
+                    .enable_clipboard_access();
+            // Windows gets Wisp's own title bar; macOS and Linux keep the native one.
+            #[cfg(windows)]
+            let window = window.decorations(false);
+            window.build()?;
             builder.mount_events(app);
             let dir = app.path().app_config_dir()?;
-            let store = Store::load(dir.clone())
+            let store = Store::load(dir.clone(), &commands::local_cmds::detect_shells())
                 .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
             app.manage(Mutex::new(store));
             let vault_path = dir.join("vault.enc");
@@ -258,6 +272,10 @@ pub fn run() {
                 Err(e) => return Err(Box::<dyn std::error::Error>::from(e.to_string())),
             };
             app.manage(Mutex::new(vault));
+            // Only cleanup: a file kept busy by a sync tool must not stop Wisp, and the next start retries.
+            if let Err(err) = commands::store_cmds::purge_left_over_deletes(app.handle()) {
+                eprintln!("wisp: purging deletes left from the last run failed: {err}");
+            }
             let known_hosts = KnownHosts::load(dir.join("known_hosts.json"))
                 .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
             app.manage(ssh_cmds::KnownHostsState(Arc::new(std::sync::Mutex::new(known_hosts))));

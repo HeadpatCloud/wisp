@@ -7,6 +7,7 @@ import {
   setAsNew,
   setField,
   setItem,
+  toggleItem,
   toPayload,
 } from './review'
 
@@ -16,7 +17,8 @@ const review: ImportReview = {
   items: [
     {
       key: 'ssh:a',
-      kind: 'ssh',
+      kind: 'connection',
+      parent: null,
       name: 'web',
       status: 'conflict',
       matched: { id: 'pc', name: 'web' },
@@ -29,7 +31,8 @@ const review: ImportReview = {
     },
     {
       key: 'ssh:n',
-      kind: 'ssh',
+      kind: 'connection',
+      parent: null,
       name: 'new',
       status: 'new',
       matched: null,
@@ -79,4 +82,22 @@ test('payload lists accepted fields only', () => {
     { key: 'ssh:a', accept: true, asNew: false, fields: ['port'] },
     { key: 'ssh:n', accept: true, asNew: false, fields: [] },
   ])
+})
+
+const hostReview: ImportReview = {
+  reviewId: 'r2',
+  unchanged: 0,
+  items: [
+    { ...fresh, key: 'host:h', kind: 'host', name: 'nas' },
+    { ...fresh, key: 'conn:a', kind: 'connection', name: 'nas · SSH · admin', parent: 'host:h' },
+    { ...fresh, key: 'conn:b', kind: 'connection', name: 'nas · Files', parent: 'host:h' },
+  ],
+}
+
+test('declining a new host declines its connections', () => {
+  const [h, a] = hostReview.items
+  const off = toggleItem(hostReview, initialDecisions(hostReview), h, false)
+  expect(toPayload(hostReview, off).map((p) => p.accept)).toEqual([false, false, false])
+  const back = toggleItem(hostReview, off, a, true)
+  expect(toPayload(hostReview, back).map((p) => p.accept)).toEqual([true, true, false])
 })

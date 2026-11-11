@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri::ipc::Channel;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, Runtime, State};
 use tauri_specta::Event;
 use tokio::sync::{mpsc, Mutex as TokioMutex};
 use zeroize::Zeroizing;
@@ -17,9 +17,15 @@ use crate::ssh::client::{self, SshHandle};
 use crate::ssh::jump;
 use crate::ssh::known_hosts::KnownHosts;
 use crate::ssh::session::{open_pty, run_session};
-use crate::store::model::{AuthMethod, Profile, ProfileKey};
+use crate::store::hosts::SshTarget;
+use crate::store::model::{AuthMethod, ProfileKey};
 use crate::store::Store;
 use crate::vault::Vault;
+
+pub struct PtyIo {
+    pub input_tx: mpsc::Sender<Vec<u8>>,
+    pub resize_tx: mpsc::Sender<(u32, u32)>,
+}
 
 pub struct Session {
     pub handle: Arc<SshHandle>,
@@ -27,8 +33,9 @@ pub struct Session {
     #[allow(dead_code)]
     pub bastions: Vec<SshHandle>,
     pub remote_forwards: crate::ssh::client::RemoteForwards,
-    pub input_tx: mpsc::Sender<Vec<u8>>,
-    pub resize_tx: mpsc::Sender<(u32, u32)>,
+    // None for a background connection that only carries tunnels.
+    pub pty: Option<PtyIo>,
+    // The terminal's task, or the task watching a background connection.
     pub abort: tokio::task::AbortHandle,
 }
 
@@ -64,9 +71,9 @@ pub(crate) fn secret_string(
 
 fn secret_for(
     vault: &StdMutex<Vault>,
-    profile: &Profile,
+    target: &SshTarget,
 ) -> AppResult<Option<Zeroizing<String>>> {
-    match &profile.secret_id {
+    match &target.secret_id {
         Some(id) => Ok(Some(secret_string(vault, id)?)),
         None => Ok(None),
     }
@@ -101,11 +108,8 @@ pub(crate) async fn connect_via_chain(
     known: &KnownHostsState,
     target_id: &str,
 ) -> AppResult<(SshHandle, Vec<SshHandle>, crate::ssh::client::RemoteForwards)> {
-    let profiles = {
-        let store = store.lock().map_err(|_| AppError::Internal("store lock poisoned".into()))?;
-        store.profiles()
-    };
-    let chain = jump::resolve_jump_chain(&profiles, target_id)?;
+    let hosts = store.lock().map_err(|_| AppError::Internal("store lock poisoned".into()))?.hosts();
+    let chain = jump::resolve_jump_chain(|id| hosts.ssh_target(id), target_id)?;
 
     let root = &chain[0];
     let root_forwards = client::new_forwards();
@@ -210,7 +214,7 @@ async fn authenticate(
                 .await
                 {
                     Ok(()) => return Ok(()),
-                    Err(e @ (AppError::PassphraseRequired | AppError::WrongPassphrase)) => {
+                    Err(e @ (AppError::PassphraseRequired(_) | AppError::WrongPassphrase)) => {
                         passphrase_err.get_or_insert(e);
                     }
                     Err(e) => last = Some(e),
@@ -244,6 +248,56 @@ pub async fn ssh_connect(
 ) -> AppResult<String> {
     let (handle, bastions, remote_forwards) =
         connect_via_chain(&store, &vault, &known, &profile_id).await?;
+    start_session(&app, &sessions, handle, bastions, remote_forwards, cols, rows, on_output).await
+}
+
+#[derive(Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AdhocTarget {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub auth_method: AuthMethod,
+    pub keys: Vec<ProfileKey>,
+    pub secret_id: Option<String>,
+}
+
+// Connect once: nothing is saved, and the secret ids belong to the tab.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::too_many_arguments)]
+pub async fn ssh_connect_adhoc(
+    app: AppHandle,
+    vault: State<'_, StdMutex<Vault>>,
+    known: State<'_, KnownHostsState>,
+    sessions: State<'_, Sessions>,
+    target: AdhocTarget,
+    cols: u32,
+    rows: u32,
+    on_output: Channel<String>,
+) -> AppResult<String> {
+    let secret = match &target.secret_id {
+        Some(id) => Some(secret_string(&vault, id)?),
+        None => None,
+    };
+    let keys = resolve_keys(&vault, &target.keys)?;
+    let forwards = client::new_forwards();
+    let mut handle = client::connect(&target.host, target.port, known.0.clone(), forwards.clone()).await?;
+    authenticate(&mut handle, &target.username, target.auth_method, &keys, secret).await?;
+    start_session(&app, &sessions, handle, vec![], forwards, cols, rows, on_output).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_session(
+    app: &AppHandle,
+    sessions: &Sessions,
+    handle: SshHandle,
+    bastions: Vec<SshHandle>,
+    remote_forwards: crate::ssh::client::RemoteForwards,
+    cols: u32,
+    rows: u32,
+    on_output: Channel<String>,
+) -> AppResult<String> {
     let channel = open_pty(&handle, cols, rows).await?;
     let handle = Arc::new(handle);
 
@@ -261,16 +315,21 @@ pub async fn ssh_connect(
             let _ = out.send(STANDARD.encode(&bytes));
         })
         .await;
-        let _ = SshStatus::Disconnected { session_id: sid, exit_code: exit }.emit(&app_task);
+        close_session(&app_task, &sid, Some(CLOSED), exit).await;
     });
 
-    sessions
-        .0
-        .lock()
-        .await
-        .insert(session_id.clone(), Session { handle, bastions, remote_forwards, input_tx, resize_tx, abort: task.abort_handle() });
+    sessions.0.lock().await.insert(
+        session_id.clone(),
+        Session {
+            handle,
+            bastions,
+            remote_forwards,
+            pty: Some(PtyIo { input_tx, resize_tx }),
+            abort: task.abort_handle(),
+        },
+    );
 
-    let _ = SshStatus::Connected { session_id: session_id.clone() }.emit(&app);
+    let _ = SshStatus::Connected { session_id: session_id.clone() }.emit(app);
     Ok(session_id)
 }
 
@@ -283,7 +342,7 @@ pub async fn ssh_write(
 ) -> AppResult<()> {
     let tx = {
         let map = sessions.0.lock().await;
-        map.get(&session_id).map(|s| s.input_tx.clone())
+        map.get(&session_id).and_then(|s| s.pty.as_ref()).map(|p| p.input_tx.clone())
     };
     let tx = tx.ok_or_else(|| AppError::NotFound(format!("session {session_id}")))?;
     tx.send(data).await.map_err(|_| AppError::Ssh("session closed".into()))
@@ -299,10 +358,24 @@ pub async fn ssh_resize(
 ) -> AppResult<()> {
     let tx = {
         let map = sessions.0.lock().await;
-        map.get(&session_id).map(|s| s.resize_tx.clone())
+        map.get(&session_id).and_then(|s| s.pty.as_ref()).map(|p| p.resize_tx.clone())
     };
     let tx = tx.ok_or_else(|| AppError::NotFound(format!("session {session_id}")))?;
     tx.send((cols, rows)).await.map_err(|_| AppError::Ssh("session closed".into()))
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn known_hosts_list(known: State<'_, KnownHostsState>) -> AppResult<Vec<crate::ssh::known_hosts::KnownHostEntry>> {
+    let kh = known.0.lock().map_err(|_| AppError::Internal("known_hosts lock poisoned".into()))?;
+    Ok(kh.list())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn known_hosts_forget(known: State<'_, KnownHostsState>, key: String) -> AppResult<()> {
+    let mut kh = known.0.lock().map_err(|_| AppError::Internal("known_hosts lock poisoned".into()))?;
+    kh.forget(&key)
 }
 
 #[tauri::command]
@@ -320,35 +393,125 @@ pub async fn trust_host_key(
     kh.record(&host, port, &fingerprint)
 }
 
+const CLOSED: &str = "The SSH connection closed.";
+
+// A connection without a terminal, for tunnels started where no tab of it is open.
 #[tauri::command]
 #[specta::specta]
-pub async fn ssh_disconnect(
+pub async fn ssh_open_background(
+    app: AppHandle,
+    store: State<'_, StdMutex<Store>>,
+    vault: State<'_, StdMutex<Vault>>,
+    known: State<'_, KnownHostsState>,
     sessions: State<'_, Sessions>,
-    sftps: State<'_, crate::commands::sftp_cmds::SftpSessions>,
-    tunnels: State<'_, crate::commands::tunnel_cmds::Tunnels>,
-    session_id: String,
-) -> AppResult<()> {
-    sftps.0.lock().await.remove(&session_id);
-    {
-        let mut tmap = tunnels.0.lock().await;
-        let ids: Vec<String> = tmap
+    connection_id: String,
+) -> AppResult<String> {
+    let (handle, bastions, remote_forwards) =
+        connect_via_chain(&store, &vault, &known, &connection_id).await?;
+    let handle = Arc::new(handle);
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let (watched, app_task, sid) = (handle.clone(), app.clone(), session_id.clone());
+    // Without a terminal nothing else notices the server going away.
+    let task = tokio::spawn(async move {
+        while !watched.is_closed() {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        close_session(&app_task, &sid, Some(CLOSED), None).await;
+    });
+    sessions.0.lock().await.insert(
+        session_id.clone(),
+        Session { handle, bastions, remote_forwards, pty: None, abort: task.abort_handle() },
+    );
+    let _ = SshStatus::Connected { session_id: session_id.clone() }.emit(&app);
+    Ok(session_id)
+}
+
+pub(crate) async fn is_background(app: &AppHandle, session_id: &str) -> bool {
+    app.state::<Sessions>().0.lock().await.get(session_id).is_some_and(|s| s.pty.is_none())
+}
+
+// Everything a session holds goes with it: its tunnels (each reported stopped, remote forwards
+// cancelled), its cached SFTP channel and the connection. Every way a session ends comes here,
+// so this is where the frontend hears that it did.
+pub(crate) async fn close_session<R: Runtime>(
+    app: &AppHandle<R>,
+    session_id: &str,
+    reason: Option<&str>,
+    exit_code: Option<u32>,
+) {
+    use crate::commands::tunnel_cmds::{end_tunnel, Tunnels};
+    app.state::<crate::commands::sftp_cmds::SftpSessions>().0.lock().await.remove(session_id);
+    let tunnels = app.state::<Tunnels>();
+    let ended: Vec<_> = {
+        let mut running = tunnels.0.lock().await;
+        let ids: Vec<String> = running
             .iter()
             .filter(|(_, h)| h.session_id == session_id)
             .map(|(id, _)| id.clone())
             .collect();
-        for id in ids {
-            if let Some(h) = tmap.remove(&id) {
-                h.abort.abort();
-                if let Ok(conns) = h.conns.lock() {
-                    for c in conns.iter() {
-                        c.abort();
-                    }
-                }
-            }
-        }
+        ids.into_iter().filter_map(|id| running.remove(&id).map(|h| (id, h))).collect()
+    };
+    for (id, h) in ended {
+        end_tunnel(h).await;
+        crate::tunnel::emit_stopped(app, id, reason.map(str::to_string));
     }
-    if let Some(session) = sessions.0.lock().await.remove(&session_id) {
+    // Last, with no await after it: called from the session's own task, the abort ends that task.
+    let sessions = app.state::<Sessions>();
+    let session = sessions.0.lock().await.remove(session_id);
+    if let Some(session) = session {
+        let _ = SshStatus::Disconnected { session_id: session_id.to_string(), exit_code }.emit(app);
         session.abort.abort();
     }
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn ssh_disconnect(app: AppHandle, session_id: String) -> AppResult<()> {
+    close_session(&app, &session_id, Some(CLOSED), None).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc as std_mpsc;
+
+    use tauri::test::MockRuntime;
+    use tauri::Listener;
+
+    use super::*;
+    use crate::commands::sftp_cmds::SftpSessions;
+    use crate::commands::tunnel_cmds::Tunnels;
+    use crate::tunnel::TunnelStatus;
+
+    #[tokio::test]
+    async fn closing_a_session_says_it_disconnected() {
+        let app = tauri::test::mock_app();
+        tauri_specta::Builder::<MockRuntime>::new()
+            .events(tauri_specta::collect_events![SshStatus, TunnelStatus])
+            .mount_events(&app);
+        app.manage(Sessions(Default::default()));
+        app.manage(Tunnels(Default::default()));
+        app.manage(SftpSessions(Default::default()));
+        let (handle, remote_forwards, _server, _opened) = client::testing::session().await;
+        let watcher = tokio::spawn(std::future::pending::<()>());
+        let session = Session {
+            handle: Arc::new(handle),
+            bastions: Vec::new(),
+            remote_forwards,
+            pty: None,
+            abort: watcher.abort_handle(),
+        };
+        app.state::<Sessions>().0.lock().await.insert("bg".into(), session);
+        let (tx, rx) = std_mpsc::channel();
+        app.listen_any("ssh-status", move |e| tx.send(e.payload().to_string()).unwrap());
+
+        close_session(app.handle(), "bg", None, None).await;
+        let sent: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(sent, serde_json::json!({ "state": "disconnected", "sessionId": "bg", "exitCode": null }));
+        assert!(app.state::<Sessions>().0.lock().await.is_empty());
+
+        // A session already gone says nothing more.
+        close_session(app.handle(), "bg", None, None).await;
+        assert!(rx.try_recv().is_err());
+    }
 }

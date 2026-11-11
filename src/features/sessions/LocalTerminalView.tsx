@@ -1,25 +1,38 @@
-import { useCallback, useEffect, useMemo, useRef } from 'react'
+import { Search } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { closeLocal, openLocal, resizeLocal, writeLocal } from '@/lib/local'
 import { useSessionStore } from '@/stores/sessionStore'
 import { appearanceOf, useSettingsStore } from '@/stores/settingsStore'
-import { TerminalView } from './TerminalView'
+import { useThemeStore } from '@/stores/themeStore'
+import { typeInto } from './broadcast'
+import { BroadcastButton, PaneFrame, PaneHeader, paneButton } from './PaneHeader'
+import { isFindChord, TerminalSearchBox } from './TerminalSearchBox'
+import { type TerminalSearch, TerminalView } from './TerminalView'
+import { pasteAsks } from './tabHosts'
 
 export function LocalTerminalView({
   tabId,
+  paneId,
   program = null,
+  startFolder = null,
 }: {
   tabId: string
+  paneId: string
   program?: string | null
+  startFolder?: string | null
 }) {
   const raw = useSettingsStore((s) => s.settings)
-  const zoom = useSessionStore((s) => {
-    const t = s.tabs.find((tab) => tab.id === tabId)
-    return t?.kind === 'local' ? (t.zoom ?? 0) : 0
-  })
+  const userThemes = useThemeStore((s) => s.userThemes)
+  const schemes = useThemeStore((s) => s.schemes)
+  const zoom = useSessionStore((s) => s.panes[paneId]?.zoom ?? 0)
+  // biome-ignore lint/correctness/useExhaustiveDependencies: themes and schemes change what the colour ids resolve to
   const settings = useMemo(() => {
     const base = appearanceOf(raw)
     return zoom ? { ...base, fontSize: Math.max(6, base.fontSize + zoom) } : base
-  }, [raw, zoom])
+  }, [raw, zoom, userThemes, schemes])
+  const setZoom = useSessionStore((s) => s.setZoom)
+  const [showSearch, setShowSearch] = useState(false)
+  const searchRef = useRef<TerminalSearch | null>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
   const writeRef = useRef<((data: Uint8Array) => void) | null>(null)
   const idRef = useRef<string | null>(null)
@@ -28,9 +41,17 @@ export function LocalTerminalView({
   const bindWrite = useCallback((write: (data: Uint8Array) => void) => {
     writeRef.current = write
   }, [])
-  const onData = useCallback((data: string) => {
-    if (idRef.current) writeLocal(idRef.current, data)
+  const askBeforePaste = useCallback(() => pasteAsks(paneId), [paneId])
+  const bindSearch = useCallback((api: TerminalSearch | null) => {
+    searchRef.current = api
   }, [])
+  const onData = useCallback(
+    (data: string) => {
+      if (typeInto(paneId, data)) return
+      if (idRef.current) writeLocal(idRef.current, data)
+    },
+    [paneId],
+  )
   const onResize = useCallback((cols: number, rows: number) => {
     sizeRef.current = { cols, rows }
     if (idRef.current) resizeLocal(idRef.current, cols, rows)
@@ -38,7 +59,7 @@ export function LocalTerminalView({
 
   useEffect(() => {
     let disposed = false
-    openLocal(program, sizeRef.current.cols, sizeRef.current.rows, (bytes) =>
+    openLocal(program, startFolder, sizeRef.current.cols, sizeRef.current.rows, (bytes) =>
       writeRef.current?.(bytes),
     )
       .then((id) => {
@@ -47,15 +68,26 @@ export function LocalTerminalView({
           return
         }
         idRef.current = id
+        useSessionStore.getState().setLocalId(paneId, id)
+        useSessionStore.getState().setStatus(paneId, 'connected')
       })
-      .catch(() => {})
+      // The shell never started (a start folder that's gone, say): say why in the empty terminal.
+      .catch((e: unknown) => {
+        if (disposed) return
+        useSessionStore.getState().setStatus(paneId, 'error')
+        const message = e instanceof Error ? e.message : String(e)
+        writeRef.current?.(new TextEncoder().encode(`${message}\r\n`))
+      })
     return () => {
       disposed = true
       if (idRef.current) closeLocal(idRef.current)
+      // A resize can still arrive before the next shell opens; it must not reach the closed one.
+      idRef.current = null
+      useSessionStore.getState().setLocalId(paneId, null)
     }
-  }, [program])
+  }, [paneId, program, startFolder])
 
-  // Non-passive so Ctrl+wheel zooms this tab instead of the whole webview.
+  // Non-passive so Ctrl+wheel zooms this pane instead of the whole webview.
   useEffect(() => {
     const el = wrapRef.current
     if (!el) return
@@ -63,17 +95,59 @@ export function LocalTerminalView({
       if (!ev.ctrlKey || ev.deltaY === 0) return
       ev.preventDefault()
       const st = useSessionStore.getState()
-      const t = st.tabs.find((tab) => tab.id === tabId)
-      const cur = t?.kind === 'local' ? (t.zoom ?? 0) : 0
-      st.setLocalZoom(tabId, cur + (ev.deltaY < 0 ? 1 : -1))
+      st.setZoom(paneId, (st.panes[paneId]?.zoom ?? 0) + (ev.deltaY < 0 ? 1 : -1))
     }
     el.addEventListener('wheel', onWheel, { passive: false })
     return () => el.removeEventListener('wheel', onWheel)
-  }, [tabId])
+  }, [paneId])
+
+  const closeSearch = () => {
+    setShowSearch(false)
+    searchRef.current?.clear()
+  }
 
   return (
-    <div ref={wrapRef} className="h-full w-full bg-background p-1">
-      <TerminalView onData={onData} onResize={onResize} bindWrite={bindWrite} settings={settings} />
-    </div>
+    <PaneFrame
+      tabId={tabId}
+      paneId={paneId}
+      onKeyDownCapture={(ev) => {
+        if (!isFindChord(ev)) return
+        ev.preventDefault()
+        ev.stopPropagation()
+        setShowSearch(true)
+      }}
+    >
+      <PaneHeader tabId={tabId} paneId={paneId}>
+        {zoom !== 0 && (
+          <button
+            type="button"
+            onClick={() => setZoom(paneId, 0)}
+            className="rounded px-1 text-muted-foreground text-xs hover:bg-muted"
+          >
+            {zoom > 0 ? `+${zoom}` : zoom}
+          </button>
+        )}
+        <BroadcastButton tabId={tabId} />
+        <button
+          type="button"
+          aria-label="Search terminal"
+          onClick={() => setShowSearch((v) => !v)}
+          className={paneButton}
+        >
+          <Search className="size-4" />
+        </button>
+      </PaneHeader>
+      <div ref={wrapRef} className="relative min-h-0 flex-1 bg-background p-1">
+        <TerminalView
+          onData={onData}
+          onResize={onResize}
+          bindWrite={bindWrite}
+          bindSearch={bindSearch}
+          settings={settings}
+          askBeforePaste={askBeforePaste}
+        />
+        {showSearch && <TerminalSearchBox search={searchRef} onClose={closeSearch} />}
+      </div>
+    </PaneFrame>
   )
 }

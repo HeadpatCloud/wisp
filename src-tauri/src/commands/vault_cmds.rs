@@ -17,6 +17,27 @@ pub fn vault_status(vault: State<'_, Mutex<Vault>>) -> AppResult<VaultStatus> {
     Ok(vault.lock().map_err(|_| poisoned())?.status())
 }
 
+// Whether the vault key comes from a master password rather than the system keychain.
+#[tauri::command]
+#[specta::specta]
+pub fn vault_uses_password(vault: State<'_, Mutex<Vault>>) -> AppResult<bool> {
+    Ok(vault.lock().map_err(|_| poisoned())?.uses_password())
+}
+
+// Whether the unlock dialog may offer to go on without the master password (a vault 0.5.0
+// switched back to the keychain).
+#[tauri::command]
+#[specta::specta]
+pub fn vault_can_skip_password(vault: State<'_, Mutex<Vault>>) -> AppResult<bool> {
+    Ok(vault.lock().map_err(|_| poisoned())?.can_skip_password())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn vault_skip_password(vault: State<'_, Mutex<Vault>>) -> AppResult<()> {
+    vault.lock().map_err(|_| poisoned())?.skip_password()
+}
+
 #[tauri::command]
 #[specta::specta]
 pub fn set_secret(vault: State<'_, Mutex<Vault>>, value: String) -> AppResult<String> {

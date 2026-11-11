@@ -27,6 +27,12 @@ export async function connectFtp(
   return res.data
 }
 
+export async function connectFtpSaved(connectionId: string): Promise<string> {
+  const res = await commands.ftpConnectSaved(connectionId)
+  if (res.status === 'error') throw res.error
+  return res.data
+}
+
 export const disconnectFtp = async (sid: string): Promise<void> => {
   unwrap(await commands.ftpDisconnect(sid))
 }

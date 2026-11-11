@@ -13,6 +13,7 @@ use crate::commands::ssh_cmds::{self, KnownHostsState, Sessions};
 use crate::error::{AppError, AppResult};
 use crate::sftp::{self, transfer, Sftp, SftpEntry};
 use crate::ssh::client::SshHandle;
+use crate::store::hosts::SftpTarget;
 use crate::store::model::{AuthMethod, ProfileKey};
 use crate::store::Store;
 use crate::vault::Vault;
@@ -99,31 +100,37 @@ async fn open_standalone(ctx: &Ctx<'_>, id: &str, reconnect: Reconnect) -> AppRe
                 ssh_cmds::connect_via_chain(ctx.store, ctx.vault, ctx.known, profile_id).await?;
             (handle, bastions)
         }
-        Reconnect::Saved(profile_id) => {
-            let profile = {
+        Reconnect::Saved(connection_id) => {
+            let target = {
                 let s =
                     ctx.store.lock().map_err(|_| AppError::Internal("store lock poisoned".into()))?;
-                s.sftp_profiles()
-                    .into_iter()
-                    .find(|p| &p.id == profile_id)
-                    .ok_or_else(|| AppError::NotFound(format!("sftp profile {profile_id}")))?
+                s.hosts().sftp_target(connection_id)?
             };
-            let secret = match &profile.secret_id {
-                Some(id) => Some(ssh_cmds::secret_string(ctx.vault, id)?),
-                None => None,
-            };
-            let resolved = ssh_cmds::resolve_keys(ctx.vault, &profile.keys)?;
-            let handle = ssh_cmds::connect_adhoc(
-                ctx.known,
-                &profile.host,
-                profile.port,
-                &profile.username,
-                profile.auth_method,
-                &resolved,
-                secret,
-            )
-            .await?;
-            (handle, Vec::new())
+            match target {
+                SftpTarget::ViaSsh(ssh_id) => {
+                    let (handle, bastions, _forwards) =
+                        ssh_cmds::connect_via_chain(ctx.store, ctx.vault, ctx.known, &ssh_id).await?;
+                    (handle, bastions)
+                }
+                SftpTarget::Own { host, port, username, auth_method, keys, secret_id } => {
+                    let secret = match &secret_id {
+                        Some(id) => Some(ssh_cmds::secret_string(ctx.vault, id)?),
+                        None => None,
+                    };
+                    let resolved = ssh_cmds::resolve_keys(ctx.vault, &keys)?;
+                    let handle = ssh_cmds::connect_adhoc(
+                        ctx.known,
+                        &host,
+                        port,
+                        &username,
+                        auth_method,
+                        &resolved,
+                        secret,
+                    )
+                    .await?;
+                    (handle, Vec::new())
+                }
+            }
         }
         Reconnect::Adhoc { host, port, username, auth_method, keys, secret_id } => {
             // Passwords and key passphrases live in the vault; the caller only holds references.
@@ -762,7 +769,7 @@ f0GsSG2Fq+0yfaqqx4M4AAAAAAECAwQF
             known.record("127.0.0.1", proxy.port, &fingerprint).unwrap();
             std::fs::write(dir.path().join("id_ed25519"), KEY).unwrap();
             Self {
-                store: StdMutex::new(Store::load(dir.path().to_path_buf()).unwrap()),
+                store: StdMutex::new(Store::load(dir.path().to_path_buf(), &[]).unwrap()),
                 vault: StdMutex::new(
                     Vault::open_with_key(dir.path().join("vault.enc"), Zeroizing::new([7u8; 32]))
                         .unwrap(),
@@ -824,8 +831,10 @@ f0GsSG2Fq+0yfaqqx4M4AAAAAAECAwQF
                 handle: Arc::new(handle),
                 bastions: Vec::new(),
                 remote_forwards: client::new_forwards(),
-                input_tx: tokio::sync::mpsc::channel(1).0,
-                resize_tx: tokio::sync::mpsc::channel(1).0,
+                pty: Some(ssh_cmds::PtyIo {
+                    input_tx: tokio::sync::mpsc::channel(1).0,
+                    resize_tx: tokio::sync::mpsc::channel(1).0,
+                }),
                 abort: tokio::spawn(async {}).abort_handle(),
             };
             self.sessions.0.lock().await.insert("term".into(), session);

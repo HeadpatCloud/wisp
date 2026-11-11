@@ -5,11 +5,9 @@ import { WebglAddon } from '@xterm/addon-webgl'
 import { Terminal } from '@xterm/xterm'
 import '@xterm/xterm/css/xterm.css'
 import { useEffect, useRef } from 'react'
-import {
-  type AppearanceSettings,
-  applyTerminalSettings,
-  resolveTerminalTheme,
-} from './terminalTheme'
+import { guardedPaste } from '@/lib/tagRules'
+import { confirm } from '@/stores/confirmStore'
+import { type AppearanceSettings, applyTerminalSettings } from './terminalTheme'
 
 export interface TerminalSearch {
   findNext: (query: string) => void
@@ -25,6 +23,15 @@ interface TerminalViewProps {
   settings: AppearanceSettings
   copyOnSelect?: boolean
   rightClickPaste?: boolean
+  // Asked at paste time: whether text of several lines waits for the user (a tag rule).
+  askBeforePaste?: () => boolean
+}
+
+// Long pastes show their start; the rest is counted.
+function shownLines(text: string): string {
+  const lines = text.split(/\r\n|\r|\n/)
+  const head = lines.slice(0, 12).join('\n')
+  return lines.length > 12 ? `${head}\n… and ${lines.length - 12} more lines` : head
 }
 
 export function TerminalView({
@@ -35,6 +42,7 @@ export function TerminalView({
   settings,
   copyOnSelect,
   rightClickPaste,
+  askBeforePaste,
 }: TerminalViewProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
@@ -45,6 +53,8 @@ export function TerminalView({
   copyRef.current = copyOnSelect
   const pasteRef = useRef(rightClickPaste)
   pasteRef.current = rightClickPaste
+  const askRef = useRef(askBeforePaste)
+  askRef.current = askBeforePaste
 
   useEffect(() => {
     if (termRef.current || !containerRef.current) return
@@ -59,7 +69,7 @@ export function TerminalView({
       cursorStyle: s.cursorStyle,
       cursorBlink: s.cursorBlink,
       scrollback: s.scrollback,
-      theme: { ...resolveTerminalTheme(s.theme, s.colorScheme) },
+      theme: { ...s.colors },
     })
     termRef.current = term
 
@@ -86,15 +96,41 @@ export function TerminalView({
     })
     // term.paste applies bracketed-paste framing and CRLF normalization; feeding onData
     // directly would send raw text the remote program can't distinguish from typing.
+    // Every paste comes through here, so a tag that asks first sees each one.
+    const paste = (text: string) =>
+      guardedPaste(
+        text,
+        askRef.current?.() ?? false,
+        (lines) =>
+          confirm({
+            title: 'Paste these lines?',
+            body: term.modes.bracketedPasteMode
+              ? shownLines(lines)
+              : `${shownLines(lines)}\n\nEach line runs as soon as it lands.`,
+            confirmLabel: 'Paste',
+          }),
+        (t) => term.paste(t),
+      )
     const onContextMenu = (ev: MouseEvent) => {
       if (!pasteRef.current) return
       ev.preventDefault()
       navigator.clipboard
         .readText()
-        .then((text) => text && term.paste(text))
+        .then((text) => {
+          if (text) void paste(text)
+        })
         .catch(() => {})
     }
+    // Ctrl+Shift+V and Shift+Insert reach xterm as a paste event on its textarea.
+    const onPaste = (ev: ClipboardEvent) => {
+      const text = ev.clipboardData?.getData('text/plain')
+      if (!text || !askRef.current?.()) return
+      ev.preventDefault()
+      ev.stopPropagation()
+      void paste(text)
+    }
     container.addEventListener('contextmenu', onContextMenu)
+    container.addEventListener('paste', onPaste, true)
     bindWrite((data) => term.write(data))
     bindSearch?.({
       findNext: (q) => search.findNext(q),
@@ -118,6 +154,7 @@ export function TerminalView({
     return () => {
       ro.disconnect()
       container.removeEventListener('contextmenu', onContextMenu)
+      container.removeEventListener('paste', onPaste, true)
       dataSub.dispose()
       resizeSub.dispose()
       selectionSub.dispose()

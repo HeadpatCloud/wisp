@@ -61,11 +61,8 @@ export function cachedTheme(): AppTheme {
   return v === 'light' || v === 'dark' || v === 'system' ? v : 'system'
 }
 
-export function watchSystemTheme(getTheme: () => AppTheme): () => void {
+export function watchSystemTheme(onChange: () => void): () => void {
   const mql = window.matchMedia('(prefers-color-scheme: dark)')
-  const onChange = () => {
-    if (getTheme() === 'system') applyAppTheme('system')
-  }
   mql.addEventListener('change', onChange)
   return () => mql.removeEventListener('change', onChange)
 }

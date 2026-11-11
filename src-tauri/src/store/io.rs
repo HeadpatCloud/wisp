@@ -24,6 +24,14 @@ pub fn read_json<T: DeserializeOwned + Default>(path: &Path) -> AppResult<T> {
     }
 }
 
+// For files that must never be moved or rewritten, such as the 0.5.0 profiles.json.
+pub fn read_json_strict<T: DeserializeOwned>(path: &Path) -> AppResult<Option<T>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_slice(&std::fs::read(path)?)?))
+}
+
 pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> AppResult<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

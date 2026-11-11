@@ -2,6 +2,8 @@
 @import "tw-animate-css";
 
 @custom-variant dark (&:is(.dark *));
+/* The Density setting: <html data-density="compact"> tightens cards, rows and tabs. */
+@custom-variant compact (&:is([data-density="compact"] *));
 
 :root {
   /* One hue tints the whole neutral UI palette; the Background setting overrides it inline. */
@@ -26,6 +28,16 @@
   --input: oklch(0.9 0.012 var(--ui-hue));
   --ring: oklch(0.6 0.118 180);
   --sidebar: oklch(0.975 0.015 var(--ui-hue));
+  /* Named colours for tags and hosts; mid lightness so they read on light and dark themes. */
+  --tag-red: oklch(0.63 0.2 25);
+  --tag-orange: oklch(0.7 0.16 55);
+  --tag-amber: oklch(0.78 0.15 85);
+  --tag-green: oklch(0.66 0.15 150);
+  --tag-teal: oklch(0.67 0.11 190);
+  --tag-blue: oklch(0.62 0.15 255);
+  --tag-purple: oklch(0.6 0.17 300);
+  --tag-pink: oklch(0.68 0.17 350);
+  --tag-grey: oklch(0.6 0.01 260);
 }
 
 .dark {
@@ -72,6 +84,33 @@
   --color-input: var(--input);
   --color-ring: var(--ring);
   --color-sidebar: var(--sidebar);
+  --color-tag-red: var(--tag-red);
+  --color-tag-orange: var(--tag-orange);
+  --color-tag-amber: var(--tag-amber);
+  --color-tag-green: var(--tag-green);
+  --color-tag-teal: var(--tag-teal);
+  --color-tag-blue: var(--tag-blue);
+  --color-tag-purple: var(--tag-purple);
+  --color-tag-pink: var(--tag-pink);
+  --color-tag-grey: var(--tag-grey);
+}
+
+/* The time a notice has left; it runs as long as the notice store's 8 s timer and pauses with it. */
+@theme {
+  --animate-notice: notice-time 8s linear forwards;
+
+  @keyframes notice-time {
+    from {
+      width: 100%;
+    }
+    to {
+      width: 0;
+    }
+  }
+}
+
+@utility paused {
+  animation-play-state: paused;
 }
 
 body {

@@ -14,7 +14,7 @@ import { unwrap } from '@/lib/ipc'
 const filters = [{ name: 'JSON', extensions: ['json'] }]
 
 export async function pickExportPath(): Promise<string | null> {
-  return (await save({ defaultPath: 'wisp-profiles.json', filters })) ?? null
+  return (await save({ defaultPath: 'wisp-hosts.json', filters })) ?? null
 }
 
 export async function pickImportPath(): Promise<string | null> {

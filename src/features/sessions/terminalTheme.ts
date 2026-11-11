@@ -1,6 +1,5 @@
 import type { FitAddon } from '@xterm/addon-fit'
 import type { FontWeight, ITheme, Terminal } from '@xterm/xterm'
-import { type AppTheme, resolveDark } from '@/lib/theme'
 
 export const DARK_THEME: ITheme = {
   background: '#1e1e2e',
@@ -50,7 +49,7 @@ export const LIGHT_THEME: ITheme = {
   brightWhite: '#bcc0cc',
 }
 
-const DRACULA: ITheme = {
+export const DRACULA: ITheme = {
   background: '#282a36',
   foreground: '#f8f8f2',
   cursor: '#f8f8f2',
@@ -73,7 +72,7 @@ const DRACULA: ITheme = {
   brightWhite: '#ffffff',
 }
 
-const NORD: ITheme = {
+export const NORD: ITheme = {
   background: '#2e3440',
   foreground: '#d8dee9',
   cursor: '#d8dee9',
@@ -96,7 +95,7 @@ const NORD: ITheme = {
   brightWhite: '#eceff4',
 }
 
-const GRUVBOX: ITheme = {
+export const GRUVBOX: ITheme = {
   background: '#282828',
   foreground: '#ebdbb2',
   cursor: '#ebdbb2',
@@ -119,27 +118,16 @@ const GRUVBOX: ITheme = {
   brightWhite: '#ebdbb2',
 }
 
-// "default" follows the app light/dark theme; named schemes are fixed palettes.
+// "default" takes the active theme's terminal colours; named schemes are fixed palettes.
 export const COLOR_SCHEMES: { value: string; label: string }[] = [
-  { value: 'default', label: 'Default (Catppuccin)' },
+  { value: 'default', label: 'From the theme' },
   { value: 'dracula', label: 'Dracula' },
   { value: 'nord', label: 'Nord' },
   { value: 'gruvbox', label: 'Gruvbox' },
 ]
 
-const FIXED_SCHEMES: Record<string, ITheme> = {
-  dracula: DRACULA,
-  nord: NORD,
-  gruvbox: GRUVBOX,
-}
-
-export function resolveTerminalTheme(theme: AppTheme, colorScheme: string): ITheme {
-  return FIXED_SCHEMES[colorScheme] ?? (resolveDark(theme) ? DARK_THEME : LIGHT_THEME)
-}
-
 export interface AppearanceSettings {
-  theme: AppTheme
-  colorScheme: string
+  colors: ITheme
   fontFamily: string
   fontSize: number
   fontWeight: string
@@ -160,7 +148,7 @@ export function applyTerminalSettings(term: Terminal, fit: FitAddon, s: Appearan
     term.options.lineHeight !== s.lineHeight ||
     term.options.letterSpacing !== s.letterSpacing
   // Assign a NEW theme object - xterm uses reference comparison to detect changes.
-  term.options.theme = { ...resolveTerminalTheme(s.theme, s.colorScheme) }
+  term.options.theme = { ...s.colors }
   term.options.fontFamily = s.fontFamily
   term.options.fontSize = s.fontSize
   term.options.fontWeight = s.fontWeight as FontWeight

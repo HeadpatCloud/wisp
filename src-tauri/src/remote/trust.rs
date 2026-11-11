@@ -1,5 +1,3 @@
-use std::net::IpAddr;
-
 use sha2::{Digest, Sha256};
 
 use crate::commands::ssh_cmds::KnownHostsState;
@@ -32,15 +30,7 @@ fn lookup(
         Scheme::Rdg => "rdg/",
     };
     // One key for every spelling of a host: a pin must not depend on how the host was typed.
-    let host = crate::net::normalize_host(host);
-    let host = match host.parse::<IpAddr>() {
-        Ok(address) => address.to_string(),
-        Err(_) => {
-            let name = host.to_ascii_lowercase();
-            name.strip_suffix('.').unwrap_or(&name).to_string()
-        }
-    };
-    let host = format!("{prefix}{host}");
+    let host = format!("{prefix}{}", crate::net::address_key(host));
     let verdict = {
         let kh = known
             .0

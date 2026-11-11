@@ -1,32 +1,43 @@
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, expect, test, vi } from 'vitest'
-import { useProfileStore } from '@/stores/profileStore'
+import type { Host } from '@/bindings'
+import { useHostStore } from '@/stores/hostStore'
 import { SftpConnectDialog } from './SftpConnectDialog'
 
-const profile = (id: string, name: string, host: string) =>
-  ({
-    id,
-    name,
-    host,
-    groupId: null,
-    port: 22,
-    username: 'u',
-    authMethod: 'agent',
-    keyPath: null,
-    secretId: null,
-    icon: { kind: 'builtin', name: 'server' },
-    order: 0,
-    jumpHostId: null,
-    tunnels: [],
-  }) as never
+const host = (id: string, name: string, address: string): Host => ({
+  id: `h-${id}`,
+  name,
+  address,
+  folderId: null,
+  color: null,
+  order: 0,
+  connections: [
+    {
+      id,
+      label: null,
+      address: null,
+      kind: {
+        type: 'ssh',
+        port: 22,
+        login: { kind: 'own', username: 'u', authMethod: 'agent', keyIds: [], secretId: null },
+        jumpHostId: null,
+        tunnels: [],
+        appearance: null,
+      },
+    },
+  ],
+})
 
 beforeEach(() => {
-  useProfileStore.setState({
-    profiles: [profile('p1', 'web-01', '10.0.0.1'), profile('p2', 'db-02', '10.0.0.2')],
-    groups: [],
+  useHostStore.setState({
+    hosts: [host('p1', 'web-01', '10.0.0.1'), host('p2', 'db-02', '10.0.0.2')],
+    folders: [],
+    logins: [],
+    keys: [],
+    tags: [],
     loaded: true,
-  } as never)
+  })
 })
 
 test('filters hosts by query and picks one', async () => {

@@ -20,21 +20,45 @@ pub struct Vault {
     path: PathBuf,
     file: VaultFile,
     key: Option<Zeroizing<[u8; 32]>>,
+    // The keychain key of a master-password vault 0.5.0 marked as keychain again. What 0.5.0
+    // saved meanwhile is sealed with it, and moves under the master password at unlock.
+    keychain_key: Option<Zeroizing<[u8; 32]>>,
 }
 
 impl Vault {
     #[cfg(test)]
     pub fn open_with_key(path: PathBuf, key: Zeroizing<[u8; 32]>) -> AppResult<Self> {
         let file: VaultFile = io::read_json(&path)?;
-        Ok(Self { path, file, key: Some(key) })
+        Ok(Self { path, file, key: Some(key), keychain_key: None })
     }
 
     pub fn open_from_keychain(path: PathBuf) -> AppResult<Self> {
+        Self::open_with(path, load_or_create_keychain_key)
+    }
+
+    // A vault under a master password stays under it: the keychain may still hold the key from
+    // before the password was set, and that key no longer opens anything.
+    pub fn open_with(
+        path: PathBuf,
+        keychain: impl FnOnce() -> AppResult<Zeroizing<[u8; 32]>>,
+    ) -> AppResult<Self> {
         let mut file: VaultFile = io::read_json(&path)?;
-        let key = load_or_create_keychain_key()?;
+        if file.key_source == KeySource::Password {
+            return Self::open_locked(path);
+        }
+        let key = keychain()?;
+        // Only a master password sets a verifier, so one the keychain key doesn't open means
+        // 0.5.0 marked this vault as keychain at its start. The file is fixed at unlock, once the
+        // secrets 0.5.0 saved meanwhile are moved over, so quitting before that loses nothing.
+        if let Some(verifier) = &file.verifier {
+            if !verify_against(&key, verifier)? {
+                file.key_source = KeySource::Password;
+                return Ok(Self { path, file, key: None, keychain_key: Some(key) });
+            }
+        }
         let changed = file.key_source != KeySource::Keychain;
         file.key_source = KeySource::Keychain;
-        let vault = Self { path, file, key: Some(key) };
+        let vault = Self { path, file, key: Some(key), keychain_key: None };
         if changed {
             vault.persist()?;
         }
@@ -50,11 +74,34 @@ impl Vault {
         if file.kdf_salt.is_none() {
             file.kdf_salt = Some(STANDARD.encode(crypto::random_bytes::<16>()?));
         }
-        let vault = Self { path, file, key: None };
+        let vault = Self { path, file, key: None, keychain_key: None };
         if changed {
             vault.persist()?;
         }
         Ok(vault)
+    }
+
+    pub fn uses_password(&self) -> bool {
+        self.file.key_source == KeySource::Password
+    }
+
+    // Only a vault 0.5.0 marked as keychain again: 0.5.0 never asked for its password after
+    // that, so the user may no longer know it.
+    pub fn can_skip_password(&self) -> bool {
+        self.keychain_key.is_some()
+    }
+
+    // Goes on with the keychain key, as 0.5.0 ran: what 0.5.0 saved since reads, what the master
+    // password sealed stays unreadable, and without the verifier the password isn't asked again.
+    pub fn skip_password(&mut self) -> AppResult<()> {
+        let key = self
+            .keychain_key
+            .take()
+            .ok_or_else(|| AppError::Vault("the vault needs its master password".into()))?;
+        self.file.key_source = KeySource::Keychain;
+        self.file.verifier = None;
+        self.key = Some(key);
+        self.persist()
     }
 
     pub fn status(&self) -> VaultStatus {
@@ -97,6 +144,23 @@ impl Vault {
         } else if let Some(sealed) = self.file.secrets.values().next() {
             let (nonce, ciphertext) = decode_sealed(sealed)?;
             crypto::open(&key, &nonce, &ciphertext).map_err(|_| AppError::WrongPassphrase)?;
+        }
+
+        if let Some(keychain_key) = self.keychain_key.take() {
+            for sealed in self.file.secrets.values_mut() {
+                let (nonce, ciphertext) = decode_sealed(sealed)?;
+                if crypto::open(&key, &nonce, &ciphertext).is_ok() {
+                    continue;
+                }
+                if let Ok(plaintext) = crypto::open(&keychain_key, &nonce, &ciphertext) {
+                    let (nonce, ciphertext) = crypto::seal(&key, &plaintext)?;
+                    *sealed = SealedSecret {
+                        nonce: STANDARD.encode(nonce),
+                        ciphertext: STANDARD.encode(ciphertext),
+                    };
+                }
+            }
+            self.persist()?;
         }
 
         if self.file.verifier.is_none() {
@@ -144,6 +208,13 @@ impl Vault {
     }
 
     fn persist(&self) -> AppResult<()> {
+        // Until unlock has moved 0.5.0's secrets over, the file keeps saying keychain, so the
+        // next start still finds them.
+        if self.keychain_key.is_some() {
+            let mut file = self.file.clone();
+            file.key_source = KeySource::Keychain;
+            return io::write_json_atomic(&self.path, &file);
+        }
         io::write_json_atomic(&self.path, &self.file)
     }
 
@@ -347,6 +418,101 @@ mod tests {
         assert!(matches!(v2.unlock("wrong"), Err(AppError::WrongPassphrase)));
         v2.unlock("first").unwrap();
         assert_eq!(v2.status(), VaultStatus::Unlocked);
+    }
+
+    #[test]
+    fn a_password_vault_stays_locked_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let keychain = || Ok(Zeroizing::new([7u8; 32]));
+        let mut v = Vault::open_with(path.clone(), keychain).unwrap();
+        let id = v.set_secret(b"hunter2").unwrap();
+        v.change_master_password("master").unwrap();
+        drop(v);
+
+        // The keychain entry is still there, as it is after "Set master password".
+        let mut v = Vault::open_with(path.clone(), keychain).unwrap();
+        assert_eq!(v.status(), VaultStatus::NeedsPassword);
+        assert!(v.uses_password());
+        let on_disk: VaultFile = io::read_json(&path).unwrap();
+        assert_eq!(on_disk.key_source, KeySource::Password);
+        v.unlock("master").unwrap();
+        assert_eq!(&*v.get_secret(&id).unwrap(), b"hunter2");
+    }
+
+    // A master-password vault as 0.5.0 leaves it: marked keychain again at its next start, with
+    // what it saved meanwhile sealed with the keychain key ([7; 32]). Returns two secrets sealed
+    // with the master password ("master") and the one 0.5.0 saved.
+    fn flipped_by_0_5_0(path: &std::path::Path) -> (String, String, String) {
+        let keychain = || Ok(Zeroizing::new([7u8; 32]));
+        let mut v = Vault::open_with(path.to_path_buf(), keychain).unwrap();
+        let old = v.set_secret(b"hunter2").unwrap();
+        let other = v.set_secret(b"deleted-host").unwrap();
+        v.change_master_password("master").unwrap();
+        drop(v);
+        let mut file: VaultFile = io::read_json(path).unwrap();
+        file.key_source = KeySource::Keychain;
+        io::write_json_atomic(path, &file).unwrap();
+        let mut v = Vault::open_with_key(path.to_path_buf(), Zeroizing::new([7u8; 32])).unwrap();
+        let new = v.set_secret(b"typed-in-0.5.0").unwrap();
+        (old, other, new)
+    }
+
+    #[test]
+    fn a_forgotten_master_password_can_be_left_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let keychain = || Ok(Zeroizing::new([7u8; 32]));
+        let (old, _, new) = flipped_by_0_5_0(&path);
+
+        let mut v = Vault::open_with(path.clone(), keychain).unwrap();
+        assert!(v.can_skip_password());
+        v.skip_password().unwrap();
+        assert_eq!(v.status(), VaultStatus::Unlocked);
+        assert_eq!(&*v.get_secret(&new).unwrap(), b"typed-in-0.5.0");
+        assert!(v.get_secret(&old).is_err());
+        drop(v);
+
+        // Not asked again, as in 0.5.0.
+        let v = Vault::open_with(path.clone(), keychain).unwrap();
+        assert_eq!(v.status(), VaultStatus::Unlocked);
+        assert_eq!(&*v.get_secret(&new).unwrap(), b"typed-in-0.5.0");
+
+        // A vault properly under its master password offers no way around it.
+        let other = dir.path().join("other.enc");
+        let mut v = Vault::open_with(other.clone(), keychain).unwrap();
+        v.change_master_password("master").unwrap();
+        drop(v);
+        let mut v = Vault::open_with(other, keychain).unwrap();
+        assert!(!v.can_skip_password());
+        assert!(v.skip_password().is_err());
+        assert_eq!(v.status(), VaultStatus::NeedsPassword);
+    }
+
+    #[test]
+    fn a_vault_0_5_0_marked_keychain_again_asks_for_the_master_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        let keychain = || Ok(Zeroizing::new([7u8; 32]));
+        let (old, purged, new) = flipped_by_0_5_0(&path);
+
+        // The purge of left-over deletes writes the file before anyone unlocks, then Wisp quits.
+        let mut v = Vault::open_with(path.clone(), keychain).unwrap();
+        assert_eq!(v.status(), VaultStatus::NeedsPassword);
+        v.delete_secret(&purged).unwrap();
+        drop(v);
+
+        let mut v = Vault::open_with(path.clone(), keychain).unwrap();
+        assert_eq!(v.status(), VaultStatus::NeedsPassword);
+        v.unlock("master").unwrap();
+        assert_eq!(&*v.get_secret(&old).unwrap(), b"hunter2");
+        assert_eq!(&*v.get_secret(&new).unwrap(), b"typed-in-0.5.0");
+        drop(v);
+
+        // Whole again: the next start needs only the master password.
+        let mut v = Vault::open_with(path.clone(), || Ok(Zeroizing::new([1u8; 32]))).unwrap();
+        v.unlock("master").unwrap();
+        assert_eq!(&*v.get_secret(&new).unwrap(), b"typed-in-0.5.0");
     }
 
     #[test]

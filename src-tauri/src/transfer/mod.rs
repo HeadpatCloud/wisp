@@ -107,12 +107,8 @@ impl Env for MapEnv {
 #[derive(Debug, Clone, Default, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportSelection {
-    pub group_ids: Vec<String>,
-    pub profile_ids: Vec<String>,
-    pub sftp_ids: Vec<String>,
-    pub s3_ids: Vec<String>,
-    pub vnc_ids: Vec<String>,
-    pub rdp_ids: Vec<String>,
+    pub folder_ids: Vec<String>,
+    pub host_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Type)]
@@ -125,7 +121,8 @@ pub struct ExportOptions {
 #[derive(Debug, Clone, Serialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportSummary {
-    pub profiles: u32,
+    pub hosts: u32,
+    pub connections: u32,
     pub secrets: u32,
     pub key_files: u32,
     pub warnings: Vec<String>,
@@ -134,23 +131,23 @@ pub struct ExportSummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub enum ItemKind {
-    Group,
-    Ssh,
-    Sftp,
-    S3,
-    Vnc,
-    Rdp,
+    Folder,
+    Host,
+    Connection,
+    Login,
+    Key,
+    Tag,
 }
 
 impl ItemKind {
     pub fn key(self, id: &str) -> String {
         let prefix = match self {
-            ItemKind::Group => "group",
-            ItemKind::Ssh => "ssh",
-            ItemKind::Sftp => "sftp",
-            ItemKind::S3 => "s3",
-            ItemKind::Vnc => "vnc",
-            ItemKind::Rdp => "rdp",
+            ItemKind::Folder => "folder",
+            ItemKind::Host => "host",
+            ItemKind::Connection => "conn",
+            ItemKind::Login => "login",
+            ItemKind::Key => "key",
+            ItemKind::Tag => "tag",
         };
         format!("{prefix}:{id}")
     }
@@ -179,6 +176,7 @@ pub struct LocalMatch {
     pub name: String,
 }
 
+// A connection item names the item of its host in `parent`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewItem {
@@ -189,8 +187,8 @@ pub struct ReviewItem {
     pub matched: Option<LocalMatch>,
     pub fields: Vec<FieldDiff>,
     pub notes: Vec<String>,
-    // What `notes` would say with no local match, for a match the user adds as new instead.
     pub notes_as_new: Vec<String>,
+    pub parent: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]

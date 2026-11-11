@@ -226,6 +226,10 @@ fn emit<R: Runtime>(app: &AppHandle<R>, status: TunnelStatus) {
     let _ = status.emit(app);
 }
 
+pub fn emit_stopped<R: Runtime>(app: &AppHandle<R>, tunnel_id: String, message: Option<String>) {
+    emit(app, TunnelStatus { tunnel_id, state: "stopped".into(), bytes_up: 0, bytes_down: 0, message });
+}
+
 // Bridge one accepted local connection to a fresh direct-tcpip channel.
 fn bridge(
     handle: Arc<SshHandle>,
@@ -251,7 +255,8 @@ fn bridge(
     .abort_handle()
 }
 
-pub fn run_local<R: Runtime>(
+// The listener is bound before this returns, so a port in use fails the start itself.
+pub async fn run_local<R: Runtime>(
     app: AppHandle<R>,
     tunnel_id: String,
     session_id: String,
@@ -266,15 +271,9 @@ pub fn run_local<R: Runtime>(
     let tid = tunnel_id.clone();
     let conns: Conns = Arc::new(Mutex::new(Vec::new()));
     let task_conns = conns.clone();
+    let listener = TcpListener::bind(&bind).await.map_err(|e| AppError::Tunnel(format!("{bind}: {e}")))?;
 
     let task = tokio::spawn(async move {
-        let listener = match TcpListener::bind(&bind).await {
-            Ok(l) => l,
-            Err(e) => {
-                emit(&app, TunnelStatus { tunnel_id: tid, state: "error".into(), bytes_up: 0, bytes_down: 0, message: Some(e.to_string()) });
-                return;
-            }
-        };
         emit(&app, TunnelStatus { tunnel_id: tid.clone(), state: "active".into(), bytes_up: 0, bytes_down: 0, message: None });
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
@@ -295,7 +294,7 @@ pub fn run_local<R: Runtime>(
     Ok(TunnelHandle { abort: task.abort_handle(), conns, session_id, remote: None })
 }
 
-pub fn run_dynamic<R: Runtime>(
+pub async fn run_dynamic<R: Runtime>(
     app: AppHandle<R>,
     tunnel_id: String,
     session_id: String,
@@ -308,15 +307,9 @@ pub fn run_dynamic<R: Runtime>(
     let tid = tunnel_id.clone();
     let conns: Conns = Arc::new(Mutex::new(Vec::new()));
     let task_conns = conns.clone();
+    let listener = TcpListener::bind(&bind).await.map_err(|e| AppError::Tunnel(format!("{bind}: {e}")))?;
 
     let task = tokio::spawn(async move {
-        let listener = match TcpListener::bind(&bind).await {
-            Ok(l) => l,
-            Err(e) => {
-                emit(&app, TunnelStatus { tunnel_id: tid, state: "error".into(), bytes_up: 0, bytes_down: 0, message: Some(e.to_string()) });
-                return;
-            }
-        };
         emit(&app, TunnelStatus { tunnel_id: tid.clone(), state: "active".into(), bytes_up: 0, bytes_down: 0, message: None });
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
@@ -446,7 +439,7 @@ mod tests {
         let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
         let app_handle = app.handle().clone();
         let (bind, session) = (free.to_string(), handle.clone());
-        let tunnel = run_dynamic(app_handle, "t".into(), "s".into(), session, bind).unwrap();
+        let tunnel = run_dynamic(app_handle, "t".into(), "s".into(), session, bind).await.unwrap();
 
         let started = Instant::now();
         let mut client = loop {

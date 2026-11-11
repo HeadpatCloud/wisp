@@ -1279,6 +1279,7 @@ mod tests {
         assert_eq!(v.get_secret(key.secret_id.as_deref().unwrap()).unwrap().as_slice(), b"phrase");
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_network_key_path_without_an_embedded_file_is_a_problem() {
         let mut payload = PayloadV3::default();
